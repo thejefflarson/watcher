@@ -1,13 +1,5 @@
-mod api;
-mod db;
-mod otlp;
-
-use axum::{
-    routing::{get, post},
-    Router,
-};
-use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
+use watcher_server::{app, db};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -25,24 +17,8 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::connect(&database_url).await?;
     db::migrate(&pool).await?;
 
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        // OTLP/HTTP ingestion (protobuf) — drop-in OTEL_EXPORTER_OTLP_ENDPOINT target.
-        .route("/v1/traces", post(otlp::ingest_traces))
-        .route("/v1/logs", post(otlp::ingest_logs))
-        // Query API for the UI.
-        .route("/api/traces", get(api::list_traces))
-        .route("/api/traces/{trace_id}", get(api::get_trace))
-        .route("/api/logs", get(api::list_logs))
-        .layer(CorsLayer::permissive())
-        .with_state(pool);
-
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("watcher listening on http://{bind}  (OTLP/HTTP + /api)");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app(pool)).await?;
     Ok(())
-}
-
-async fn healthz() -> &'static str {
-    "ok"
 }

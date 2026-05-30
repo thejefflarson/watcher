@@ -11,6 +11,20 @@ permissions:
 jobs:
   server:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: watcher
+          POSTGRES_PASSWORD: watcher
+          POSTGRES_DB: watcher
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U watcher"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      DATABASE_URL: postgres://watcher:watcher@localhost:5432/watcher
     defaults:
       run:
         working-directory: server
@@ -18,7 +32,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo fmt --check
       - run: cargo build --locked
-      - run: cargo test --locked
+      - run: cargo test --locked   # runs the ingest->query integration test against the service DB
 
   ui:
     runs-on: ubuntu-latest
