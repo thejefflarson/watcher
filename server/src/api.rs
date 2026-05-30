@@ -45,7 +45,8 @@ pub async fn list_traces(
                 (array_agg(name ORDER BY start_time))[1]                       AS root_name,
                 min(start_time)                                                AS start_time,
                 max(end_time)                                                  AS end_time,
-                extract(epoch FROM (max(end_time) - min(start_time))) * 1000.0 AS duration_ms,
+                -- ::float8 because Postgres 14+ extract() returns numeric, which sqlx won't decode into f64
+                (extract(epoch FROM (max(end_time) - min(start_time))) * 1000.0)::float8 AS duration_ms,
                 count(*)                                                       AS span_count,
                 count(*) FILTER (WHERE status_code = 2)                        AS error_count
          FROM spans
