@@ -1,0 +1,6 @@
+apiVersion: v2
+name: watcher
+description: Postgres-native OTLP traces + logs backend with a built-in UI
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

@@ -1,0 +1,20 @@
+# Dedicated Postgres provisioned by the Zalando postgres-operator.
+apiVersion: acid.zalan.do/v1
+kind: postgresql
+metadata:
+  name: {{ .Values.postgres.clusterName }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "watcher.labels" . | nindent 4 }}
+spec:
+  teamId: {{ .Values.postgres.teamId }}
+  numberOfInstances: {{ .Values.postgres.numberOfInstances }}
+  volume:
+    size: {{ .Values.postgres.volume.size }}
+    storageClass: {{ .Values.postgres.volume.storageClass }}
+  users:
+    {{ .Values.postgres.user }}: []
+  databases:
+    {{ .Values.postgres.database }}: {{ .Values.postgres.user }}
+  postgresql:
+    version: {{ .Values.postgres.version | quote }}

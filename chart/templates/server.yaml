@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: watcher-server
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "watcher.labels" . | nindent 4 }}
+    app: watcher-server
+spec:
+  replicas: {{ .Values.server.replicaCount }}
+  selector:
+    matchLabels:
+      app: watcher-server
+  template:
+    metadata:
+      labels:
+        app: watcher-server
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: server
+          image: "{{ .Values.server.image.repository }}:{{ .Values.server.image.tag }}"
+          imagePullPolicy: {{ .Values.server.image.pullPolicy }}
+          ports:
+            - containerPort: 4318
+          env:
+            - name: BIND_ADDR
+              value: "0.0.0.0:4318"
+            - name: RUST_LOG
+              value: "info,watcher_server=info,sqlx=warn"
+            # Password from the Zalando-generated credential secret, then
+            # composed into DATABASE_URL via in-order $(VAR) expansion.
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "watcher.dbSecret" . }}
+                  key: password
+            - name: DATABASE_URL
+              value: "postgres://{{ .Values.postgres.user }}:$(PGPASSWORD)@{{ .Values.postgres.clusterName }}:5432/{{ .Values.postgres.database }}"
+          resources:
+            {{- toYaml .Values.server.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 4318
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 4318
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: watcher-server
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "watcher.labels" . | nindent 4 }}
+    app: watcher-server
+spec:
+  type: ClusterIP
+  selector:
+    app: watcher-server
+  ports:
+    - port: 4318
+      targetPort: 4318

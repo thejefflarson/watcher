@@ -1,0 +1,49 @@
+{{- if .Values.ingressRoute.enabled }}
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: watcher-security-headers
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "watcher.labels" . | nindent 4 }}
+spec:
+  headers:
+    stsSeconds: 31536000
+    stsIncludeSubdomains: true
+    contentTypeNosniff: true
+    frameDeny: true
+    referrerPolicy: "strict-origin-when-cross-origin"
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: watcher
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "watcher.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    # OTLP ingest + query API + health → server.
+    - match: >-
+        Host(`{{ .Values.hostname }}`) && (
+          PathPrefix(`/v1`) ||
+          PathPrefix(`/api`) ||
+          Path(`/healthz`)
+        )
+      kind: Rule
+      middlewares:
+        - name: watcher-security-headers
+      services:
+        - name: watcher-server
+          port: 4318
+    # Everything else (SPA + assets) → UI.
+    - match: Host(`{{ .Values.hostname }}`)
+      kind: Rule
+      middlewares:
+        - name: watcher-security-headers
+      services:
+        - name: watcher-ui
+          port: 80
+{{- end }}
