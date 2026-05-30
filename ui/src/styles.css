@@ -66,6 +66,22 @@ nav button.active {
   background: var(--panel);
 }
 
+.token {
+  margin-left: auto;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.servicemap {
+  display: flex;
+  justify-content: center;
+  padding-top: 12px;
+}
+
 main {
   padding-top: 20px;
 }

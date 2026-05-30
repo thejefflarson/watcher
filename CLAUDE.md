@@ -57,6 +57,6 @@ cluster. ARM images are required for Raspberry Pi nodes (CI builds them).
 
 ## Not yet (good first issues)
 
-Metrics (third pillar), OTLP/gRPC (`:4317`), auth, retention/downsampling, a service
-map, and an end-to-end ingest→query integration test (needs a small lib refactor so the
-router is testable in-process).
+Downsampling/rollups for old data, metric time-series charts in the UI (today it's a
+latest-value table), and alerting. Traces, logs, metrics, OTLP/gRPC, service map,
+retention, and optional bearer-token auth are all implemented.

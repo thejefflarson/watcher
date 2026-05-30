@@ -28,10 +28,17 @@ spec:
           image: "{{ .Values.server.image.repository }}:{{ .Values.server.image.tag }}"
           imagePullPolicy: {{ .Values.server.image.pullPolicy }}
           ports:
-            - containerPort: 4318
+            - name: otlp-http
+              containerPort: 4318
+            - name: otlp-grpc
+              containerPort: 4317
           env:
             - name: BIND_ADDR
               value: "0.0.0.0:4318"
+            - name: GRPC_BIND_ADDR
+              value: "0.0.0.0:4317"
+            - name: WATCHER_RETENTION_DAYS
+              value: {{ .Values.server.retentionDays | quote }}
             - name: RUST_LOG
               value: "info,watcher_server=info,sqlx=warn"
             # Password from the Zalando-generated credential secret, then
@@ -76,5 +83,9 @@ spec:
   selector:
     app: watcher-server
   ports:
-    - port: 4318
+    - name: otlp-http
+      port: 4318
       targetPort: 4318
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317

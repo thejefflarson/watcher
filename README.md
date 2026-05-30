@@ -1,15 +1,13 @@
 # watcher
 
-A small, **Postgres-native** OpenTelemetry **traces + logs** backend with a built-in UI
-— a SigNoz-style trace/log experience **without ClickHouse**, light enough to run on a
-Raspberry Pi.
+A small, **Postgres-native** OpenTelemetry backend for **traces, logs, and metrics**,
+with a built-in UI — a SigNoz-style experience **without ClickHouse**, light enough to
+run on a Raspberry Pi.
 
-- **Rust** ingest + query server (axum + sqlx)
-- **TypeScript** UI (Vite + React): trace list, trace waterfall, log search
+- **Rust** ingest + query server (axum + sqlx), OTLP over **HTTP (:4318) and gRPC (:4317)**
+- **TypeScript** UI (Vite + React): trace list & waterfall, log search, metrics, service map
 - **Postgres** for storage (Timescale optional) — nothing else
-
-> Status: **v0**. OTLP/HTTP ingest for traces + logs, Postgres storage, query API, and
-> a working UI. Metrics, OTLP/gRPC, and auth are on the roadmap.
+- Optional bearer-token auth, background retention
 
 ## Architecture
 
@@ -92,12 +90,15 @@ docker-compose.yml   local Postgres
 
 ## Roadmap
 
-- [ ] Metrics (third pillar)
-- [ ] OTLP/gRPC (`:4317`)
-- [ ] End-to-end ingest→query integration test
-- [ ] Auth on ingest + UI
-- [ ] Retention / downsampling
-- [ ] Service map
+- [x] Metrics (third pillar)
+- [x] OTLP/gRPC (`:4317`)
+- [x] End-to-end ingest→query integration tests
+- [x] Auth on ingest + UI (optional bearer tokens)
+- [x] Retention (background prune; `WATCHER_RETENTION_DAYS`)
+- [x] Service map
+- [ ] Downsampling / rollups for old data
+- [ ] Metric time-series charts in the UI (currently latest-value table)
+- [ ] Alerting
 
 ## License
 
