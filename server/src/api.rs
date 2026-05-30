@@ -159,6 +159,8 @@ pub struct MetricSummary {
     points: i64,
     last_time: DateTime<Utc>,
     last_value: Option<f64>,
+    /// Up to 30 most-recent values (newest first) for an inline sparkline.
+    spark: Option<Vec<f64>>,
 }
 
 /// GET /api/metrics — one row per metric series with its latest value.
@@ -174,7 +176,8 @@ pub async fn list_metrics(
                 max(unit)                               AS unit,
                 count(*)                                AS points,
                 max(time)                               AS last_time,
-                (array_agg(value ORDER BY time DESC))[1] AS last_value
+                (array_agg(value ORDER BY time DESC))[1] AS last_value,
+                (array_agg(value ORDER BY time DESC) FILTER (WHERE value IS NOT NULL))[1:30] AS spark
          FROM metrics
          WHERE ($1::text IS NULL OR service = $1)
          GROUP BY name

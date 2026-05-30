@@ -54,6 +54,7 @@ export interface MetricSummary {
   points: number;
   last_time: string;
   last_value: number | null;
+  spark: number[] | null;
 }
 
 export interface ServiceMapData {

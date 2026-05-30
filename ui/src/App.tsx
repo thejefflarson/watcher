@@ -35,9 +35,7 @@ export default function App() {
   return (
     <div className="app">
       <header>
-        <h1>
-          <span className="logo">◉</span> watcher
-        </h1>
+        <h1>watcher</h1>
         <nav>
           {TABS.map((t) => (
             <button
@@ -50,7 +48,7 @@ export default function App() {
           ))}
         </nav>
         <button className="token" title="Set API token" onClick={editToken}>
-          🔑
+          token
         </button>
       </header>
       <main>

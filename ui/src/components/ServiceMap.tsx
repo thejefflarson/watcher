@@ -51,7 +51,7 @@ export default function ServiceMap() {
             markerHeight="7"
             orient="auto-start-reverse"
           >
-            <path d="M 0 0 L 10 5 L 0 10 z" fill="#5b9dff" />
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#777" />
           </marker>
         </defs>
         {data.edges.map((e, i) => {
@@ -67,11 +67,11 @@ export default function ServiceMap() {
                 y1={s.y}
                 x2={t.x}
                 y2={t.y}
-                stroke="#3a4250"
-                strokeWidth={1.5}
+                stroke="#cbcbc0"
+                strokeWidth={1}
                 markerEnd="url(#arrow)"
               />
-              <text x={mx} y={my - 4} fill="#8b94a7" fontSize={11} textAnchor="middle">
+              <text x={mx} y={my - 4} fill="#6f6f6f" fontSize={11} textAnchor="middle">
                 {e.calls}
               </text>
             </g>
@@ -81,8 +81,8 @@ export default function ServiceMap() {
           const p = pos.get(n)!;
           return (
             <g key={n}>
-              <circle cx={p.x} cy={p.y} r={26} fill="#171a21" stroke="#5b9dff" strokeWidth={2} />
-              <text x={p.x} y={p.y + 42} fill="#d7dce5" fontSize={12} textAnchor="middle">
+              <circle cx={p.x} cy={p.y} r={4} fill="#111" />
+              <text x={p.x} y={p.y + 18} fill="#111" fontSize={12} textAnchor="middle">
                 {n}
               </text>
             </g>

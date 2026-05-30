@@ -1,15 +1,14 @@
+/* Tufte-minded: light ground, near-black ink, hairline rules, no boxes/pills.
+   Color is reserved for data (errors, severity), not decoration. */
 :root {
-  --bg: #0f1115;
-  --panel: #171a21;
-  --border: #262b36;
-  --text: #d7dce5;
-  --muted: #8b94a7;
-  --accent: #5b9dff;
-  --err: #ff6b6b;
-  --warn: #ffb454;
-  --info: #5b9dff;
-  --debug: #8b94a7;
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --bg: #fffff8;
+  --text: #111111;
+  --muted: #6f6f6f;
+  --rule: #d6d6cc;
+  --hover: #f2f2e9;
+  --error: #a00000;
+  --warn: #8a5a00;
+  font-family: Georgia, "Times New Roman", serif;
 }
 
 * {
@@ -20,72 +19,67 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font-size: 14px;
+  font-size: 15px;
+  line-height: 1.45;
 }
 
 .app {
-  max-width: 1200px;
+  max-width: 1100px;
   margin: 0 auto;
-  padding: 0 20px 60px;
+  padding: 0 2rem 4rem;
 }
 
 header {
   display: flex;
-  align-items: center;
-  gap: 24px;
-  padding: 18px 0;
-  border-bottom: 1px solid var(--border);
-  position: sticky;
-  top: 0;
-  background: var(--bg);
-  z-index: 10;
+  align-items: baseline;
+  gap: 1.6rem;
+  padding: 1.2rem 0 0.6rem;
+  border-bottom: 1px solid var(--rule);
 }
 
 header h1 {
-  font-size: 18px;
   margin: 0;
-  letter-spacing: 0.5px;
+  font-size: 1.3rem;
+  font-weight: 400;
+  letter-spacing: 0.01em;
 }
 
-.logo {
-  color: var(--accent);
+nav {
+  display: flex;
+  gap: 1.2rem;
 }
 
 nav button {
   background: none;
   border: none;
+  padding: 0 0 2px;
+  font: inherit;
+  font-size: 0.95rem;
   color: var(--muted);
-  font-size: 14px;
-  padding: 6px 10px;
   cursor: pointer;
-  border-radius: 6px;
 }
 
 nav button.active {
   color: var(--text);
-  background: var(--panel);
+  border-bottom: 1.5px solid var(--text);
 }
 
 .token {
   margin-left: auto;
   background: none;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 4px 8px;
+  border: none;
+  font: inherit;
+  font-size: 0.85rem;
+  color: var(--muted);
+  text-decoration: underline;
   cursor: pointer;
-  font-size: 13px;
-}
-
-.servicemap {
-  display: flex;
-  justify-content: center;
-  padding-top: 12px;
 }
 
 main {
-  padding-top: 20px;
+  padding-top: 1.4rem;
 }
 
+/* Tables: rule under the header only, whitespace between rows — no boxes. */
 table {
   width: 100%;
   border-collapse: collapse;
@@ -94,17 +88,16 @@ table {
 th,
 td {
   text-align: left;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border);
+  padding: 0.35rem 1.4rem 0.35rem 0;
+  vertical-align: baseline;
   white-space: nowrap;
 }
 
 th {
+  font-weight: 400;
+  font-style: italic;
   color: var(--muted);
-  font-weight: 500;
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.4px;
+  border-bottom: 1px solid var(--rule);
 }
 
 td.num,
@@ -113,16 +106,22 @@ th.num {
   font-variant-numeric: tabular-nums;
 }
 
-td.err {
-  color: var(--err);
+td.err,
+.num.err {
+  color: var(--error);
 }
 
 tr.clickable {
   cursor: pointer;
 }
 
-tr.clickable:hover {
-  background: var(--panel);
+tr.clickable:hover td {
+  background: var(--hover);
+}
+
+.mono {
+  font-family: ui-monospace, Menlo, "SF Mono", monospace;
+  font-size: 0.84rem;
 }
 
 .muted {
@@ -130,12 +129,7 @@ tr.clickable:hover {
 }
 
 .error {
-  color: var(--err);
-}
-
-.mono {
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 12.5px;
+  color: var(--error);
 }
 
 .body {
@@ -143,43 +137,76 @@ tr.clickable:hover {
   word-break: break-word;
 }
 
-/* Waterfall */
-.back {
-  background: var(--panel);
-  border: 1px solid var(--border);
+/* Severity as colored text, not a filled pill. */
+.sev {
+  font-style: italic;
+}
+.sev-error {
+  color: var(--error);
+  font-style: normal;
+  font-weight: 700;
+}
+.sev-warn {
+  color: var(--warn);
+}
+.sev-info {
+  color: var(--text);
+}
+.sev-debug {
   color: var(--muted);
-  padding: 4px 10px;
-  border-radius: 6px;
+}
+
+/* Filters: underlined fields, no boxes. */
+.filters {
+  display: flex;
+  gap: 1.4rem;
+  margin-bottom: 1rem;
+}
+
+.filters input {
+  border: none;
+  border-bottom: 1px solid var(--rule);
+  background: none;
+  font: inherit;
+  font-size: 0.9rem;
+  padding: 0.2rem 0;
+}
+
+.filters input:focus {
+  outline: none;
+  border-bottom-color: var(--text);
+}
+
+/* Trace waterfall — bars are the data; grey ink, red only for errors. */
+.back {
+  background: none;
+  border: none;
+  font: inherit;
+  color: var(--muted);
+  text-decoration: underline;
   cursor: pointer;
-  margin-bottom: 12px;
+  padding: 0;
+  margin-bottom: 0.8rem;
 }
 
 .waterfall h2 {
-  font-size: 15px;
-  font-weight: 500;
-}
-
-.waterfall code {
-  color: var(--accent);
-}
-
-.bars {
-  margin-top: 12px;
+  font-weight: 400;
+  font-size: 1.05rem;
 }
 
 .bar-row {
   display: flex;
   align-items: center;
-  height: 24px;
+  height: 1.5rem;
 }
 
 .bar-label {
-  width: 280px;
-  flex: 0 0 280px;
+  width: 260px;
+  flex: 0 0 260px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 12.5px;
+  font-size: 0.85rem;
 }
 
 .bar-track {
@@ -190,64 +217,32 @@ tr.clickable:hover {
 
 .bar {
   position: absolute;
-  top: 5px;
-  height: 14px;
-  min-width: 2px;
-  background: var(--accent);
-  border-radius: 3px;
+  top: 0.45rem;
+  height: 0.5rem;
+  min-width: 1px;
+  background: #555;
 }
 
 .bar.err {
-  background: var(--err);
+  background: var(--error);
 }
 
 .bar-dur {
-  width: 80px;
-  flex: 0 0 80px;
-  font-size: 12px;
+  width: 70px;
+  flex: 0 0 70px;
+  text-align: right;
+  font-size: 0.8rem;
   color: var(--muted);
+  font-variant-numeric: tabular-nums;
 }
 
-/* Logs */
-.filters {
+.spark {
+  display: inline-block;
+  vertical-align: middle;
+}
+
+.servicemap {
   display: flex;
-  gap: 10px;
-  margin-bottom: 14px;
-}
-
-.filters input {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  color: var(--text);
-  padding: 7px 10px;
-  border-radius: 6px;
-  font-size: 13px;
-}
-
-.sev {
-  font-size: 11px;
-  font-weight: 600;
-  padding: 2px 7px;
-  border-radius: 4px;
-  text-transform: uppercase;
-}
-
-.sev-error {
-  color: var(--err);
-  background: rgba(255, 107, 107, 0.12);
-}
-
-.sev-warn {
-  color: var(--warn);
-  background: rgba(255, 180, 84, 0.12);
-}
-
-.sev-info {
-  color: var(--info);
-  background: rgba(91, 157, 255, 0.12);
-}
-
-.sev-debug {
-  color: var(--debug);
-  background: rgba(139, 148, 167, 0.12);
+  justify-content: center;
+  padding-top: 0.5rem;
 }
