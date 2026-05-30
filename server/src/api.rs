@@ -143,3 +143,89 @@ pub async fn list_logs(
     .map_err(internal)?;
     Ok(Json(rows))
 }
+
+#[derive(Deserialize)]
+pub struct MetricQuery {
+    limit: Option<i64>,
+    service: Option<String>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct MetricSummary {
+    name: String,
+    service: Option<String>,
+    kind: Option<String>,
+    unit: Option<String>,
+    points: i64,
+    last_time: DateTime<Utc>,
+    last_value: Option<f64>,
+}
+
+/// GET /api/metrics — one row per metric series with its latest value.
+pub async fn list_metrics(
+    State(pool): State<PgPool>,
+    Query(q): Query<MetricQuery>,
+) -> Result<Json<Vec<MetricSummary>>, ApiError> {
+    let limit = q.limit.unwrap_or(200).clamp(1, 2000);
+    let rows = sqlx::query_as::<_, MetricSummary>(
+        "SELECT name,
+                max(service)                            AS service,
+                max(kind)                               AS kind,
+                max(unit)                               AS unit,
+                count(*)                                AS points,
+                max(time)                               AS last_time,
+                (array_agg(value ORDER BY time DESC))[1] AS last_value
+         FROM metrics
+         WHERE ($1::text IS NULL OR service = $1)
+         GROUP BY name
+         ORDER BY name
+         LIMIT $2",
+    )
+    .bind(q.service)
+    .bind(limit)
+    .fetch_all(&pool)
+    .await
+    .map_err(internal)?;
+    Ok(Json(rows))
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct ServiceEdge {
+    source: String,
+    target: String,
+    calls: i64,
+}
+
+#[derive(Serialize)]
+pub struct ServiceMap {
+    nodes: Vec<String>,
+    edges: Vec<ServiceEdge>,
+}
+
+/// GET /api/servicemap — service dependency graph derived from span parent/child links.
+pub async fn service_map(State(pool): State<PgPool>) -> Result<Json<ServiceMap>, ApiError> {
+    let nodes: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT service FROM spans WHERE service IS NOT NULL ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(internal)?;
+
+    let edges = sqlx::query_as::<_, ServiceEdge>(
+        "SELECT parent.service AS source, child.service AS target, count(*) AS calls
+         FROM spans child
+         JOIN spans parent
+           ON child.parent_span_id = parent.span_id
+          AND child.trace_id = parent.trace_id
+         WHERE parent.service IS NOT NULL
+           AND child.service IS NOT NULL
+           AND parent.service IS DISTINCT FROM child.service
+         GROUP BY parent.service, child.service
+         ORDER BY calls DESC",
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(internal)?;
+
+    Ok(Json(ServiceMap { nodes, edges }))
+}
