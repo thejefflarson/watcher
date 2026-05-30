@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/api.ts","./src/main.tsx","./src/vite-env.d.ts","./src/components/logview.tsx","./src/components/tracelist.tsx","./src/components/tracewaterfall.tsx"],"errors":true,"version":"5.9.3"}

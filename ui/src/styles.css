@@ -1,0 +1,237 @@
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --border: #262b36;
+  --text: #d7dce5;
+  --muted: #8b94a7;
+  --accent: #5b9dff;
+  --err: #ff6b6b;
+  --warn: #ffb454;
+  --info: #5b9dff;
+  --debug: #8b94a7;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+}
+
+.app {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 20px 60px;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 18px 0;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  z-index: 10;
+}
+
+header h1 {
+  font-size: 18px;
+  margin: 0;
+  letter-spacing: 0.5px;
+}
+
+.logo {
+  color: var(--accent);
+}
+
+nav button {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 14px;
+  padding: 6px 10px;
+  cursor: pointer;
+  border-radius: 6px;
+}
+
+nav button.active {
+  color: var(--text);
+  background: var(--panel);
+}
+
+main {
+  padding-top: 20px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+th {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+td.num,
+th.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+td.err {
+  color: var(--err);
+}
+
+tr.clickable {
+  cursor: pointer;
+}
+
+tr.clickable:hover {
+  background: var(--panel);
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.error {
+  color: var(--err);
+}
+
+.mono {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12.5px;
+}
+
+.body {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Waterfall */
+.back {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  margin-bottom: 12px;
+}
+
+.waterfall h2 {
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.waterfall code {
+  color: var(--accent);
+}
+
+.bars {
+  margin-top: 12px;
+}
+
+.bar-row {
+  display: flex;
+  align-items: center;
+  height: 24px;
+}
+
+.bar-label {
+  width: 280px;
+  flex: 0 0 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+}
+
+.bar-track {
+  position: relative;
+  flex: 1;
+  height: 100%;
+}
+
+.bar {
+  position: absolute;
+  top: 5px;
+  height: 14px;
+  min-width: 2px;
+  background: var(--accent);
+  border-radius: 3px;
+}
+
+.bar.err {
+  background: var(--err);
+}
+
+.bar-dur {
+  width: 80px;
+  flex: 0 0 80px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* Logs */
+.filters {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.filters input {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.sev {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 4px;
+  text-transform: uppercase;
+}
+
+.sev-error {
+  color: var(--err);
+  background: rgba(255, 107, 107, 0.12);
+}
+
+.sev-warn {
+  color: var(--warn);
+  background: rgba(255, 180, 84, 0.12);
+}
+
+.sev-info {
+  color: var(--info);
+  background: rgba(91, 157, 255, 0.12);
+}
+
+.sev-debug {
+  color: var(--debug);
+  background: rgba(139, 148, 167, 0.12);
+}

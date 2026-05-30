@@ -1,0 +1,6 @@
+/server/target
+/ui/node_modules
+/ui/dist
+.env
+*.log
+.DS_Store
