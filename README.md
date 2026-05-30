@@ -88,6 +88,12 @@ chart/       Helm chart (server, ui, Zalando Postgres, Traefik IngressRoute)
 docker-compose.yml   local Postgres
 ```
 
+## Docs
+
+- [docs/architecture.md](docs/architecture.md) — components, module map, data flow, config
+- [docs/adr/](docs/adr/) — architecture decision records (the *why*)
+- [CONTRIBUTING.md](CONTRIBUTING.md) — dev workflow + conventions
+
 ## Roadmap
 
 - [x] Metrics (third pillar)
