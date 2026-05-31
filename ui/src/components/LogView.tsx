@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { listLogs, type LogRow } from "../api";
+import { useControls, rangeParams } from "../timerange";
 
 function sevClass(n: number | null): string {
   if (n === null) return "";
@@ -14,11 +15,17 @@ export default function LogView() {
   const [error, setError] = useState<string | null>(null);
   const [q, setQ] = useState("");
   const [service, setService] = useState("");
+  const { rangeKey, tick } = useControls();
 
   useEffect(() => {
     let active = true;
     const handle = setTimeout(() => {
-      listLogs({ q: q || undefined, service: service || undefined, limit: 200 })
+      listLogs({
+        q: q || undefined,
+        service: service || undefined,
+        limit: 200,
+        ...rangeParams(rangeKey),
+      })
         .then((l) => {
           if (active) {
             setLogs(l);
@@ -31,7 +38,7 @@ export default function LogView() {
       active = false;
       clearTimeout(handle);
     };
-  }, [q, service]);
+  }, [q, service, rangeKey, tick]);
 
   return (
     <div className="logs">

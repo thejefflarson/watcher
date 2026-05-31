@@ -83,17 +83,26 @@ function qs(params: Record<string, string | number | undefined>): string {
   return q.toString();
 }
 
-export const listTraces = (p: { service?: string; limit?: number } = {}) =>
-  get<TraceSummary[]>(`/api/traces?${qs(p)}`);
+export const listTraces = (
+  p: { service?: string; limit?: number; from?: string; to?: string } = {},
+) => get<TraceSummary[]>(`/api/traces?${qs(p)}`);
 
 export const getTrace = (traceId: string) => get<SpanRow[]>(`/api/traces/${traceId}`);
 
 export const listLogs = (
-  p: { service?: string; q?: string; trace_id?: string; limit?: number } = {},
+  p: {
+    service?: string;
+    q?: string;
+    trace_id?: string;
+    limit?: number;
+    from?: string;
+    to?: string;
+  } = {},
 ) => get<LogRow[]>(`/api/logs?${qs(p)}`);
 
-export const listMetrics = (p: { service?: string; limit?: number } = {}) =>
-  get<MetricSummary[]>(`/api/metrics?${qs(p)}`);
+export const listMetrics = (
+  p: { service?: string; limit?: number; from?: string; to?: string } = {},
+) => get<MetricSummary[]>(`/api/metrics?${qs(p)}`);
 
 export interface SeriesPoint {
   t: string;

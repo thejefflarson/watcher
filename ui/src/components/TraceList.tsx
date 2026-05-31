@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { listTraces, type TraceSummary } from "../api";
+import { useControls, rangeParams } from "../timerange";
 
 export function fmtDuration(ms: number): string {
   if (ms < 1) return `${(ms * 1000).toFixed(0)}µs`;
@@ -11,11 +12,12 @@ export default function TraceList({ onSelect }: { onSelect: (traceId: string) =>
   const [traces, setTraces] = useState<TraceSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const { rangeKey, tick } = useControls();
 
   useEffect(() => {
     let active = true;
     setLoading(true);
-    listTraces({ limit: 100 })
+    listTraces({ limit: 100, ...rangeParams(rangeKey) })
       .then((t) => {
         if (active) {
           setTraces(t);
@@ -27,7 +29,7 @@ export default function TraceList({ onSelect }: { onSelect: (traceId: string) =>
     return () => {
       active = false;
     };
-  }, []);
+  }, [rangeKey, tick]);
 
   if (loading) return <p className="muted">Loading traces…</p>;
   if (error) return <p className="error">Failed to load: {error}</p>;

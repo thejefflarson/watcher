@@ -10,6 +10,7 @@ import {
   type Agg,
 } from "../api";
 import { formatValue } from "../format";
+import { useControls } from "../timerange";
 
 const COMPARATORS: { v: Comparator; label: string }[] = [
   { v: "gt", label: ">" },
@@ -107,6 +108,7 @@ export default function Alerts() {
   const [rules, setRules] = useState<AlertRule[]>([]);
   const [events, setEvents] = useState<AlertEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const { tick } = useControls();
 
   const reload = () => {
     Promise.all([listAlerts(), listAlertEvents()])
@@ -118,7 +120,8 @@ export default function Alerts() {
       .catch((e: unknown) => setError(String(e)));
   };
 
-  useEffect(reload, []);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(reload, [tick]);
 
   const remove = (id: number) => {
     deleteAlert(id)

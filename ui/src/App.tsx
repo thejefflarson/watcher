@@ -14,6 +14,7 @@ import MetricList from "./components/MetricList";
 import MetricChart from "./components/MetricChart";
 import ServiceMap from "./components/ServiceMap";
 import Alerts from "./components/Alerts";
+import { useControls, RANGES, INTERVALS } from "./timerange";
 
 const TABS: { to: string; label: string }[] = [
   { to: "/traces", label: "Traces" },
@@ -65,6 +66,39 @@ function MetricRoute() {
   );
 }
 
+function Controls() {
+  const { rangeKey, setRangeKey, intervalKey, setIntervalKey, refresh } = useControls();
+  return (
+    <div className="controls">
+      <select
+        value={rangeKey}
+        onChange={(e) => setRangeKey(e.target.value)}
+        title="Time range"
+      >
+        {RANGES.map((r) => (
+          <option key={r.key} value={r.key}>
+            {r.label}
+          </option>
+        ))}
+      </select>
+      <select
+        value={intervalKey}
+        onChange={(e) => setIntervalKey(e.target.value)}
+        title="Live refresh"
+      >
+        {INTERVALS.map((i) => (
+          <option key={i.key} value={i.key}>
+            {i.key === "off" ? "live: off" : `live: ${i.label}`}
+          </option>
+        ))}
+      </select>
+      <button className="refresh" onClick={refresh} title="Refresh now">
+        ↻
+      </button>
+    </div>
+  );
+}
+
 export default function App() {
   return (
     <div className="app">
@@ -81,6 +115,7 @@ export default function App() {
             </NavLink>
           ))}
         </nav>
+        <Controls />
       </header>
       <main>
         <Routes>

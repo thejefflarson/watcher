@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
 import { getServiceMap, type ServiceMapData } from "../api";
+import { useControls } from "../timerange";
 
 // Simple circular layout — nodes on a ring, edges as arrowed lines.
 export default function ServiceMap() {
   const [data, setData] = useState<ServiceMapData | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const { tick } = useControls();
 
   useEffect(() => {
     let active = true;
@@ -19,7 +21,7 @@ export default function ServiceMap() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [tick]);
 
   if (error) return <p className="error">Failed to load: {error}</p>;
   if (!data) return <p className="muted">Loading…</p>;

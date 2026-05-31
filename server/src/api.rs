@@ -19,6 +19,9 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
 pub struct TraceQuery {
     limit: Option<i64>,
     service: Option<String>,
+    /// Time window (RFC3339); both optional. Absent ends are unbounded.
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -51,11 +54,15 @@ pub async fn list_traces(
                 count(*) FILTER (WHERE status_code = 2)                        AS error_count
          FROM spans
          WHERE ($1::text IS NULL OR service = $1)
+           AND ($2::timestamptz IS NULL OR start_time >= $2)
+           AND ($3::timestamptz IS NULL OR start_time <= $3)
          GROUP BY trace_id
          ORDER BY start_time DESC
-         LIMIT $2",
+         LIMIT $4",
     )
     .bind(q.service)
+    .bind(q.from)
+    .bind(q.to)
     .bind(limit)
     .fetch_all(&pool)
     .await
@@ -104,6 +111,8 @@ pub struct LogQuery {
     service: Option<String>,
     trace_id: Option<String>,
     q: Option<String>,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -131,12 +140,16 @@ pub async fn list_logs(
          WHERE ($1::text IS NULL OR service = $1)
            AND ($2::text IS NULL OR trace_id = $2)
            AND ($3::text IS NULL OR body ILIKE '%' || $3 || '%')
+           AND ($4::timestamptz IS NULL OR time >= $4)
+           AND ($5::timestamptz IS NULL OR time <= $5)
          ORDER BY time DESC
-         LIMIT $4",
+         LIMIT $6",
     )
     .bind(q.service)
     .bind(q.trace_id)
     .bind(q.q)
+    .bind(q.from)
+    .bind(q.to)
     .bind(limit)
     .fetch_all(&pool)
     .await
@@ -148,6 +161,8 @@ pub async fn list_logs(
 pub struct MetricQuery {
     limit: Option<i64>,
     service: Option<String>,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -180,11 +195,15 @@ pub async fn list_metrics(
                 (array_agg(value ORDER BY time DESC) FILTER (WHERE value IS NOT NULL))[1:30] AS spark
          FROM metrics
          WHERE ($1::text IS NULL OR service = $1)
+           AND ($2::timestamptz IS NULL OR time >= $2)
+           AND ($3::timestamptz IS NULL OR time <= $3)
          GROUP BY name
          ORDER BY name
-         LIMIT $2",
+         LIMIT $4",
     )
     .bind(q.service)
+    .bind(q.from)
+    .bind(q.to)
     .bind(limit)
     .fetch_all(&pool)
     .await

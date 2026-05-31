@@ -1093,3 +1093,33 @@ async fn ingest_log_keeps_resource_dimensions() {
             .unwrap();
     assert_eq!(pod.as_deref(), Some("api-7d"));
 }
+
+#[tokio::test]
+#[serial]
+async fn time_window_filters_traces_and_logs() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let day = 86_400.0;
+    insert_span_at(&pool, "svc", "recent", "r1", 30.0).await; // 30s ago
+    insert_span_at(&pool, "svc", "old", "o1", 3.0 * day).await; // 3 days ago
+    insert_log_at(&pool, "svc", 30.0).await;
+    insert_log_at(&pool, "svc", 3.0 * day).await;
+    let router = app(pool);
+
+    // `from` an hour ago → only the recent rows. RFC3339 with Z (no '+').
+    let from = (chrono::Utc::now() - chrono::Duration::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let (status, traces) = get_json(&router, &format!("/api/traces?from={from}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(traces.as_array().unwrap().len(), 1, "only the recent trace");
+    assert_eq!(traces[0]["trace_id"], "recent");
+
+    let (_, logs) = get_json(&router, &format!("/api/logs?from={from}")).await;
+    assert_eq!(logs.as_array().unwrap().len(), 1, "only the recent log");
+
+    // No window → both.
+    let (_, all) = get_json(&router, "/api/traces").await;
+    assert_eq!(all.as_array().unwrap().len(), 2);
+}
