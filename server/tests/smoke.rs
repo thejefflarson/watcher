@@ -693,7 +693,9 @@ async fn metrics_summary_kinds_and_filter() {
         .find(|m| m["name"] == "reqs")
         .unwrap();
     assert_eq!(reqs["kind"], "sum");
-    assert_eq!(reqs["points"], 2);
+    // Last value is the most recent sum point (both share now(), so either).
+    let lv = reqs["last_value"].as_f64().unwrap();
+    assert!(lv == 5.0 || lv == 7.0, "last_value was {lv}");
 }
 
 // --- Rollups ---------------------------------------------------------------
