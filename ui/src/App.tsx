@@ -40,12 +40,13 @@ function MetricsRoute() {
   const navigate = useNavigate();
   return (
     <MetricList
-      onSelect={(m) =>
-        navigate(
-          `/metrics/${encodeURIComponent(m.name)}` +
-            (m.service ? `?service=${encodeURIComponent(m.service)}` : ""),
-        )
-      }
+      onSelect={(m) => {
+        const qs = new URLSearchParams();
+        if (m.service) qs.set("service", m.service);
+        if (m.unit) qs.set("unit", m.unit);
+        const s = qs.toString();
+        navigate(`/metrics/${encodeURIComponent(m.name)}${s ? `?${s}` : ""}`);
+      }}
     />
   );
 }
@@ -58,6 +59,7 @@ function MetricRoute() {
     <MetricChart
       name={name!}
       service={params.get("service")}
+      unit={params.get("unit")}
       onBack={() => navigate("/metrics")}
     />
   );

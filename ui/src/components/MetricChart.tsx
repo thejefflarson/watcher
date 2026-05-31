@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { getMetricSeries, type SeriesPoint } from "../api";
+import { formatValue } from "../format";
 
 const RANGES: { label: string; hours: number }[] = [
   { label: "1h", hours: 1 },
@@ -9,7 +10,7 @@ const RANGES: { label: string; hours: number }[] = [
 ];
 
 // A small line chart drawn by hand — hairline axes, ink only for the line.
-function Chart({ points }: { points: SeriesPoint[] }) {
+function Chart({ points, unit }: { points: SeriesPoint[]; unit?: string | null }) {
   const w = 720;
   const h = 240;
   const pad = { l: 48, r: 12, t: 12, b: 24 };
@@ -48,10 +49,10 @@ function Chart({ points }: { points: SeriesPoint[] }) {
       <line x1={pad.l} y1={pad.t} x2={pad.l} y2={h - pad.b} stroke="var(--rule)" />
       <line x1={pad.l} y1={h - pad.b} x2={w - pad.r} y2={h - pad.b} stroke="var(--rule)" />
       <text x={pad.l - 6} y={pad.t + 4} textAnchor="end" className="tick">
-        {geom.hi}
+        {formatValue(geom.hi, unit)}
       </text>
       <text x={pad.l - 6} y={h - pad.b} textAnchor="end" className="tick">
-        {geom.lo}
+        {formatValue(geom.lo, unit)}
       </text>
       <text x={pad.l} y={h - 6} textAnchor="start" className="tick">
         {fmtTime(geom.t0)}
@@ -67,10 +68,12 @@ function Chart({ points }: { points: SeriesPoint[] }) {
 export default function MetricChart({
   name,
   service,
+  unit,
   onBack,
 }: {
   name: string;
   service: string | null;
+  unit?: string | null;
   onBack: () => void;
 }) {
   const [points, setPoints] = useState<SeriesPoint[]>([]);
@@ -110,7 +113,7 @@ export default function MetricChart({
       {error ? (
         <p className="error">Failed to load: {error}</p>
       ) : (
-        <Chart points={points} />
+        <Chart points={points} unit={unit} />
       )}
     </div>
   );
