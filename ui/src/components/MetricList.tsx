@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { listMetrics, type MetricSummary } from "../api";
 import { formatValue } from "../format";
+import { useControls, rangeParams } from "../timerange";
 
 // Inline sparkline — a small multiple, drawn with no axes or chrome.
 function Sparkline({ values }: { values: number[] }) {
@@ -35,11 +36,12 @@ export default function MetricList({
   const [metrics, setMetrics] = useState<MetricSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [service, setService] = useState("");
+  const { rangeKey, tick } = useControls();
 
   useEffect(() => {
     let active = true;
     const handle = setTimeout(() => {
-      listMetrics({ service: service || undefined })
+      listMetrics({ service: service || undefined, ...rangeParams(rangeKey) })
         .then((m) => {
           if (active) {
             setMetrics(m);
@@ -52,7 +54,7 @@ export default function MetricList({
       active = false;
       clearTimeout(handle);
     };
-  }, [service]);
+  }, [service, rangeKey, tick]);
 
   if (error) return <p className="error">Failed to load: {error}</p>;
 
