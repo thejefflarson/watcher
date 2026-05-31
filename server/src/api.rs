@@ -340,6 +340,53 @@ pub async fn metric_series_grouped(
     Ok(Json(rows))
 }
 
+#[derive(Deserialize)]
+pub struct RedQuery {
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct ServiceRed {
+    service: String,
+    spans: i64,
+    errors: i64,
+    error_rate: f64,
+    p50_ms: Option<f64>,
+    p95_ms: Option<f64>,
+    p99_ms: Option<f64>,
+}
+
+/// GET /api/services — RED (Rate, Errors, Duration) per service over a window:
+/// span count, error count + rate, and latency p50/p95/p99.
+pub async fn service_red(
+    State(pool): State<PgPool>,
+    Query(q): Query<RedQuery>,
+) -> Result<Json<Vec<ServiceRed>>, ApiError> {
+    let rows = sqlx::query_as::<_, ServiceRed>(
+        "SELECT service,
+                count(*)                                AS spans,
+                count(*) FILTER (WHERE status_code = 2) AS errors,
+                (count(*) FILTER (WHERE status_code = 2))::float8
+                    / nullif(count(*), 0)::float8       AS error_rate,
+                percentile_cont(0.5)  WITHIN GROUP (ORDER BY duration_ms) AS p50_ms,
+                percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) AS p95_ms,
+                percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_ms) AS p99_ms
+         FROM spans
+         WHERE service IS NOT NULL
+           AND ($1::timestamptz IS NULL OR start_time >= $1)
+           AND ($2::timestamptz IS NULL OR start_time <= $2)
+         GROUP BY service
+         ORDER BY spans DESC",
+    )
+    .bind(q.from)
+    .bind(q.to)
+    .fetch_all(&pool)
+    .await
+    .map_err(internal)?;
+    Ok(Json(rows))
+}
+
 #[derive(Serialize, sqlx::FromRow)]
 struct ServiceEdge {
     source: String,

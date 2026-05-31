@@ -13,6 +13,7 @@ import LogView from "./components/LogView";
 import MetricList from "./components/MetricList";
 import MetricChart from "./components/MetricChart";
 import ServiceMap from "./components/ServiceMap";
+import Services from "./components/Services";
 import Alerts from "./components/Alerts";
 import { useControls, RANGES, INTERVALS } from "./timerange";
 
@@ -20,6 +21,7 @@ const TABS: { to: string; label: string }[] = [
   { to: "/traces", label: "Traces" },
   { to: "/logs", label: "Logs" },
   { to: "/metrics", label: "Metrics" },
+  { to: "/services", label: "Services" },
   { to: "/map", label: "Service Map" },
   { to: "/alerts", label: "Alerts" },
 ];
@@ -125,6 +127,7 @@ export default function App() {
           <Route path="/logs" element={<LogView />} />
           <Route path="/metrics" element={<MetricsRoute />} />
           <Route path="/metrics/:name" element={<MetricRoute />} />
+          <Route path="/services" element={<Services />} />
           <Route path="/map" element={<ServiceMap />} />
           <Route path="/alerts" element={<Alerts />} />
           <Route path="*" element={<Navigate to="/traces" replace />} />
