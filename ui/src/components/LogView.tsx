@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import { listLogs, type LogRow } from "../api";
 import { useControls, rangeParams } from "../timerange";
 
@@ -16,6 +17,8 @@ export default function LogView() {
   const [q, setQ] = useState("");
   const [service, setService] = useState("");
   const { rangeKey, tick } = useControls();
+  const [params, setParams] = useSearchParams();
+  const traceFilter = params.get("trace_id");
 
   useEffect(() => {
     let active = true;
@@ -23,6 +26,7 @@ export default function LogView() {
       listLogs({
         q: q || undefined,
         service: service || undefined,
+        trace_id: traceFilter ?? undefined,
         limit: 200,
         ...rangeParams(rangeKey),
       })
@@ -38,7 +42,7 @@ export default function LogView() {
       active = false;
       clearTimeout(handle);
     };
-  }, [q, service, rangeKey, tick]);
+  }, [q, service, traceFilter, rangeKey, tick]);
 
   return (
     <div className="logs">
@@ -54,6 +58,14 @@ export default function LogView() {
           onChange={(e) => setService(e.target.value)}
         />
       </div>
+      {traceFilter && (
+        <p className="filter-banner">
+          logs for trace <code>{traceFilter.slice(0, 16)}…</code>{" "}
+          <button className="xlink" onClick={() => setParams({})}>
+            clear
+          </button>
+        </p>
+      )}
       {error && <p className="error">Failed to load: {error}</p>}
       {logs.length === 0 && !error && <p className="muted">No logs.</p>}
       <table>
@@ -62,6 +74,7 @@ export default function LogView() {
             <th>Time</th>
             <th>Severity</th>
             <th>Service</th>
+            <th>Trace</th>
             <th>Body</th>
           </tr>
         </thead>
@@ -75,6 +88,15 @@ export default function LogView() {
                 </span>
               </td>
               <td>{l.service ?? "—"}</td>
+              <td className="mono">
+                {l.trace_id ? (
+                  <Link className="xlink" to={`/traces/${l.trace_id}`} title={l.trace_id}>
+                    {l.trace_id.slice(0, 8)}
+                  </Link>
+                ) : (
+                  <span className="muted">—</span>
+                )}
+              </td>
               <td className="mono body">{l.body ?? ""}</td>
             </tr>
           ))}

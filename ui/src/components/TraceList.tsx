@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { listTraces, type TraceSummary } from "../api";
 import { useControls, rangeParams } from "../timerange";
 
@@ -13,11 +14,13 @@ export default function TraceList({ onSelect }: { onSelect: (traceId: string) =>
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const { rangeKey, tick } = useControls();
+  const [params, setParams] = useSearchParams();
+  const serviceFilter = params.get("service");
 
   useEffect(() => {
     let active = true;
     setLoading(true);
-    listTraces({ limit: 100, ...rangeParams(rangeKey) })
+    listTraces({ limit: 100, service: serviceFilter ?? undefined, ...rangeParams(rangeKey) })
       .then((t) => {
         if (active) {
           setTraces(t);
@@ -29,15 +32,32 @@ export default function TraceList({ onSelect }: { onSelect: (traceId: string) =>
     return () => {
       active = false;
     };
-  }, [rangeKey, tick]);
+  }, [serviceFilter, rangeKey, tick]);
 
   if (loading) return <p className="muted">Loading traces…</p>;
   if (error) return <p className="error">Failed to load: {error}</p>;
+
+  const banner = serviceFilter && (
+    <p className="filter-banner">
+      traces for <strong>{serviceFilter}</strong>{" "}
+      <button className="xlink" onClick={() => setParams({})}>
+        clear
+      </button>
+    </p>
+  );
+
   if (traces.length === 0)
-    return <p className="muted">No traces yet. Point an OTLP exporter at :4318.</p>;
+    return (
+      <>
+        {banner}
+        <p className="muted">No traces in this window.</p>
+      </>
+    );
 
   return (
-    <table>
+    <>
+      {banner}
+      <table>
       <thead>
         <tr>
           <th>Service</th>
@@ -60,6 +80,7 @@ export default function TraceList({ onSelect }: { onSelect: (traceId: string) =>
           </tr>
         ))}
       </tbody>
-    </table>
+      </table>
+    </>
   );
 }

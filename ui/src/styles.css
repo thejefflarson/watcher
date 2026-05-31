@@ -272,6 +272,37 @@ tr.clickable:hover td {
   padding-top: 0.5rem;
 }
 
+/* Cross-signal links (trace ↔ logs ↔ service) — underlined muted text. */
+.xlink {
+  background: none;
+  border: none;
+  font: inherit;
+  color: var(--muted);
+  text-decoration: underline;
+  cursor: pointer;
+  padding: 0;
+}
+a.xlink:hover,
+.xlink:hover {
+  color: var(--text);
+}
+
+.filter-banner {
+  color: var(--muted);
+  font-size: 0.9rem;
+  margin: 0 0 0.8rem;
+}
+
+.map-node {
+  cursor: pointer;
+}
+.map-node:hover circle {
+  r: 6;
+}
+.map-node:hover text {
+  font-weight: 700;
+}
+
 /* Metric time-series chart. */
 .metric-chart h2 {
   font-weight: 400;
