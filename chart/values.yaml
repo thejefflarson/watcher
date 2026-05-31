@@ -8,9 +8,15 @@ imagePullSecrets:
 
 server:
   replicaCount: 1
-  # Delete telemetry older than this many days (0 disables). Set auth tokens via
-  # WATCHER_INGEST_TOKEN / WATCHER_API_TOKEN env if you need them.
+  # Delete telemetry older than this many days (0 disables).
   retentionDays: 7
+  # Optional bearer tokens. Empty = that surface is open (rely on edge auth such
+  # as Cloudflare Access). When set, the chart creates a `watcher-tokens` Secret
+  # and wires the env. Supply via a SOPS-encrypted helmfile secrets file — do NOT
+  # commit plaintext. Note: setting ingestToken means in-cluster senders
+  # (whisperer) must present it too (OTEL_EXPORTER_OTLP_HEADERS).
+  apiToken: ""
+  ingestToken: ""
   image:
     repository: ghcr.io/thejefflarson/watcher-server
     tag: latest
@@ -39,3 +45,7 @@ postgres:
 
 ingressRoute:
   enabled: true
+  # When false (default), OTLP ingest (/v1) is NOT routed on the public host —
+  # telemetry is pushed in-cluster via the Service, so there's no public write
+  # surface. Enable only behind edge auth (e.g. a Cloudflare Access service token).
+  exposeIngest: false

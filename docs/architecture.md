@@ -14,7 +14,10 @@ this is *how*.
 The built UI (`ui/dist`) is compiled into the binary with `rust-embed` and served
 as the axum fallback, so there's one image, one port, one origin — no nginx, no
 path-split ([ADR 0010](adr/0010-ui-embedded-in-server-binary.md)). A Traefik
-IngressRoute (when enabled) routes the whole host to the server.
+IngressRoute (when enabled) routes the host to the server, but **carves out `/v1`
+by default** (`ingressRoute.exposeIngest: false`) so OTLP ingest is never publicly
+routable — telemetry is pushed in-cluster via the Service. Pair public exposure
+with edge auth (Cloudflare Access) for the read surface.
 
 ## Server module map (`server/src/`)
 

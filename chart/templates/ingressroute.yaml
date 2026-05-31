@@ -25,9 +25,14 @@ spec:
   entryPoints:
     - websecure
   routes:
-    # One backend: the server handles OTLP ingest (/v1), the query API (/api),
-    # health (/healthz), and serves the embedded SPA for everything else.
-    - match: Host(`{{ .Values.hostname }}`)
+    # The server handles the query API (/api), health (/healthz), and the embedded
+    # SPA (everything else). OTLP ingest (/v1) is deliberately NOT exposed on the
+    # public host by default — telemetry is pushed in-cluster via the Service, so
+    # there's no anonymous-write surface. Carved out with Traefik v3's `!` matcher,
+    # so /v1 simply isn't routed (404 at the edge). Flip exposeIngest=true only
+    # behind edge auth (e.g. a Cloudflare Access service token on /v1).
+    - match: >-
+        Host(`{{ .Values.hostname }}`){{ if not .Values.ingressRoute.exposeIngest }} && !PathPrefix(`/v1`){{ end }}
       kind: Rule
       middlewares:
         - name: watcher-security-headers
