@@ -1,69 +1,97 @@
-import { useState } from "react";
+import {
+  NavLink,
+  Navigate,
+  Route,
+  Routes,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
 import TraceList from "./components/TraceList";
 import TraceWaterfall from "./components/TraceWaterfall";
 import LogView from "./components/LogView";
 import MetricList from "./components/MetricList";
+import MetricChart from "./components/MetricChart";
 import ServiceMap from "./components/ServiceMap";
 import Alerts from "./components/Alerts";
-import { getToken, setToken } from "./api";
 
-type Tab = "traces" | "logs" | "metrics" | "map" | "alerts";
-
-const TABS: { id: Tab; label: string }[] = [
-  { id: "traces", label: "Traces" },
-  { id: "logs", label: "Logs" },
-  { id: "metrics", label: "Metrics" },
-  { id: "map", label: "Service Map" },
-  { id: "alerts", label: "Alerts" },
+const TABS: { to: string; label: string }[] = [
+  { to: "/traces", label: "Traces" },
+  { to: "/logs", label: "Logs" },
+  { to: "/metrics", label: "Metrics" },
+  { to: "/map", label: "Service Map" },
+  { to: "/alerts", label: "Alerts" },
 ];
 
+// Route wrappers translate component callbacks into URL navigation, so the
+// view (selected trace, drilled-in metric) lives in the address bar.
+function TracesRoute() {
+  const navigate = useNavigate();
+  return <TraceList onSelect={(id) => navigate(`/traces/${id}`)} />;
+}
+
+function TraceRoute() {
+  const { traceId } = useParams();
+  const navigate = useNavigate();
+  return <TraceWaterfall traceId={traceId!} onBack={() => navigate("/traces")} />;
+}
+
+function MetricsRoute() {
+  const navigate = useNavigate();
+  return (
+    <MetricList
+      onSelect={(m) =>
+        navigate(
+          `/metrics/${encodeURIComponent(m.name)}` +
+            (m.service ? `?service=${encodeURIComponent(m.service)}` : ""),
+        )
+      }
+    />
+  );
+}
+
+function MetricRoute() {
+  const { name } = useParams();
+  const [params] = useSearchParams();
+  const navigate = useNavigate();
+  return (
+    <MetricChart
+      name={name!}
+      service={params.get("service")}
+      onBack={() => navigate("/metrics")}
+    />
+  );
+}
+
 export default function App() {
-  const [tab, setTab] = useState<Tab>("traces");
-  const [trace, setTrace] = useState<string | null>(null);
-
-  const go = (t: Tab) => {
-    setTab(t);
-    setTrace(null);
-  };
-
-  const editToken = () => {
-    const t = window.prompt("API token (leave blank if the server has none)", getToken());
-    if (t !== null) {
-      setToken(t.trim());
-      go(tab);
-    }
-  };
-
   return (
     <div className="app">
       <header>
         <h1>watcher</h1>
         <nav>
           {TABS.map((t) => (
-            <button
-              key={t.id}
-              className={tab === t.id ? "active" : ""}
-              onClick={() => go(t.id)}
+            <NavLink
+              key={t.to}
+              to={t.to}
+              className={({ isActive }) => (isActive ? "active" : "")}
             >
               {t.label}
-            </button>
+            </NavLink>
           ))}
         </nav>
-        <button className="token" title="Set API token" onClick={editToken}>
-          token
-        </button>
       </header>
       <main>
-        {tab === "traces" &&
-          (trace === null ? (
-            <TraceList onSelect={setTrace} />
-          ) : (
-            <TraceWaterfall traceId={trace} onBack={() => setTrace(null)} />
-          ))}
-        {tab === "logs" && <LogView />}
-        {tab === "metrics" && <MetricList />}
-        {tab === "map" && <ServiceMap />}
-        {tab === "alerts" && <Alerts />}
+        <Routes>
+          <Route path="/" element={<Navigate to="/traces" replace />} />
+          <Route path="/traces" element={<TracesRoute />} />
+          <Route path="/traces/:traceId" element={<TraceRoute />} />
+          <Route path="/logs" element={<LogView />} />
+          <Route path="/metrics" element={<MetricsRoute />} />
+          <Route path="/metrics/:name" element={<MetricRoute />} />
+          <Route path="/map" element={<ServiceMap />} />
+          <Route path="/alerts" element={<Alerts />} />
+          <Route path="*" element={<Navigate to="/traces" replace />} />
+        </Routes>
       </main>
     </div>
   );

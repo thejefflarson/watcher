@@ -81,6 +81,8 @@ last rollup bucket, so it stays continuous after pruning.
 | `WATCHER_ROLLUP_BUCKET_SECS` | `300` | downsample bucket width; `0` disables rollups |
 | `WATCHER_ALERT_INTERVAL_SECS` | `30` | how often alert rules are evaluated (min 5) |
 | `WATCHER_ALERT_WEBHOOK` | — | optional URL to POST on alert fire/resolve |
-| `WATCHER_INGEST_TOKEN` | — | optional bearer for `/v1` + gRPC |
-| `WATCHER_API_TOKEN` | — | optional bearer for `/api` |
 | `RUST_LOG` | `info,watcher_server=debug,sqlx=warn` | tracing filter |
+
+The server has **no app-layer auth** ([ADR 0013](adr/0013-auth-at-the-edge.md)): the
+public read surface is gated by Cloudflare Access at the edge, and ingest is only
+reachable in-cluster (`/v1` carved out of the public route, gRPC never routed).

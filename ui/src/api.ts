@@ -1,12 +1,7 @@
+// Same-origin in production (the server serves the UI); localhost in dev.
+// Auth lives at the edge (Cloudflare Access), so the client sends no token.
 const BASE =
   (import.meta.env.VITE_API_BASE as string | undefined) ?? "http://localhost:4318";
-
-// Optional API token (when the server has WATCHER_API_TOKEN set).
-const TOKEN_KEY = "watcher_token";
-export const getToken = () => localStorage.getItem(TOKEN_KEY) ?? "";
-export const setToken = (t: string) => localStorage.setItem(TOKEN_KEY, t);
-
-export class Unauthorized extends Error {}
 
 export interface TraceSummary {
   trace_id: string;
@@ -62,17 +57,8 @@ export interface ServiceMapData {
   edges: { source: string; target: string; calls: number }[];
 }
 
-function authHeaders(extra?: Record<string, string>): Record<string, string> {
-  const token = getToken();
-  return {
-    ...(token ? { authorization: `Bearer ${token}` } : {}),
-    ...extra,
-  };
-}
-
 async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, { headers: authHeaders() });
-  if (res.status === 401) throw new Unauthorized("unauthorized");
+  const res = await fetch(`${BASE}${path}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as T;
 }
@@ -80,10 +66,9 @@ async function get<T>(path: string): Promise<T> {
 async function send<T>(method: string, path: string, body?: unknown): Promise<T | null> {
   const res = await fetch(`${BASE}${path}`, {
     method,
-    headers: authHeaders(body !== undefined ? { "content-type": "application/json" } : {}),
+    headers: body !== undefined ? { "content-type": "application/json" } : undefined,
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
-  if (res.status === 401) throw new Unauthorized("unauthorized");
   if (!res.ok) throw new Error(`${res.status} ${(await res.text()) || res.statusText}`);
   // 204 No Content (DELETE) has no body to parse.
   if (res.status === 204) return null;

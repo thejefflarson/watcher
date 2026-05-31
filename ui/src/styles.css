@@ -49,30 +49,17 @@ nav {
   gap: 1.2rem;
 }
 
-nav button {
-  background: none;
-  border: none;
+nav a {
   padding: 0 0 2px;
-  font: inherit;
   font-size: 0.95rem;
   color: var(--muted);
+  text-decoration: none;
   cursor: pointer;
 }
 
-nav button.active {
+nav a.active {
   color: var(--text);
   border-bottom: 1.5px solid var(--text);
-}
-
-.token {
-  margin-left: auto;
-  background: none;
-  border: none;
-  font: inherit;
-  font-size: 0.85rem;
-  color: var(--muted);
-  text-decoration: underline;
-  cursor: pointer;
 }
 
 main {

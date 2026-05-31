@@ -41,21 +41,6 @@ spec:
               value: {{ .Values.server.retentionDays | quote }}
             - name: RUST_LOG
               value: "info,watcher_server=info,sqlx=warn"
-            {{- if .Values.server.apiToken }}
-            # Optional bearer for /api (defense-in-depth behind edge auth).
-            - name: WATCHER_API_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: watcher-tokens
-                  key: api-token
-            {{- end }}
-            {{- if .Values.server.ingestToken }}
-            - name: WATCHER_INGEST_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: watcher-tokens
-                  key: ingest-token
-            {{- end }}
             # Password from the Zalando-generated credential secret, then
             # composed into DATABASE_URL via in-order $(VAR) expansion.
             - name: PGPASSWORD

@@ -6,12 +6,8 @@ pub mod otlp;
 pub mod retention;
 pub mod rollup;
 
-use std::sync::Arc;
-
 use axum::{
-    extract::{Request, State},
     http::{header, StatusCode, Uri},
-    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Router,
@@ -50,56 +46,17 @@ async fn ui_handler(uri: Uri) -> Response {
     }
 }
 
-/// Optional bearer tokens. When `None`, that surface is unauthenticated.
-#[derive(Clone, Default)]
-pub struct AuthConfig {
-    pub ingest: Option<Arc<str>>,
-    pub api: Option<Arc<str>>,
-}
-
-impl AuthConfig {
-    pub fn from_env() -> Self {
-        let read = |k: &str| {
-            std::env::var(k)
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(Arc::from)
-        };
-        Self {
-            ingest: read("WATCHER_INGEST_TOKEN"),
-            api: read("WATCHER_API_TOKEN"),
-        }
-    }
-}
-
-/// Middleware: if a token is configured, require `Authorization: Bearer <token>`.
-async fn require_token(
-    State(expected): State<Option<Arc<str>>>,
-    req: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    if let Some(token) = expected {
-        let ok = req
-            .headers()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(|t| t == &*token)
-            .unwrap_or(false);
-        if !ok {
-            return Err(StatusCode::UNAUTHORIZED);
-        }
-    }
-    Ok(next.run(req).await)
-}
-
 /// Build the HTTP router. Shared by the binary and the integration tests.
-pub fn app(pool: PgPool, auth: AuthConfig) -> Router {
+///
+/// The server is unauthenticated at the app layer by design — auth lives at the
+/// edge (Cloudflare Access for the public read surface) and ingest is only
+/// reachable in-cluster (see ADR 0013). The permissive CORS layer keeps local
+/// dev (`:5173` → `:4318`) working.
+pub fn app(pool: PgPool) -> Router {
     let ingest = Router::new()
         .route("/v1/traces", post(otlp::ingest_traces))
         .route("/v1/logs", post(otlp::ingest_logs))
-        .route("/v1/metrics", post(otlp::ingest_metrics))
-        .route_layer(middleware::from_fn_with_state(auth.ingest, require_token));
+        .route("/v1/metrics", post(otlp::ingest_metrics));
 
     let api = Router::new()
         .route("/api/traces", get(api::list_traces))
@@ -110,8 +67,7 @@ pub fn app(pool: PgPool, auth: AuthConfig) -> Router {
         .route("/api/servicemap", get(api::service_map))
         .route("/api/alerts", get(api::list_alerts).post(api::create_alert))
         .route("/api/alerts/events", get(api::list_alert_events))
-        .route("/api/alerts/{id}", delete(api::delete_alert))
-        .route_layer(middleware::from_fn_with_state(auth.api, require_token));
+        .route("/api/alerts/{id}", delete(api::delete_alert));
 
     Router::new()
         .route("/healthz", get(healthz))
