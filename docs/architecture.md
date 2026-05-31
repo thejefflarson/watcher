@@ -81,6 +81,10 @@ last rollup bucket, so it stays continuous after pruning.
 | `WATCHER_ROLLUP_BUCKET_SECS` | `300` | downsample bucket width; `0` disables rollups |
 | `WATCHER_ALERT_INTERVAL_SECS` | `30` | how often alert rules are evaluated (min 5) |
 | `WATCHER_ALERT_WEBHOOK` | — | optional URL to POST on alert fire/resolve |
+| `WATCHER_DEFAULT_SERVICE` | — | fallback service name when ingested telemetry has none / `unknown_service` |
+| `WATCHER_SELF_TELEMETRY` | on | export watcher's own `/api` traces via OTLP (`0`/`off` disables) |
+| `OTEL_SERVICE_NAME` | `watcher` | service name for watcher's own telemetry |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318` | where watcher exports its own telemetry (defaults to itself) |
 | `RUST_LOG` | `info,watcher_server=debug,sqlx=warn` | tracing filter |
 
 The server has **no app-layer auth** ([ADR 0013](adr/0013-auth-at-the-edge.md)): the

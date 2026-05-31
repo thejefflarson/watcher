@@ -73,7 +73,15 @@ pub fn app(pool: PgPool) -> Router {
         .route("/api/services", get(api::service_red))
         .route("/api/alerts", get(api::list_alerts).post(api::create_alert))
         .route("/api/alerts/events", get(api::list_alert_events))
-        .route("/api/alerts/{id}", delete(api::delete_alert));
+        .route("/api/alerts/{id}", delete(api::delete_alert))
+        // Span each query-API request (INFO so it's recorded) for watcher's own
+        // self-telemetry. Deliberately NOT on /v1, so exporting traces to self
+        // can't create a feedback loop.
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http().make_span_with(
+                tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::INFO),
+            ),
+        );
 
     Router::new()
         .route("/healthz", get(healthz))
