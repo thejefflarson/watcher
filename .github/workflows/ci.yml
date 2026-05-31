@@ -73,10 +73,21 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-        with:
-          driver: remote
-          endpoint: tcp://buildkit.dev.svc.cluster.local:1234
+      # The in-cluster BuildKit worker is shared across every repo's runners, so
+      # `buildx create` can time out when it's saturated. Retry with backoff
+      # instead of setup-buildx-action (which fails fast).
+      - name: Connect to BuildKit (retry — shared worker)
+        run: |
+          for i in $(seq 1 10); do
+            docker buildx rm watcher-remote >/dev/null 2>&1 || true
+            if docker buildx create --name watcher-remote --use \
+                 --driver remote tcp://buildkit.dev.svc.cluster.local:1234 \
+               && timeout 90 docker buildx inspect --bootstrap; then
+              echo "connected to buildkit"; exit 0
+            fi
+            echo "buildkit busy/unreachable (attempt $i), backing off…"; sleep 20
+          done
+          echo "could not reach buildkit after retries"; exit 1
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
