@@ -97,6 +97,7 @@ export const listLogs = (
     limit?: number;
     from?: string;
     to?: string;
+    attr?: string;
   } = {},
 ) => get<LogRow[]>(`/api/logs?${qs(p)}`);
 

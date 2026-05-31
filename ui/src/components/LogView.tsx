@@ -16,6 +16,7 @@ export default function LogView() {
   const [error, setError] = useState<string | null>(null);
   const [q, setQ] = useState("");
   const [service, setService] = useState("");
+  const [attr, setAttr] = useState("");
   const { rangeKey, tick } = useControls();
   const [params, setParams] = useSearchParams();
   const traceFilter = params.get("trace_id");
@@ -27,6 +28,7 @@ export default function LogView() {
         q: q || undefined,
         service: service || undefined,
         trace_id: traceFilter ?? undefined,
+        attr: attr.includes("=") ? attr : undefined,
         limit: 200,
         ...rangeParams(rangeKey),
       })
@@ -42,7 +44,7 @@ export default function LogView() {
       active = false;
       clearTimeout(handle);
     };
-  }, [q, service, traceFilter, rangeKey, tick]);
+  }, [q, service, attr, traceFilter, rangeKey, tick]);
 
   return (
     <div className="logs">
@@ -56,6 +58,12 @@ export default function LogView() {
           placeholder="service"
           value={service}
           onChange={(e) => setService(e.target.value)}
+        />
+        <input
+          placeholder="attribute key=value"
+          value={attr}
+          onChange={(e) => setAttr(e.target.value)}
+          title="Filter by an attribute, e.g. k8s.pod.name=api-7f"
         />
       </div>
       {traceFilter && (
