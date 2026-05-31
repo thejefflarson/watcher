@@ -14,6 +14,7 @@ function sevClass(n: number | null): string {
 export default function LogView() {
   const [logs, setLogs] = useState<LogRow[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
   const [q, setQ] = useState("");
   const [service, setService] = useState("");
   const [attr, setAttr] = useState("");
@@ -38,7 +39,8 @@ export default function LogView() {
             setError(null);
           }
         })
-        .catch((e: unknown) => active && setError(String(e)));
+        .catch((e: unknown) => active && setError(String(e)))
+        .finally(() => active && setLoaded(true));
     }, 250);
     return () => {
       active = false;
@@ -75,7 +77,8 @@ export default function LogView() {
         </p>
       )}
       {error && <p className="error">Failed to load: {error}</p>}
-      {logs.length === 0 && !error && <p className="muted">No logs.</p>}
+      {!loaded && !error && <p className="muted">Loading…</p>}
+      {loaded && logs.length === 0 && !error && <p className="muted">No logs.</p>}
       <table>
         <thead>
           <tr>

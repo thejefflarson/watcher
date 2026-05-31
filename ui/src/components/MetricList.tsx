@@ -35,6 +35,7 @@ export default function MetricList({
 }) {
   const [metrics, setMetrics] = useState<MetricSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
   const [service, setService] = useState("");
   const { rangeKey, tick } = useControls();
 
@@ -48,7 +49,8 @@ export default function MetricList({
             setError(null);
           }
         })
-        .catch((e: unknown) => active && setError(String(e)));
+        .catch((e: unknown) => active && setError(String(e)))
+        .finally(() => active && setLoaded(true));
     }, 250);
     return () => {
       active = false;
@@ -67,7 +69,9 @@ export default function MetricList({
           onChange={(e) => setService(e.target.value)}
         />
       </div>
-      {metrics.length === 0 ? (
+      {!loaded ? (
+        <p className="muted">Loading…</p>
+      ) : metrics.length === 0 ? (
         <p className="muted">No metrics yet.</p>
       ) : (
         <table>

@@ -9,6 +9,7 @@ import { fmtDuration } from "./TraceList";
 export default function Services() {
   const [rows, setRows] = useState<ServiceRed[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
   const { rangeKey, tick } = useControls();
   const navigate = useNavigate();
 
@@ -16,7 +17,8 @@ export default function Services() {
     let active = true;
     listServices(rangeParams(rangeKey))
       .then((r) => active && (setRows(r), setError(null)))
-      .catch((e: unknown) => active && setError(String(e)));
+      .catch((e: unknown) => active && setError(String(e)))
+      .finally(() => active && setLoaded(true));
     return () => {
       active = false;
     };
@@ -25,6 +27,7 @@ export default function Services() {
   const { sorted, onSort, indicator } = useSort(rows, "spans");
 
   if (error) return <p className="error">Failed to load: {error}</p>;
+  if (!loaded) return <p className="muted">Loading…</p>;
   if (rows.length === 0) return <p className="muted">No spans in this window.</p>;
 
   return (
