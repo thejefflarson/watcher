@@ -108,6 +108,7 @@ export default function Alerts() {
   const [rules, setRules] = useState<AlertRule[]>([]);
   const [events, setEvents] = useState<AlertEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
   const { tick } = useControls();
 
   const reload = () => {
@@ -117,7 +118,8 @@ export default function Alerts() {
         setEvents(e);
         setError(null);
       })
-      .catch((e: unknown) => setError(String(e)));
+      .catch((e: unknown) => setError(String(e)))
+      .finally(() => setLoaded(true));
   };
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -136,7 +138,9 @@ export default function Alerts() {
       <CreateForm onCreated={reload} />
 
       <h3>Rules</h3>
-      {rules.length === 0 ? (
+      {!loaded ? (
+        <p className="muted">Loading…</p>
+      ) : rules.length === 0 ? (
         <p className="muted">No alert rules yet.</p>
       ) : (
         <table>
@@ -174,7 +178,9 @@ export default function Alerts() {
       )}
 
       <h3>Recent events</h3>
-      {events.length === 0 ? (
+      {!loaded ? (
+        <p className="muted">Loading…</p>
+      ) : events.length === 0 ? (
         <p className="muted">No events yet.</p>
       ) : (
         <table>

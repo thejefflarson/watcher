@@ -13,14 +13,13 @@ export function fmtDuration(ms: number): string {
 export default function TraceList({ onSelect }: { onSelect: (traceId: string) => void }) {
   const [traces, setTraces] = useState<TraceSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loaded, setLoaded] = useState(false);
   const { rangeKey, tick } = useControls();
   const [params, setParams] = useSearchParams();
   const serviceFilter = params.get("service");
 
   useEffect(() => {
     let active = true;
-    setLoading(true);
     listTraces({ limit: 100, service: serviceFilter ?? undefined, ...rangeParams(rangeKey) })
       .then((t) => {
         if (active) {
@@ -29,7 +28,7 @@ export default function TraceList({ onSelect }: { onSelect: (traceId: string) =>
         }
       })
       .catch((e: unknown) => active && setError(String(e)))
-      .finally(() => active && setLoading(false));
+      .finally(() => active && setLoaded(true));
     return () => {
       active = false;
     };
@@ -37,7 +36,7 @@ export default function TraceList({ onSelect }: { onSelect: (traceId: string) =>
 
   const { sorted, onSort, indicator } = useSort(traces, "start_time");
 
-  if (loading) return <p className="muted">Loading traces…</p>;
+  if (!loaded) return <p className="muted">Loading traces…</p>;
   if (error) return <p className="error">Failed to load: {error}</p>;
 
   const banner = serviceFilter && (
