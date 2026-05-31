@@ -186,7 +186,13 @@ pub struct MetricSummary {
     last_time: DateTime<Utc>,
     last_value: Option<f64>,
     /// Up to 30 most-recent values (newest first) for an inline sparkline.
+    /// Each value is the sum across the metric's series at that tick, so a
+    /// multi-series metric (e.g. container.cpu.time over many containers)
+    /// reads as one coherent total rather than interleaved series.
     spark: Option<Vec<f64>>,
+    /// Distinct series collapsed into this row (max points sharing a tick).
+    /// 1 for a plain metric; >1 signals the per-label breakdown lives in the chart.
+    series_count: Option<i64>,
 }
 
 /// GET /api/metrics — one row per metric series with its latest value.
@@ -206,25 +212,53 @@ pub async fn list_metrics(
              SELECT (SELECT min(name) FROM metrics WHERE name > n.name)
              FROM names n WHERE n.name IS NOT NULL
          )
-         SELECT n.name, r.service, r.kind, r.unit, r.last_time, r.last_value, r.spark
+         SELECT n.name, r.service, r.kind, r.unit, r.last_time, r.last_value,
+                r.spark, r.series_count
          FROM names n
          CROSS JOIN LATERAL (
-             SELECT (array_agg(service ORDER BY time DESC))[1] AS service,
-                    (array_agg(kind    ORDER BY time DESC))[1] AS kind,
-                    (array_agg(unit    ORDER BY time DESC))[1] AS unit,
-                    (array_agg(value   ORDER BY time DESC))[1] AS last_value,
-                    max(time)                                  AS last_time,
-                    array_agg(value ORDER BY time DESC) FILTER (WHERE value IS NOT NULL) AS spark
+             -- Collapse a metric's many series into one coherent total trend:
+             -- bucket time (120s), take each series' latest value per bucket,
+             -- then sum across series. Without the per-series step, summing raw
+             -- points interleaves series whose timestamps don't line up and the
+             -- sparkline is noise. Bounded by LIMIT so the per-name read stays
+             -- index-fast (metrics_name_time_idx) regardless of table size.
+             SELECT (array_agg(service ORDER BY bucket DESC))[1] AS service,
+                    (array_agg(kind    ORDER BY bucket DESC))[1] AS kind,
+                    (array_agg(unit    ORDER BY bucket DESC))[1] AS unit,
+                    (array_agg(v        ORDER BY bucket DESC))[1] AS last_value,
+                    max(bucket)                                  AS last_time,
+                    array_agg(v ORDER BY bucket DESC) FILTER (WHERE v IS NOT NULL) AS spark,
+                    max(series)                                  AS series_count
              FROM (
-                 SELECT service, kind, unit, value, time
-                 FROM metrics
-                 WHERE name = n.name
-                   AND ($1::text IS NULL OR service = $1)
-                   AND ($2::timestamptz IS NULL OR time >= $2)
-                   AND ($3::timestamptz IS NULL OR time <= $3)
-                 ORDER BY time DESC
+                 SELECT bucket,
+                        sum(sv)                                       AS v,
+                        (array_agg(service ORDER BY sv_time DESC))[1] AS service,
+                        (array_agg(kind    ORDER BY sv_time DESC))[1] AS kind,
+                        (array_agg(unit    ORDER BY sv_time DESC))[1] AS unit,
+                        count(*)                                      AS series
+                 FROM (
+                     SELECT bucket, service, attributes,
+                            (array_agg(value ORDER BY time DESC))[1] AS sv,
+                            (array_agg(kind  ORDER BY time DESC))[1] AS kind,
+                            (array_agg(unit  ORDER BY time DESC))[1] AS unit,
+                            max(time)                                AS sv_time
+                     FROM (
+                         SELECT to_timestamp(floor(extract(epoch FROM time) / 120) * 120) AS bucket,
+                                service, kind, unit, attributes, value, time
+                         FROM metrics
+                         WHERE name = n.name
+                           AND ($1::text IS NULL OR service = $1)
+                           AND ($2::timestamptz IS NULL OR time >= $2)
+                           AND ($3::timestamptz IS NULL OR time <= $3)
+                         ORDER BY time DESC
+                         LIMIT 5000
+                     ) recent
+                     GROUP BY bucket, service, attributes
+                 ) per_series
+                 GROUP BY bucket
+                 ORDER BY bucket DESC
                  LIMIT 30
-             ) recent
+             ) ticks
          ) r
          WHERE n.name IS NOT NULL AND r.last_time IS NOT NULL
          ORDER BY n.name

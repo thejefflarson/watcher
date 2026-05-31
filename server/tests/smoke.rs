@@ -698,6 +698,37 @@ async fn metrics_summary_kinds_and_filter() {
     assert!(lv == 5.0 || lv == 7.0, "last_value was {lv}");
 }
 
+#[tokio::test]
+#[serial]
+async fn metrics_summary_sums_across_series() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // One metric, two series distinguished by attributes (e.g. per-pod). The
+    // summary collapses them into a single coherent total, not interleaved
+    // points: last_value is the sum of each series' latest value, and
+    // series_count reports how many were folded together.
+    sqlx::query(
+        "INSERT INTO metrics (time, service, name, kind, value, unit, attributes) VALUES
+            (now(),'api','mem','gauge',10,'By','{\"pod\":\"a\"}'),
+            (now(),'api','mem','gauge',20,'By','{\"pod\":\"b\"}')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let router = app(pool);
+
+    let (_, all) = get_json(&router, "/api/metrics").await;
+    let mem = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "mem")
+        .expect("mem row");
+    assert_eq!(mem["last_value"].as_f64().unwrap(), 30.0, "10 + 20");
+    assert_eq!(mem["series_count"].as_i64().unwrap(), 2);
+}
+
 // --- Rollups ---------------------------------------------------------------
 
 #[tokio::test]

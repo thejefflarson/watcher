@@ -60,22 +60,32 @@ jobs:
   # One image now: the server builds the UI and embeds it (rust-embed), so there
   # is no separate watcher-ui image. Build context is the repo root.
   #
-  # arm64 via QEMU on a GitHub-hosted runner. This is the reliable interim while
-  # the in-cluster BuildKit path is parked: even with the runner co-located on
-  # BuildKit's node, the buildx remote-driver gRPC bootstrap times out (TCP is
-  # reachable, the session is not). Switch back to watcher-runners once that and
-  # the cross-node overlay are sorted. gha cache keeps the QEMU rebuild bearable.
+  # Native arm64 on the self-hosted runner (watcher-runners), offloading the build
+  # to the in-cluster BuildKit — no QEMU, since the cluster is ARM-only. Now that
+  # cross-node overlay routing is fixed, any node's runner reaches the BuildKit
+  # Service; the retry loop still rides out transient blips. BuildKit's daemon
+  # cache replaces the gha cache.
   image:
     needs: [server, ui, chart]
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: watcher-runners
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - name: Connect to BuildKit (retry)
+        run: |
+          for i in $(seq 1 10); do
+            docker buildx rm watcher-remote >/dev/null 2>&1 || true
+            if docker buildx create --name watcher-remote --use \
+                 --driver remote tcp://buildkit.dev.svc.cluster.local:1234 \
+               && timeout 90 docker buildx inspect --bootstrap; then
+              echo "connected to buildkit"; exit 0
+            fi
+            echo "buildkit unreachable (attempt $i/10), retrying…"; sleep 25
+          done
+          echo "could not reach buildkit"; exit 1
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -96,5 +106,3 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
