@@ -103,6 +103,19 @@ export interface SeriesPoint {
 export const getMetricSeries = (p: { name: string; service?: string; hours?: number }) =>
   get<SeriesPoint[]>(`/api/metrics/series?${qs(p)}`);
 
+export interface LabeledPoint {
+  label: string | null;
+  t: string;
+  v: number | null;
+}
+
+// Attribute keys a metric can be grouped by (e.g. k8s.pod.name / node / container).
+export const getMetricDims = (name: string) => get<string[]>(`/api/metrics/dims?${qs({ name })}`);
+
+// One labeled point stream — group client-side by `label` into per-dimension series.
+export const getMetricSeriesGrouped = (p: { name: string; group_by: string; hours?: number }) =>
+  get<LabeledPoint[]>(`/api/metrics/series_grouped?${qs(p)}`);
+
 export const getServiceMap = () => get<ServiceMapData>(`/api/servicemap`);
 
 // --- Alerts ---------------------------------------------------------------

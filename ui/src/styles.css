@@ -315,3 +315,31 @@ button.range.active {
   font-size: 0.95rem;
   margin: 1.6rem 0 0.6rem;
 }
+
+/* Metric chart legend (group-by series) */
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1rem;
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+}
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.swatch {
+  display: inline-block;
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 2px;
+}
+.filters select {
+  border: none;
+  border-bottom: 1px solid var(--rule);
+  background: none;
+  font: inherit;
+  font-size: 0.9rem;
+  padding: 0.2rem 0;
+}
