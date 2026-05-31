@@ -8,6 +8,63 @@ interface Row {
   depth: number;
 }
 
+const SPAN_KINDS = ["unspecified", "internal", "server", "client", "producer", "consumer"];
+
+// Detail panel for a selected span: identity, status, timing, and attributes.
+function SpanDetail({ span, onClose }: { span: SpanRow; onClose: () => void }) {
+  const attrs = Object.entries(span.attributes ?? {});
+  const fmt = (v: unknown) => (typeof v === "string" ? v : JSON.stringify(v));
+  return (
+    <div className="span-detail">
+      <div className="span-detail-head">
+        <strong className="mono">{span.name}</strong>
+        <button className="xlink" onClick={onClose}>
+          close
+        </button>
+      </div>
+      <table className="kv">
+        <tbody>
+          <tr>
+            <td className="muted">service</td>
+            <td>{span.service ?? "—"}</td>
+          </tr>
+          <tr>
+            <td className="muted">kind</td>
+            <td>{span.kind != null ? (SPAN_KINDS[span.kind] ?? span.kind) : "—"}</td>
+          </tr>
+          <tr>
+            <td className="muted">status</td>
+            <td className={span.status_code === 2 ? "err" : ""}>
+              {span.status_code === 2 ? "ERROR" : span.status_code === 1 ? "OK" : "unset"}
+              {span.status_message ? ` · ${span.status_message}` : ""}
+            </td>
+          </tr>
+          <tr>
+            <td className="muted">duration</td>
+            <td>{fmtDuration(span.duration_ms)}</td>
+          </tr>
+          <tr>
+            <td className="muted">span id</td>
+            <td className="mono">{span.span_id}</td>
+          </tr>
+          {span.parent_span_id && (
+            <tr>
+              <td className="muted">parent</td>
+              <td className="mono">{span.parent_span_id}</td>
+            </tr>
+          )}
+          {attrs.map(([k, v]) => (
+            <tr key={k}>
+              <td className="muted mono">{k}</td>
+              <td className="mono body">{fmt(v)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function buildOrder(spans: SpanRow[]): Row[] {
   const byId = new Map(spans.map((s) => [s.span_id, s]));
   const children = new Map<string, SpanRow[]>();
@@ -40,9 +97,11 @@ export default function TraceWaterfall({
 }) {
   const [spans, setSpans] = useState<SpanRow[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
+    setSelected(null);
     getTrace(traceId)
       .then((s) => {
         if (active) {
@@ -81,8 +140,13 @@ export default function TraceWaterfall({
           const left = ((Date.parse(span.start_time) - t0) / total) * 100;
           const width = Math.max((span.duration_ms / total) * 100, 0.4);
           const err = span.status_code === 2;
+          const sel = span.span_id === selected;
           return (
-            <div className="bar-row" key={span.span_id}>
+            <div
+              className={"bar-row clickable" + (sel ? " selected" : "")}
+              key={span.span_id}
+              onClick={() => setSelected(sel ? null : span.span_id)}
+            >
               <div className="bar-label" style={{ paddingLeft: depth * 14 }} title={span.name}>
                 {span.name}
               </div>
@@ -98,6 +162,12 @@ export default function TraceWaterfall({
           );
         })}
       </div>
+      {selected && (
+        <SpanDetail
+          span={spans.find((s) => s.span_id === selected)!}
+          onClose={() => setSelected(null)}
+        />
+      )}
     </div>
   );
 }
