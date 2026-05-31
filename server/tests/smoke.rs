@@ -705,9 +705,8 @@ async fn metrics_summary_sums_across_series() {
         return;
     };
     // One metric, two series distinguished by attributes (e.g. per-pod). The
-    // summary collapses them into a single coherent total, not interleaved
-    // points: last_value is the sum of each series' latest value, and
-    // series_count reports how many were folded together.
+    // summary reports how many distinct series the row folds together via
+    // series_count, so the list can flag it and point at the chart's breakdown.
     sqlx::query(
         "INSERT INTO metrics (time, service, name, kind, value, unit, attributes) VALUES
             (now(),'api','mem','gauge',10,'By','{\"pod\":\"a\"}'),
@@ -725,7 +724,9 @@ async fn metrics_summary_sums_across_series() {
         .iter()
         .find(|m| m["name"] == "mem")
         .expect("mem row");
-    assert_eq!(mem["last_value"].as_f64().unwrap(), 30.0, "10 + 20");
+    // Latest single point (both share now(), so either of the two series).
+    let lv = mem["last_value"].as_f64().unwrap();
+    assert!(lv == 10.0 || lv == 20.0, "last_value was {lv}");
     assert_eq!(mem["series_count"].as_i64().unwrap(), 2);
 }
 

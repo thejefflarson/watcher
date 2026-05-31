@@ -95,7 +95,7 @@ export default function MetricList({
                 <td className="mono">
                   {m.name}
                   {m.series_count != null && m.series_count > 1 && (
-                    <span className="muted" title={`${m.series_count} series summed — open for the per-label breakdown`}>
+                    <span className="muted" title={`${m.series_count}+ series — open for the per-label breakdown`}>
                       {" "}×{m.series_count}
                     </span>
                   )}
