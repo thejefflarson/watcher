@@ -1,15 +1,54 @@
 use std::net::SocketAddr;
 
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::WithExportConfig;
+use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 use watcher_server::{alerts, app, db, grpc, retention, rollup};
 
+/// Self-instrumentation: export watcher's own traces over OTLP, tagged
+/// `service.name=watcher` by default, so it shows up in its own UI. Exports to
+/// itself (`http://localhost:4318`) unless `OTEL_EXPORTER_OTLP_ENDPOINT` says
+/// otherwise; opt out with `WATCHER_SELF_TELEMETRY=0`. Only `/api` requests are
+/// spanned (not `/v1`), so exporting to self can't loop.
+fn init_telemetry() -> Option<opentelemetry_sdk::trace::TracerProvider> {
+    let off = std::env::var("WATCHER_SELF_TELEMETRY")
+        .map(|v| matches!(v.as_str(), "0" | "false" | "off"))
+        .unwrap_or(false);
+    if off {
+        return None;
+    }
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .unwrap_or_else(|_| "http://localhost:4318".to_string());
+    let service = std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "watcher".to_string());
+
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_endpoint(format!("{}/v1/traces", endpoint.trim_end_matches('/')))
+        .build()
+        .ok()?;
+    let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+        .with_resource(opentelemetry_sdk::Resource::new(vec![
+            opentelemetry::KeyValue::new("service.name", service),
+        ]))
+        .build();
+    Some(provider)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    let telemetry = init_telemetry();
+    let otel_layer = telemetry
+        .as_ref()
+        .map(|p| tracing_opentelemetry::layer().with_tracer(p.tracer("watcher-server")));
+    tracing_subscriber::registry()
+        .with(
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("info,watcher_server=debug,sqlx=warn")),
         )
+        .with(tracing_subscriber::fmt::layer())
+        .with(otel_layer)
         .init();
 
     let database_url = std::env::var("DATABASE_URL")

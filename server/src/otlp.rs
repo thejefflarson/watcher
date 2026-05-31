@@ -369,15 +369,51 @@ fn resource_attrs(
     resource.map(|r| r.attributes.as_slice()).unwrap_or(&[])
 }
 
-fn service_name(attrs: &[KeyValue]) -> Option<String> {
+fn string_attr<'a>(attrs: &'a [KeyValue], key: &str) -> Option<&'a str> {
     attrs
         .iter()
-        .find(|kv| kv.key == "service.name")
+        .find(|kv| kv.key == key)
         .and_then(|kv| kv.value.as_ref())
         .and_then(|v| match &v.value {
-            Some(any_value::Value::StringValue(s)) => Some(s.clone()),
+            Some(any_value::Value::StringValue(s)) => Some(s.as_str()),
             _ => None,
         })
+}
+
+/// Resolve a service name for stored telemetry. Prefers an explicit
+/// `service.name`, but the OTel SDKs default it to `unknown_service[:exe]` when
+/// the app set none — in that case fall back to a meaningful k8s identity
+/// (deployment/pod/…), then the configured `WATCHER_DEFAULT_SERVICE`.
+fn service_name(attrs: &[KeyValue]) -> Option<String> {
+    if let Some(s) = string_attr(attrs, "service.name") {
+        if !s.is_empty() && !s.starts_with("unknown_service") {
+            return Some(s.to_string());
+        }
+    }
+    for key in [
+        "k8s.deployment.name",
+        "k8s.statefulset.name",
+        "k8s.daemonset.name",
+        "k8s.cronjob.name",
+        "k8s.pod.name",
+    ] {
+        if let Some(s) = string_attr(attrs, key) {
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    default_service().clone()
+}
+
+/// Configured fallback service name (`WATCHER_DEFAULT_SERVICE`), read once.
+fn default_service() -> &'static Option<String> {
+    static D: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    D.get_or_init(|| {
+        std::env::var("WATCHER_DEFAULT_SERVICE")
+            .ok()
+            .filter(|s| !s.is_empty())
+    })
 }
 
 fn attrs_to_json(attrs: &[KeyValue]) -> serde_json::Value {
@@ -459,6 +495,29 @@ mod tests {
         ];
         assert_eq!(service_name(&attrs).as_deref(), Some("checkout"));
         assert_eq!(service_name(&[]), None);
+    }
+
+    #[test]
+    fn service_name_falls_back_past_unknown() {
+        // SDK default "unknown_service:foo" → fall back to a k8s identity.
+        let attrs = vec![
+            KeyValue {
+                key: "service.name".into(),
+                value: Some(sval("unknown_service:node")),
+            },
+            KeyValue {
+                key: "k8s.deployment.name".into(),
+                value: Some(sval("checkout")),
+            },
+        ];
+        assert_eq!(service_name(&attrs).as_deref(), Some("checkout"));
+
+        // unknown_service with no k8s hints and no configured default → None.
+        let bare = vec![KeyValue {
+            key: "service.name".into(),
+            value: Some(sval("unknown_service")),
+        }];
+        assert_eq!(service_name(&bare), None);
     }
 
     #[test]
