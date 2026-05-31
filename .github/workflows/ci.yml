@@ -60,21 +60,33 @@ jobs:
   # One image now: the server builds the UI and embeds it (rust-embed), so there
   # is no separate watcher-ui image. Build context is the repo root.
   #
-  # GitHub-hosted + QEMU for arm64 (the cluster is ARM-only). Slower than a native
-  # build, but reliable — the self-hosted BuildKit path is parked until the
-  # cluster networking is sorted (watcher-runners couldn't reach the shared
-  # worker; see the watcher-runners follow-up).
+  # Native arm64 on the self-hosted runner (runs-on: watcher-runners), offloading
+  # to the in-cluster BuildKit (now 2 stable warm workers). BuildKit is shared
+  # across repos, so the connect can transiently fail under load — hence the
+  # patient retry. BuildKit's daemon cache replaces the gha cache.
   image:
     needs: [server, ui, chart]
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: watcher-runners
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      # Connect to the shared BuildKit, retrying — a busy worker can time out the
+      # gRPC handshake. Patient (up to ~12 min) so it rides out contention bursts.
+      - name: Connect to BuildKit (retry)
+        run: |
+          for i in $(seq 1 18); do
+            docker buildx rm watcher-remote >/dev/null 2>&1 || true
+            if docker buildx create --name watcher-remote --use \
+                 --driver remote tcp://buildkit.dev.svc.cluster.local:1234 \
+               && timeout 90 docker buildx inspect --bootstrap; then
+              echo "connected to buildkit"; exit 0
+            fi
+            echo "buildkit busy (attempt $i/18), backing off…"; sleep 35
+          done
+          echo "could not reach buildkit after retries"; exit 1
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -95,5 +107,3 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
