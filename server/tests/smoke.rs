@@ -1158,3 +1158,30 @@ async fn service_red_aggregates() {
     // percentile_cont(0.5) of [10,20,30,40] = 25 (interpolated).
     assert!((s["p50_ms"].as_f64().unwrap() - 25.0).abs() < 1e-6);
 }
+
+#[tokio::test]
+#[serial]
+async fn logs_attribute_filter() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO logs (time, service, body, attributes) VALUES
+            (now(),'svc','a','{\"k8s.pod.name\":\"api-1\"}'),
+            (now(),'svc','b','{\"k8s.pod.name\":\"api-2\"}')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let router = app(pool);
+
+    let (status, logs) = get_json(&router, "/api/logs?attr=k8s.pod.name=api-1").await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = logs.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["body"], "a");
+
+    // No attr filter → both.
+    let (_, all) = get_json(&router, "/api/logs").await;
+    assert_eq!(all.as_array().unwrap().len(), 2);
+}

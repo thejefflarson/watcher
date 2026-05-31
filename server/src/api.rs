@@ -113,6 +113,8 @@ pub struct LogQuery {
     q: Option<String>,
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
+    /// Attribute equality filter, `key=value` (e.g. `k8s.pod.name=api-7f`).
+    attr: Option<String>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -134,6 +136,11 @@ pub async fn list_logs(
     Query(q): Query<LogQuery>,
 ) -> Result<Json<Vec<LogRow>>, ApiError> {
     let limit = q.limit.unwrap_or(200).clamp(1, 2000);
+    // `key=value` → match logs whose attribute `key` equals `value`.
+    let (attr_key, attr_val) = match q.attr.as_deref().and_then(|s| s.split_once('=')) {
+        Some((k, v)) if !k.is_empty() => (Some(k.to_string()), Some(v.to_string())),
+        _ => (None, None),
+    };
     let rows = sqlx::query_as::<_, LogRow>(
         "SELECT id, time, trace_id, span_id, service, severity_number, severity_text, body, attributes
          FROM logs
@@ -142,14 +149,17 @@ pub async fn list_logs(
            AND ($3::text IS NULL OR body ILIKE '%' || $3 || '%')
            AND ($4::timestamptz IS NULL OR time >= $4)
            AND ($5::timestamptz IS NULL OR time <= $5)
+           AND ($6::text IS NULL OR attributes->>$6 = $7)
          ORDER BY time DESC
-         LIMIT $6",
+         LIMIT $8",
     )
     .bind(q.service)
     .bind(q.trace_id)
     .bind(q.q)
     .bind(q.from)
     .bind(q.to)
+    .bind(attr_key)
+    .bind(attr_val)
     .bind(limit)
     .fetch_all(&pool)
     .await
