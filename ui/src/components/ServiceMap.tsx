@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { getServiceMap, type ServiceMapData } from "../api";
 import { useControls } from "../timerange";
 
@@ -7,6 +8,7 @@ export default function ServiceMap() {
   const [data, setData] = useState<ServiceMapData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const { tick } = useControls();
+  const navigate = useNavigate();
 
   useEffect(() => {
     let active = true;
@@ -82,7 +84,12 @@ export default function ServiceMap() {
         {data.nodes.map((n) => {
           const p = pos.get(n)!;
           return (
-            <g key={n}>
+            <g
+              key={n}
+              className="map-node"
+              onClick={() => navigate(`/traces?service=${encodeURIComponent(n)}`)}
+            >
+              <title>{`View traces for ${n}`}</title>
               <circle cx={p.x} cy={p.y} r={4} fill="#111" />
               <text x={p.x} y={p.y + 18} fill="#111" fontSize={12} textAnchor="middle">
                 {n}

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { getTrace, type SpanRow } from "../api";
 import { fmtDuration } from "./TraceList";
 
@@ -70,7 +71,10 @@ export default function TraceWaterfall({
       </button>
       <h2>
         {spans[0].service ?? "trace"} · <code>{traceId.slice(0, 16)}…</code> ·{" "}
-        {fmtDuration(total)}
+        {fmtDuration(total)} ·{" "}
+        <Link className="xlink" to={`/logs?trace_id=${traceId}`}>
+          logs ↗
+        </Link>
       </h2>
       <div className="bars">
         {rows.map(({ span, depth }) => {
