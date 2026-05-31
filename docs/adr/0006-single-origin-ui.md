@@ -1,7 +1,11 @@
 # 0006. Single-origin deployment, path-split by Traefik
 
-- Status: Accepted
+- Status: Superseded by [0010](0010-ui-embedded-in-server-binary.md)
 - Date: 2026-05-30
+
+> **Superseded.** The same-origin goal stands, but the UI is now embedded in the
+> server binary and served by axum rather than a separate nginx container behind a
+> path-splitting IngressRoute. See [0010](0010-ui-embedded-in-server-binary.md).
 
 ## Context
 

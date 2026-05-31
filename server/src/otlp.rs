@@ -330,3 +330,121 @@ fn any_value_to_text(v: &AnyValue) -> String {
         _ => any_value_to_json(v).to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opentelemetry_proto::tonic::common::v1::{any_value::Value as V, ArrayValue, KeyValueList};
+
+    fn sval(s: &str) -> AnyValue {
+        AnyValue {
+            value: Some(V::StringValue(s.to_string())),
+        }
+    }
+
+    #[test]
+    fn ts_converts_nanos() {
+        // 1_500_000_000 ns = 1.5 s after the epoch.
+        let t = ts(1_500_000_000);
+        assert_eq!(t.timestamp(), 1);
+        assert_eq!(t.timestamp_subsec_nanos(), 500_000_000);
+    }
+
+    #[test]
+    fn service_name_extraction() {
+        let attrs = vec![
+            KeyValue {
+                key: "host".into(),
+                value: Some(sval("box")),
+            },
+            KeyValue {
+                key: "service.name".into(),
+                value: Some(sval("checkout")),
+            },
+        ];
+        assert_eq!(service_name(&attrs).as_deref(), Some("checkout"));
+        assert_eq!(service_name(&[]), None);
+    }
+
+    #[test]
+    fn service_name_ignores_non_string() {
+        let attrs = vec![KeyValue {
+            key: "service.name".into(),
+            value: Some(AnyValue {
+                value: Some(V::IntValue(7)),
+            }),
+        }];
+        assert_eq!(service_name(&attrs), None);
+    }
+
+    #[test]
+    fn attrs_to_json_covers_all_value_kinds() {
+        let attrs = vec![
+            KeyValue {
+                key: "s".into(),
+                value: Some(sval("x")),
+            },
+            KeyValue {
+                key: "b".into(),
+                value: Some(AnyValue {
+                    value: Some(V::BoolValue(true)),
+                }),
+            },
+            KeyValue {
+                key: "i".into(),
+                value: Some(AnyValue {
+                    value: Some(V::IntValue(42)),
+                }),
+            },
+            KeyValue {
+                key: "d".into(),
+                value: Some(AnyValue {
+                    value: Some(V::DoubleValue(1.5)),
+                }),
+            },
+            KeyValue {
+                key: "by".into(),
+                value: Some(AnyValue {
+                    value: Some(V::BytesValue(vec![0xde, 0xad])),
+                }),
+            },
+            KeyValue {
+                key: "arr".into(),
+                value: Some(AnyValue {
+                    value: Some(V::ArrayValue(ArrayValue {
+                        values: vec![sval("a"), sval("b")],
+                    })),
+                }),
+            },
+            KeyValue {
+                key: "kv".into(),
+                value: Some(AnyValue {
+                    value: Some(V::KvlistValue(KeyValueList {
+                        values: vec![KeyValue {
+                            key: "nested".into(),
+                            value: Some(sval("y")),
+                        }],
+                    })),
+                }),
+            },
+        ];
+        let json = attrs_to_json(&attrs);
+        assert_eq!(json["s"], "x");
+        assert_eq!(json["b"], true);
+        assert_eq!(json["i"], 42);
+        assert_eq!(json["d"], 1.5);
+        assert_eq!(json["by"], "dead"); // hex-encoded
+        assert_eq!(json["arr"], serde_json::json!(["a", "b"]));
+        assert_eq!(json["kv"]["nested"], "y");
+    }
+
+    #[test]
+    fn any_value_to_text_passthrough_and_fallback() {
+        assert_eq!(any_value_to_text(&sval("plain")), "plain");
+        let n = AnyValue {
+            value: Some(V::IntValue(5)),
+        };
+        // Non-string bodies are JSON-stringified.
+        assert_eq!(any_value_to_text(&n), "5");
+    }
+}

@@ -192,6 +192,68 @@ pub async fn list_metrics(
     Ok(Json(rows))
 }
 
+/// Time-bucket width (seconds) used for rollups and raw-series bucketing.
+/// Matches rollup.rs' `WATCHER_ROLLUP_BUCKET_SECS` so series points line up.
+fn rollup_bucket_secs() -> f64 {
+    std::env::var("WATCHER_ROLLUP_BUCKET_SECS")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|s| *s > 0.0)
+        .unwrap_or(300.0)
+}
+
+#[derive(Deserialize)]
+pub struct SeriesQuery {
+    name: String,
+    service: Option<String>,
+    hours: Option<i32>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct SeriesPoint {
+    t: DateTime<Utc>,
+    v: Option<f64>,
+}
+
+/// GET /api/metrics/series — a time series for one metric, stitched from
+/// rollups (older buckets) and raw points (newer than the last rollup bucket),
+/// so it stays continuous after raw points are pruned. Bucket-average values.
+pub async fn metric_series(
+    State(pool): State<PgPool>,
+    Query(q): Query<SeriesQuery>,
+) -> Result<Json<Vec<SeriesPoint>>, ApiError> {
+    let hours = q.hours.unwrap_or(24).clamp(1, 24 * 90);
+    let width = rollup_bucket_secs();
+    let rows = sqlx::query_as::<_, SeriesPoint>(
+        "WITH last_roll AS (
+             SELECT max(bucket) AS b
+             FROM metric_rollups
+             WHERE name = $1 AND ($2::text IS NULL OR service = $2)
+         )
+         SELECT bucket AS t, avg AS v
+         FROM metric_rollups
+         WHERE name = $1 AND ($2::text IS NULL OR service = $2)
+           AND bucket >= now() - make_interval(hours => $3)
+         UNION ALL
+         SELECT to_timestamp(floor(extract(epoch FROM time)::float8 / $4) * $4) AS t,
+                avg(value) AS v
+         FROM metrics, last_roll
+         WHERE name = $1 AND ($2::text IS NULL OR service = $2)
+           AND time >= now() - make_interval(hours => $3)
+           AND (last_roll.b IS NULL OR time >= last_roll.b + make_interval(secs => $4))
+         GROUP BY t
+         ORDER BY t ASC",
+    )
+    .bind(q.name)
+    .bind(q.service)
+    .bind(hours)
+    .bind(width)
+    .fetch_all(&pool)
+    .await
+    .map_err(internal)?;
+    Ok(Json(rows))
+}
+
 #[derive(Serialize, sqlx::FromRow)]
 struct ServiceEdge {
     source: String,
@@ -231,4 +293,143 @@ pub async fn service_map(State(pool): State<PgPool>) -> Result<Json<ServiceMap>,
     .map_err(internal)?;
 
     Ok(Json(ServiceMap { nodes, edges }))
+}
+
+// ---------------------------------------------------------------------------
+// Alerts
+// ---------------------------------------------------------------------------
+
+fn bad_request(msg: impl Into<String>) -> ApiError {
+    (StatusCode::BAD_REQUEST, msg.into())
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct AlertRuleView {
+    id: i64,
+    name: String,
+    metric: String,
+    service: Option<String>,
+    comparator: String,
+    threshold: f64,
+    agg: String,
+    window_secs: i32,
+    enabled: bool,
+    created_at: DateTime<Utc>,
+    /// True when the rule has an unresolved (open) event.
+    firing: bool,
+}
+
+/// GET /api/alerts — all rules with their current firing state.
+pub async fn list_alerts(State(pool): State<PgPool>) -> Result<Json<Vec<AlertRuleView>>, ApiError> {
+    let rows = sqlx::query_as::<_, AlertRuleView>(
+        "SELECT r.id, r.name, r.metric, r.service, r.comparator, r.threshold, r.agg,
+                r.window_secs, r.enabled, r.created_at,
+                (e.id IS NOT NULL) AS firing
+         FROM alert_rules r
+         LEFT JOIN alert_events e ON e.rule_id = r.id AND e.resolved_at IS NULL
+         ORDER BY r.created_at DESC",
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(internal)?;
+    Ok(Json(rows))
+}
+
+#[derive(Deserialize)]
+pub struct NewAlertRule {
+    name: String,
+    metric: String,
+    service: Option<String>,
+    comparator: String,
+    threshold: f64,
+    agg: Option<String>,
+    window_secs: Option<i32>,
+}
+
+/// POST /api/alerts — create a rule. Validates the enum-ish fields so the
+/// evaluator's whitelisted SQL never sees anything unexpected.
+pub async fn create_alert(
+    State(pool): State<PgPool>,
+    Json(body): Json<NewAlertRule>,
+) -> Result<Json<i64>, ApiError> {
+    if body.name.trim().is_empty() || body.metric.trim().is_empty() {
+        return Err(bad_request("name and metric are required"));
+    }
+    if !matches!(body.comparator.as_str(), "gt" | "lt") {
+        return Err(bad_request("comparator must be 'gt' or 'lt'"));
+    }
+    let agg = body.agg.unwrap_or_else(|| "avg".to_string());
+    if !matches!(agg.as_str(), "avg" | "max" | "min" | "sum" | "last") {
+        return Err(bad_request("agg must be one of avg|max|min|sum|last"));
+    }
+    let window_secs = body.window_secs.unwrap_or(300).clamp(10, 86_400);
+    let service = body.service.filter(|s| !s.is_empty());
+
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO alert_rules (name, metric, service, comparator, threshold, agg, window_secs)
+         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id",
+    )
+    .bind(body.name)
+    .bind(body.metric)
+    .bind(service)
+    .bind(body.comparator)
+    .bind(body.threshold)
+    .bind(agg)
+    .bind(window_secs)
+    .fetch_one(&pool)
+    .await
+    .map_err(internal)?;
+    Ok(Json(id))
+}
+
+/// DELETE /api/alerts/{id} — remove a rule (its events cascade).
+pub async fn delete_alert(
+    State(pool): State<PgPool>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let res = sqlx::query("DELETE FROM alert_rules WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .map_err(internal)?;
+    if res.rows_affected() == 0 {
+        return Err((StatusCode::NOT_FOUND, "no such rule".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub struct EventQuery {
+    limit: Option<i64>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct AlertEventView {
+    id: i64,
+    rule_id: i64,
+    rule_name: String,
+    metric: String,
+    value: Option<f64>,
+    fired_at: DateTime<Utc>,
+    resolved_at: Option<DateTime<Utc>>,
+}
+
+/// GET /api/alerts/events — recent firing/resolved transitions, newest first.
+pub async fn list_alert_events(
+    State(pool): State<PgPool>,
+    Query(q): Query<EventQuery>,
+) -> Result<Json<Vec<AlertEventView>>, ApiError> {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let rows = sqlx::query_as::<_, AlertEventView>(
+        "SELECT e.id, e.rule_id, r.name AS rule_name, r.metric, e.value, e.fired_at, e.resolved_at
+         FROM alert_events e
+         JOIN alert_rules r ON r.id = e.rule_id
+         ORDER BY e.fired_at DESC
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(&pool)
+    .await
+    .map_err(internal)?;
+    Ok(Json(rows))
 }

@@ -14,7 +14,10 @@ Copy [`0000-template.md`](0000-template.md) to start one.
 | [0003](0003-denormalized-jsonb-rows.md) | One denormalized row per span/log/metric point, attributes as JSONB | Accepted |
 | [0004](0004-otlp-http-and-grpc.md) | Accept OTLP over both HTTP and gRPC, sharing storage code | Accepted |
 | [0005](0005-zalando-dedicated-postgres.md) | Dedicated Postgres via the Zalando operator | Accepted |
-| [0006](0006-single-origin-ui.md) | Single-origin deployment, path-split by Traefik | Accepted |
+| [0006](0006-single-origin-ui.md) | Single-origin deployment, path-split by Traefik | Superseded by 0010 |
 | [0007](0007-retention-by-deletion.md) | Retention by time-based deletion (defer downsampling) | Accepted |
 | [0008](0008-optional-bearer-auth.md) | Optional bearer-token auth, open by default | Accepted |
 | [0009](0009-minimal-tufte-ui.md) | Minimal, high-data-ink UI | Accepted |
+| [0010](0010-ui-embedded-in-server-binary.md) | Embed the UI in the server binary (drop nginx) | Accepted |
+| [0011](0011-metric-rollups.md) | Downsample metrics into rollup buckets | Accepted |
+| [0012](0012-alerting.md) | Threshold alerting with stored events and optional webhook | Accepted |

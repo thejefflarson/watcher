@@ -23,20 +23,6 @@ server:
       cpu: 500m
       memory: 256Mi
 
-ui:
-  replicaCount: 1
-  image:
-    repository: ghcr.io/thejefflarson/watcher-ui
-    tag: latest
-    pullPolicy: Always
-  resources:
-    requests:
-      cpu: 10m
-      memory: 16Mi
-    limits:
-      cpu: 50m
-      memory: 64Mi
-
 # A dedicated Postgres provisioned by the Zalando postgres-operator.
 # The operator creates a credential secret:
 #   {user}.{clusterName}.credentials.postgresql.acid.zalan.do
