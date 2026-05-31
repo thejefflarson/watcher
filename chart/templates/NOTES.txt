@@ -1,8 +1,7 @@
 watcher is deploying to namespace "{{ .Values.namespace }}".
 
 Components:
-  - watcher-server : OTLP/HTTP ingest + query API on :4318
-  - watcher-ui     : web UI (nginx)
+  - watcher-server : OTLP ingest + query API + embedded web UI on :4318
   - {{ .Values.postgres.clusterName }} : Postgres (Zalando operator)
 
 Point your OpenTelemetry exporters at:

@@ -246,3 +246,85 @@ tr.clickable:hover td {
   justify-content: center;
   padding-top: 0.5rem;
 }
+
+/* Metric time-series chart. */
+.metric-chart h2 {
+  font-weight: 400;
+  font-size: 1.05rem;
+}
+
+.chart {
+  display: block;
+  max-width: 100%;
+}
+
+.chart .tick {
+  fill: var(--muted);
+  font-family: ui-monospace, Menlo, "SF Mono", monospace;
+  font-size: 10px;
+}
+
+button.range {
+  background: none;
+  border: none;
+  font: inherit;
+  font-size: 0.9rem;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0 0 2px;
+}
+
+button.range.active {
+  color: var(--text);
+  border-bottom: 1.5px solid var(--text);
+}
+
+/* Alerts: an inline rule-builder, fields underlined like the filters. */
+.alert-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.9rem;
+  margin-bottom: 1.6rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--rule);
+}
+
+.alert-form input,
+.alert-form select {
+  border: none;
+  border-bottom: 1px solid var(--rule);
+  background: none;
+  font: inherit;
+  font-size: 0.9rem;
+  padding: 0.2rem 0;
+}
+
+.alert-form input.num {
+  width: 6rem;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.alert-form input:focus,
+.alert-form select:focus {
+  outline: none;
+  border-bottom-color: var(--text);
+}
+
+.alert-form button[type="submit"] {
+  background: none;
+  border: 1px solid var(--rule);
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.2rem 0.7rem;
+  cursor: pointer;
+}
+
+.alerts h3 {
+  font-weight: 400;
+  font-style: italic;
+  color: var(--muted);
+  font-size: 0.95rem;
+  margin: 1.6rem 0 0.6rem;
+}

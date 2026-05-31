@@ -57,20 +57,15 @@ jobs:
         run: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
       - run: helm lint chart
 
-  images:
+  # One image now: the server builds the UI and embeds it (rust-embed), so there
+  # is no separate watcher-ui image. Build context is the repo root.
+  image:
     needs: [server, ui, chart]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-    strategy:
-      matrix:
-        include:
-          - name: server
-            context: server
-          - name: ui
-            context: ui
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
@@ -83,7 +78,7 @@ jobs:
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: ghcr.io/${{ github.repository_owner }}/watcher-${{ matrix.name }}
+          images: ghcr.io/${{ github.repository_owner }}/watcher-server
           tags: |
             type=raw,value=latest
             type=sha
@@ -91,7 +86,8 @@ jobs:
       # cluster is ARM. Switch to native arm64 runners later if it drags.
       - uses: docker/build-push-action@v6
         with:
-          context: ${{ matrix.context }}
+          context: .
+          file: server/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}

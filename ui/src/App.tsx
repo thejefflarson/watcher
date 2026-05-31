@@ -4,15 +4,17 @@ import TraceWaterfall from "./components/TraceWaterfall";
 import LogView from "./components/LogView";
 import MetricList from "./components/MetricList";
 import ServiceMap from "./components/ServiceMap";
+import Alerts from "./components/Alerts";
 import { getToken, setToken } from "./api";
 
-type Tab = "traces" | "logs" | "metrics" | "map";
+type Tab = "traces" | "logs" | "metrics" | "map" | "alerts";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "traces", label: "Traces" },
   { id: "logs", label: "Logs" },
   { id: "metrics", label: "Metrics" },
   { id: "map", label: "Service Map" },
+  { id: "alerts", label: "Alerts" },
 ];
 
 export default function App() {
@@ -61,6 +63,7 @@ export default function App() {
         {tab === "logs" && <LogView />}
         {tab === "metrics" && <MetricList />}
         {tab === "map" && <ServiceMap />}
+        {tab === "alerts" && <Alerts />}
       </main>
     </div>
   );

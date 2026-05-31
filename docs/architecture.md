@@ -1,30 +1,34 @@
 # Architecture
 
-watcher is two processes — a Rust **server** and a static **UI** — over one
-PostgreSQL database. See the [ADRs](adr/) for *why*; this is *how*.
+watcher is a single Rust **server** — OTLP ingest, JSON query API, and the
+embedded **UI** — over one PostgreSQL database. See the [ADRs](adr/) for *why*;
+this is *how*.
 
 ## Components & ports
 
-| Port | Proto | Who | What |
-|------|-------|-----|------|
-| 4318 | HTTP  | server | OTLP ingest (`/v1/{traces,logs,metrics}`) **and** JSON query API (`/api/*`) + `/healthz` |
-| 4317 | gRPC  | server | OTLP ingest (Trace/Logs/Metrics services) |
-| 8080 | HTTP  | ui     | nginx serving the built SPA |
+| Port | Proto | What |
+|------|-------|------|
+| 4318 | HTTP  | OTLP ingest (`/v1/{traces,logs,metrics}`), JSON query API (`/api/*`), `/healthz`, **and the SPA** (everything else) |
+| 4317 | gRPC  | OTLP ingest (Trace/Logs/Metrics services) |
 
-In production a single Traefik IngressRoute path-splits one host: `/v1` + `/api` +
-`/healthz` → server, everything else → UI ([ADR 0006](adr/0006-single-origin-ui.md)).
+The built UI (`ui/dist`) is compiled into the binary with `rust-embed` and served
+as the axum fallback, so there's one image, one port, one origin — no nginx, no
+path-split ([ADR 0010](adr/0010-ui-embedded-in-server-binary.md)). A Traefik
+IngressRoute (when enabled) routes the whole host to the server.
 
 ## Server module map (`server/src/`)
 
 ```
-main.rs        env, connect, migrate, then run HTTP + gRPC + retention concurrently
-lib.rs         app(pool, auth) -> axum Router; AuthConfig + bearer-token middleware
+main.rs        env, connect, migrate, then run HTTP + gRPC + retention + rollup + alerts concurrently
+lib.rs         app(pool, auth) -> axum Router; AuthConfig + bearer middleware; rust-embed UI fallback
 otlp.rs        OTLP decode + storage. ingest_* (HTTP) and store_* (shared) + inserts
 grpc.rs        tonic Trace/Logs/Metrics services -> the same store_* functions
-api.rs         query handlers: list_traces, get_trace, list_logs, list_metrics, service_map
+api.rs         query handlers: traces, logs, metrics, metric series, service map, alert CRUD
 db.rs          PgPool + sqlx::migrate!
-retention.rs   hourly background prune
-migrations/    0001 spans+logs, 0002 metrics (additive, embedded at build)
+retention.rs   hourly background prune (prune_once); raw metrics on a shorter window than rollups
+rollup.rs      periodic downsample of raw metrics into metric_rollups (rollup_once)
+alerts.rs      periodic threshold evaluation (evaluate_once) -> alert_events + optional webhook
+migrations/    0001 spans+logs, 0002 metrics, 0003 metric_rollups, 0004 alerts (additive, embedded)
 ```
 
 The key seam: **transports are thin, storage is shared.** Both the HTTP handlers
@@ -52,9 +56,15 @@ Three flat tables, one row per span / log record / metric data point, with
   end_time, duration_ms, status_code, …`. Unique on `(trace_id, span_id)`.
 - **logs** — `time, trace_id, span_id, service, severity_*, body, …`.
 - **metrics** — `time, service, name, kind (gauge|sum|histogram), value, count, unit, …`.
+- **metric_rollups** — pre-aggregated metric buckets (`bucket, name, service, count,
+  sum, min, max, avg`) so history survives raw-point pruning ([ADR 0011](adr/0011-metric-rollups.md)).
+- **alert_rules** / **alert_events** — threshold rules and their firing/resolved
+  transitions ([ADR 0012](adr/0012-alerting.md)).
 
 Derived views are pure SQL: trace summaries (`GROUP BY trace_id`), the service map
-(self-join `spans` on `parent_span_id`), metric sparklines (`array_agg` slice).
+(self-join `spans` on `parent_span_id`), metric sparklines (`array_agg` slice). A
+metric time series stitches `metric_rollups` (old) with raw `metrics` newer than the
+last rollup bucket, so it stays continuous after pruning.
 
 ## Config (env)
 
@@ -63,7 +73,11 @@ Derived views are pure SQL: trace summaries (`GROUP BY trace_id`), the service m
 | `DATABASE_URL` | `postgres://watcher:watcher@localhost:5432/watcher` | Postgres |
 | `BIND_ADDR` | `0.0.0.0:4318` | HTTP listener |
 | `GRPC_BIND_ADDR` | `0.0.0.0:4317` | gRPC listener |
-| `WATCHER_RETENTION_DAYS` | `7` | prune age; `0` disables |
+| `WATCHER_RETENTION_DAYS` | `7` | prune age for spans/logs/rollups; `0` disables |
+| `WATCHER_METRICS_RAW_DAYS` | `2` | prune age for raw metric points (rollups keep history); `0` = same as retention |
+| `WATCHER_ROLLUP_BUCKET_SECS` | `300` | downsample bucket width; `0` disables rollups |
+| `WATCHER_ALERT_INTERVAL_SECS` | `30` | how often alert rules are evaluated (min 5) |
+| `WATCHER_ALERT_WEBHOOK` | — | optional URL to POST on alert fire/resolve |
 | `WATCHER_INGEST_TOKEN` | — | optional bearer for `/v1` + gRPC |
 | `WATCHER_API_TOKEN` | — | optional bearer for `/api` |
 | `RUST_LOG` | `info,watcher_server=debug,sqlx=warn` | tracing filter |

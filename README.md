@@ -5,32 +5,32 @@ with a built-in UI — a SigNoz-style experience **without ClickHouse**, light e
 run on a Raspberry Pi.
 
 - **Rust** ingest + query server (axum + sqlx), OTLP over **HTTP (:4318) and gRPC (:4317)**
-- **TypeScript** UI (Vite + React): trace list & waterfall, log search, metrics, service map
+- **TypeScript** UI (Vite + React): traces & waterfall, log search, metric charts, service map, alerts —
+  **embedded into the server binary**, so it's one image on one port (no nginx)
 - **Postgres** for storage (Timescale optional) — nothing else
-- Optional bearer-token auth, background retention
+- Optional bearer-token auth, background retention, metric rollups, threshold alerting
 
 ## Architecture
 
 ```
   OTel SDKs / Collector
-        │  OTLP/HTTP (protobuf)
+        │  OTLP/HTTP (protobuf) :4318  ·  OTLP/gRPC :4317
         ▼
-  ┌─────────────────┐   POST /v1/traces   ┌────────────┐
-  │  watcher-server │──────────────────▶ │            │
-  │  (Rust, axum)   │   POST /v1/logs     │  Postgres  │
-  │                 │◀──────────────────  │ spans/logs │
-  │  GET /api/...   │   query (sqlx)      └────────────┘
-  └─────────────────┘
-        ▲  fetch JSON
-  ┌─────────────────┐
-  │   watcher-ui    │  React: trace list · waterfall · log search
-  └─────────────────┘
+  ┌───────────────────────────────┐   POST /v1/{traces,logs,metrics}   ┌──────────────┐
+  │        watcher-server         │ ─────────────────────────────────▶ │              │
+  │        (Rust, axum)           │            query (sqlx)            │   Postgres   │
+  │  /v1 ingest · /api query      │ ◀───────────────────────────────── │ spans/logs/  │
+  │  embedded React SPA (/)       │                                    │ metrics/...  │
+  └───────────────────────────────┘                                    └──────────────┘
+        ▲  browser: one origin (API + UI)
+        │  GET / → SPA · GET /api/... → JSON
 ```
 
-- **Ingest**: OTLP/HTTP on `:4318` (`/v1/traces`, `/v1/logs`) — a drop-in
-  `OTEL_EXPORTER_OTLP_ENDPOINT`.
-- **Store**: `spans` and `logs` tables, attributes as `JSONB`. Migrations run on startup.
-- **Query**: `/api/traces`, `/api/traces/{trace_id}`, `/api/logs`.
+- **Ingest**: OTLP on `:4318` (`/v1/traces`, `/v1/logs`, `/v1/metrics`) and gRPC
+  `:4317` — a drop-in `OTEL_EXPORTER_OTLP_ENDPOINT`.
+- **Store**: `spans`, `logs`, `metrics` (+ `metric_rollups`, `alert_rules/events`)
+  tables, attributes as `JSONB`. Migrations run on startup.
+- **Query + UI**: `/api/*` returns JSON; everything else serves the embedded SPA.
 
 ## Quick start (local)
 
@@ -52,7 +52,8 @@ OTEL_TRACES_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp  your-app
 
 ## Deploy (Kubernetes / Helm)
 
-The chart deploys the server, the UI, and a dedicated Postgres, behind one host.
+The chart deploys the server (which serves both the API and the embedded UI) and a
+dedicated Postgres, behind one host.
 
 **Requirements in-cluster:** the Zalando [postgres-operator](https://github.com/zalando/postgres-operator)
 (provisions the DB) and [Traefik](https://traefik.io/) (the IngressRoute). Nodes must be
@@ -68,23 +69,25 @@ The server reads its DB password from the operator-generated credential secret
 (`watcher.watcher-db.credentials.postgresql.acid.zalan.do`) and composes `DATABASE_URL`
 at runtime. See `chart/values.yaml` for the knobs.
 
-## Build the images
+## Build the image
+
+One image — the build (context = repo root) builds the UI and embeds it in the
+server binary:
 
 ```sh
-docker build -t ghcr.io/thejefflarson/watcher-server ./server
-docker build -t ghcr.io/thejefflarson/watcher-ui ./ui   # build-arg VITE_API_BASE="" (same-origin)
+docker build -f server/Dockerfile -t ghcr.io/thejefflarson/watcher-server .
 ```
 
-CI (`.github/workflows/ci.yml`) builds and pushes multi-arch (`amd64` + `arm64`) images
-to GHCR on every push to `main`, alongside `cargo fmt/build/test`, the UI build, and
-`helm lint`.
+CI (`.github/workflows/ci.yml`) builds and pushes a multi-arch (`amd64` + `arm64`)
+image to GHCR on every push to `main`, alongside `cargo fmt/build/test`, the UI build,
+and `helm lint`.
 
 ## Layout
 
 ```
-server/      Rust ingest + query server, migrations, Dockerfile
-ui/          Vite + React + TS UI, Dockerfile, nginx.conf
-chart/       Helm chart (server, ui, Zalando Postgres, Traefik IngressRoute)
+server/      Rust ingest + query server, migrations, Dockerfile (builds + embeds the UI)
+ui/          Vite + React + TS UI (built to ui/dist, embedded into the server)
+chart/       Helm chart (server, Zalando Postgres, Traefik IngressRoute)
 docker-compose.yml   local Postgres
 ```
 
@@ -102,9 +105,11 @@ docker-compose.yml   local Postgres
 - [x] Auth on ingest + UI (optional bearer tokens)
 - [x] Retention (background prune; `WATCHER_RETENTION_DAYS`)
 - [x] Service map
-- [ ] Downsampling / rollups for old data
-- [ ] Metric time-series charts in the UI (currently latest-value table)
-- [ ] Alerting
+- [x] Downsampling / rollups for old data
+- [x] Metric time-series charts in the UI
+- [x] Alerting (threshold rules, events, optional webhook)
+- [x] Single image — UI embedded in the server binary (no nginx)
+- [ ] Sustained-condition alerts (`for: 5m`) and webhook retries
 
 ## License
 

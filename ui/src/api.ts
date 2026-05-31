@@ -62,13 +62,31 @@ export interface ServiceMapData {
   edges: { source: string; target: string; calls: number }[];
 }
 
-async function get<T>(path: string): Promise<T> {
+function authHeaders(extra?: Record<string, string>): Record<string, string> {
   const token = getToken();
-  const res = await fetch(`${BASE}${path}`, {
-    headers: token ? { authorization: `Bearer ${token}` } : {},
-  });
+  return {
+    ...(token ? { authorization: `Bearer ${token}` } : {}),
+    ...extra,
+  };
+}
+
+async function get<T>(path: string): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, { headers: authHeaders() });
   if (res.status === 401) throw new Unauthorized("unauthorized");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return (await res.json()) as T;
+}
+
+async function send<T>(method: string, path: string, body?: unknown): Promise<T | null> {
+  const res = await fetch(`${BASE}${path}`, {
+    method,
+    headers: authHeaders(body !== undefined ? { "content-type": "application/json" } : {}),
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  if (res.status === 401) throw new Unauthorized("unauthorized");
+  if (!res.ok) throw new Error(`${res.status} ${(await res.text()) || res.statusText}`);
+  // 204 No Content (DELETE) has no body to parse.
+  if (res.status === 204) return null;
   return (await res.json()) as T;
 }
 
@@ -92,4 +110,57 @@ export const listLogs = (
 export const listMetrics = (p: { service?: string; limit?: number } = {}) =>
   get<MetricSummary[]>(`/api/metrics?${qs(p)}`);
 
+export interface SeriesPoint {
+  t: string;
+  v: number | null;
+}
+
+export const getMetricSeries = (p: { name: string; service?: string; hours?: number }) =>
+  get<SeriesPoint[]>(`/api/metrics/series?${qs(p)}`);
+
 export const getServiceMap = () => get<ServiceMapData>(`/api/servicemap`);
+
+// --- Alerts ---------------------------------------------------------------
+
+export type Comparator = "gt" | "lt";
+export type Agg = "avg" | "max" | "min" | "sum" | "last";
+
+export interface AlertRule {
+  id: number;
+  name: string;
+  metric: string;
+  service: string | null;
+  comparator: Comparator;
+  threshold: number;
+  agg: Agg;
+  window_secs: number;
+  enabled: boolean;
+  created_at: string;
+  firing: boolean;
+}
+
+export interface NewAlertRule {
+  name: string;
+  metric: string;
+  service?: string;
+  comparator: Comparator;
+  threshold: number;
+  agg?: Agg;
+  window_secs?: number;
+}
+
+export interface AlertEvent {
+  id: number;
+  rule_id: number;
+  rule_name: string;
+  metric: string;
+  value: number | null;
+  fired_at: string;
+  resolved_at: string | null;
+}
+
+export const listAlerts = () => get<AlertRule[]>(`/api/alerts`);
+export const createAlert = (r: NewAlertRule) => send<number>("POST", `/api/alerts`, r);
+export const deleteAlert = (id: number) => send<null>("DELETE", `/api/alerts/${id}`);
+export const listAlertEvents = (limit = 100) =>
+  get<AlertEvent[]>(`/api/alerts/events?${qs({ limit })}`);

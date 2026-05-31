@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use tracing_subscriber::EnvFilter;
-use watcher_server::{app, db, grpc, retention, AuthConfig};
+use watcher_server::{alerts, app, db, grpc, retention, rollup, AuthConfig};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -18,16 +18,39 @@ async fn main() -> anyhow::Result<()> {
     let grpc_bind: SocketAddr = std::env::var("GRPC_BIND_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:4317".to_string())
         .parse()?;
-    let retention_days: i32 = std::env::var("WATCHER_RETENTION_DAYS")
+    let env_i32 = |k: &str, default: i32| -> i32 {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
+    };
+    let retention_days = env_i32("WATCHER_RETENTION_DAYS", 7);
+    // Raw metric points are pruned sooner than everything else; rollups keep the
+    // history. 0 keeps raw points for the full retention window.
+    let metrics_raw_days = env_i32("WATCHER_METRICS_RAW_DAYS", 2);
+    // Width of a downsample bucket, in seconds (0 disables rollups).
+    let rollup_bucket_secs = env_i32("WATCHER_ROLLUP_BUCKET_SECS", 300) as i64;
+    // How often to evaluate alert rules, and where to POST when one fires.
+    let alert_interval_secs = env_i32("WATCHER_ALERT_INTERVAL_SECS", 30).max(5) as u64;
+    let alert_webhook = std::env::var("WATCHER_ALERT_WEBHOOK")
         .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(7);
+        .filter(|s| !s.is_empty());
 
     let pool = db::connect(&database_url).await?;
     db::migrate(&pool).await?;
 
     let auth = AuthConfig::from_env();
-    tokio::spawn(retention::run(pool.clone(), retention_days));
+    tokio::spawn(retention::run(
+        pool.clone(),
+        retention_days,
+        metrics_raw_days,
+    ));
+    tokio::spawn(rollup::run(pool.clone(), rollup_bucket_secs));
+    tokio::spawn(alerts::run(
+        pool.clone(),
+        alert_webhook,
+        alert_interval_secs,
+    ));
 
     let http = {
         let pool = pool.clone();

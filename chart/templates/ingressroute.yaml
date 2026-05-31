@@ -25,25 +25,13 @@ spec:
   entryPoints:
     - websecure
   routes:
-    # OTLP ingest + query API + health → server.
-    - match: >-
-        Host(`{{ .Values.hostname }}`) && (
-          PathPrefix(`/v1`) ||
-          PathPrefix(`/api`) ||
-          Path(`/healthz`)
-        )
+    # One backend: the server handles OTLP ingest (/v1), the query API (/api),
+    # health (/healthz), and serves the embedded SPA for everything else.
+    - match: Host(`{{ .Values.hostname }}`)
       kind: Rule
       middlewares:
         - name: watcher-security-headers
       services:
         - name: watcher-server
           port: 4318
-    # Everything else (SPA + assets) → UI.
-    - match: Host(`{{ .Values.hostname }}`)
-      kind: Rule
-      middlewares:
-        - name: watcher-security-headers
-      services:
-        - name: watcher-ui
-          port: 80
 {{- end }}
