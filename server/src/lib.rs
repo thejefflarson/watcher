@@ -64,6 +64,11 @@ pub fn app(pool: PgPool) -> Router {
         .route("/api/logs", get(api::list_logs))
         .route("/api/metrics", get(api::list_metrics))
         .route("/api/metrics/series", get(api::metric_series))
+        .route(
+            "/api/metrics/series_grouped",
+            get(api::metric_series_grouped),
+        )
+        .route("/api/metrics/dims", get(api::metric_dims))
         .route("/api/servicemap", get(api::service_map))
         .route("/api/alerts", get(api::list_alerts).post(api::create_alert))
         .route("/api/alerts/events", get(api::list_alert_events))

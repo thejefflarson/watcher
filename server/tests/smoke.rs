@@ -1043,3 +1043,53 @@ async fn ingest_gzipped_metric_keeps_resource_dimensions() {
     .unwrap();
     assert_eq!(pod.as_deref(), Some("watcher-server-abc"));
 }
+
+#[tokio::test]
+#[serial]
+async fn ingest_log_keeps_resource_dimensions() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let router = app(pool.clone());
+
+    let req = ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", "api"), kv("k8s.pod.name", "api-7d")],
+                ..Default::default()
+            }),
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![LogRecord {
+                    time_unix_nano: 1_000_000_000,
+                    body: Some(AnyValue {
+                        value: Some(any_value::Value::StringValue("hi".to_string())),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/logs")
+                .header("content-type", "application/x-protobuf")
+                .body(Body::from(req.encode_to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let pod: Option<String> =
+        sqlx::query_scalar("SELECT attributes->>'k8s.pod.name' FROM logs LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(pod.as_deref(), Some("api-7d"));
+}

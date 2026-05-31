@@ -114,10 +114,11 @@ pub async fn ingest_metrics(
 pub async fn store_traces(pool: &PgPool, req: ExportTraceServiceRequest) -> u64 {
     let mut count = 0;
     for rs in &req.resource_spans {
-        let service = service_name(resource_attrs(rs.resource.as_ref()));
+        let rattrs = resource_attrs(rs.resource.as_ref());
+        let service = service_name(rattrs);
         for ss in &rs.scope_spans {
             for span in &ss.spans {
-                match insert_span(pool, service.as_deref(), span).await {
+                match insert_span(pool, service.as_deref(), rattrs, span).await {
                     Ok(()) => count += 1,
                     Err(e) => tracing::warn!("insert span failed: {e}"),
                 }
@@ -130,10 +131,13 @@ pub async fn store_traces(pool: &PgPool, req: ExportTraceServiceRequest) -> u64 
 pub async fn store_logs(pool: &PgPool, req: ExportLogsServiceRequest) -> u64 {
     let mut count = 0;
     for rl in &req.resource_logs {
-        let service = service_name(resource_attrs(rl.resource.as_ref()));
+        // Keep resource attributes (k8s.pod.name / node / container, …) so logs
+        // can be filtered by pod/host, not just service.
+        let rattrs = resource_attrs(rl.resource.as_ref());
+        let service = service_name(rattrs);
         for sl in &rl.scope_logs {
             for rec in &sl.log_records {
-                match insert_log(pool, service.as_deref(), rec).await {
+                match insert_log(pool, service.as_deref(), rattrs, rec).await {
                     Ok(()) => count += 1,
                     Err(e) => tracing::warn!("insert log failed: {e}"),
                 }
@@ -163,7 +167,12 @@ pub async fn store_metrics(pool: &PgPool, req: ExportMetricsServiceRequest) -> u
 // Inserts
 // ---------------------------------------------------------------------------
 
-async fn insert_span(pool: &PgPool, service: Option<&str>, span: &Span) -> anyhow::Result<()> {
+async fn insert_span(
+    pool: &PgPool,
+    service: Option<&str>,
+    resource: &[KeyValue],
+    span: &Span,
+) -> anyhow::Result<()> {
     let trace_id = hex::encode(&span.trace_id);
     let span_id = hex::encode(&span.span_id);
     let parent = (!span.parent_span_id.is_empty()).then(|| hex::encode(&span.parent_span_id));
@@ -180,7 +189,7 @@ async fn insert_span(pool: &PgPool, service: Option<&str>, span: &Span) -> anyho
         ),
         None => (None, None),
     };
-    let attrs = attrs_to_json(&span.attributes);
+    let attrs = merged_attrs(resource, &span.attributes);
 
     sqlx::query(
         "INSERT INTO spans (trace_id, span_id, parent_span_id, service, name, kind,
@@ -205,7 +214,12 @@ async fn insert_span(pool: &PgPool, service: Option<&str>, span: &Span) -> anyho
     Ok(())
 }
 
-async fn insert_log(pool: &PgPool, service: Option<&str>, rec: &LogRecord) -> anyhow::Result<()> {
+async fn insert_log(
+    pool: &PgPool,
+    service: Option<&str>,
+    resource: &[KeyValue],
+    rec: &LogRecord,
+) -> anyhow::Result<()> {
     let nanos = if rec.time_unix_nano != 0 {
         rec.time_unix_nano
     } else {
@@ -215,7 +229,7 @@ async fn insert_log(pool: &PgPool, service: Option<&str>, rec: &LogRecord) -> an
     let trace_id = (!rec.trace_id.is_empty()).then(|| hex::encode(&rec.trace_id));
     let span_id = (!rec.span_id.is_empty()).then(|| hex::encode(&rec.span_id));
     let body = rec.body.as_ref().map(any_value_to_text);
-    let attrs = attrs_to_json(&rec.attributes);
+    let attrs = merged_attrs(resource, &rec.attributes);
 
     sqlx::query(
         "INSERT INTO logs (time, trace_id, span_id, service, severity_number, severity_text, body, attributes)

@@ -254,6 +254,73 @@ pub async fn metric_series(
     Ok(Json(rows))
 }
 
+#[derive(Deserialize)]
+pub struct DimsQuery {
+    name: String,
+}
+
+/// GET /api/metrics/dims — attribute keys a metric can be grouped by
+/// (e.g. k8s.pod.name, k8s.node.name, k8s.container.name).
+pub async fn metric_dims(
+    State(pool): State<PgPool>,
+    Query(q): Query<DimsQuery>,
+) -> Result<Json<Vec<String>>, ApiError> {
+    let keys: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT key
+         FROM metrics, jsonb_object_keys(attributes) AS key
+         WHERE name = $1 AND time >= now() - interval '2 days'
+         ORDER BY key",
+    )
+    .bind(q.name)
+    .fetch_all(&pool)
+    .await
+    .map_err(internal)?;
+    Ok(Json(keys))
+}
+
+#[derive(Deserialize)]
+pub struct GroupedQuery {
+    name: String,
+    group_by: String,
+    hours: Option<i32>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct LabeledPoint {
+    label: Option<String>,
+    t: DateTime<Utc>,
+    v: Option<f64>,
+}
+
+/// GET /api/metrics/series_grouped — one bucketed series per distinct value of
+/// `group_by` (e.g. one line per pod). Raw points only, since rollups aggregate
+/// the dimensions away — so this covers the raw-retention window.
+pub async fn metric_series_grouped(
+    State(pool): State<PgPool>,
+    Query(q): Query<GroupedQuery>,
+) -> Result<Json<Vec<LabeledPoint>>, ApiError> {
+    let hours = q.hours.unwrap_or(6).clamp(1, 24 * 7);
+    let width = rollup_bucket_secs();
+    let rows = sqlx::query_as::<_, LabeledPoint>(
+        "SELECT attributes->>$2 AS label,
+                to_timestamp(floor(extract(epoch FROM time)::float8 / $4) * $4) AS t,
+                avg(value) AS v
+         FROM metrics
+         WHERE name = $1 AND attributes ? $2
+           AND time >= now() - make_interval(hours => $3)
+         GROUP BY label, t
+         ORDER BY label NULLS LAST, t ASC",
+    )
+    .bind(&q.name)
+    .bind(&q.group_by)
+    .bind(hours)
+    .bind(width)
+    .fetch_all(&pool)
+    .await
+    .map_err(internal)?;
+    Ok(Json(rows))
+}
+
 #[derive(Serialize, sqlx::FromRow)]
 struct ServiceEdge {
     source: String,
