@@ -92,7 +92,14 @@ export default function MetricList({
                 onClick={() => onSelect(m)}
                 title="View time series"
               >
-                <td className="mono">{m.name}</td>
+                <td className="mono">
+                  {m.name}
+                  {m.series_count != null && m.series_count > 1 && (
+                    <span className="muted" title={`${m.series_count} series summed — open for the per-label breakdown`}>
+                      {" "}×{m.series_count}
+                    </span>
+                  )}
+                </td>
                 <td>{m.service ?? "—"}</td>
                 <td className="muted">{m.kind ?? "—"}</td>
                 <td>{m.spark ? <Sparkline values={m.spark} /> : <span className="muted">—</span>}</td>
