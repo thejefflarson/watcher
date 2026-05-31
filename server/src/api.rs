@@ -183,7 +183,6 @@ pub struct MetricSummary {
     service: Option<String>,
     kind: Option<String>,
     unit: Option<String>,
-    points: i64,
     last_time: DateTime<Utc>,
     last_value: Option<f64>,
     /// Up to 30 most-recent values (newest first) for an inline sparkline.
@@ -196,21 +195,39 @@ pub async fn list_metrics(
     Query(q): Query<MetricQuery>,
 ) -> Result<Json<Vec<MetricSummary>>, ApiError> {
     let limit = q.limit.unwrap_or(200).clamp(1, 2000);
+    // Reading every point in the window to GROUP BY name was ~minutes at scale.
+    // Instead: enumerate distinct names with a loose index scan (recursive CTE),
+    // then per name read only the 30 most-recent points (via metrics_name_time_idx)
+    // for the latest value + sparkline. Names with no points in the window drop out.
     let rows = sqlx::query_as::<_, MetricSummary>(
-        "SELECT name,
-                max(service)                            AS service,
-                max(kind)                               AS kind,
-                max(unit)                               AS unit,
-                count(*)                                AS points,
-                max(time)                               AS last_time,
-                (array_agg(value ORDER BY time DESC))[1] AS last_value,
-                (array_agg(value ORDER BY time DESC) FILTER (WHERE value IS NOT NULL))[1:30] AS spark
-         FROM metrics
-         WHERE ($1::text IS NULL OR service = $1)
-           AND ($2::timestamptz IS NULL OR time >= $2)
-           AND ($3::timestamptz IS NULL OR time <= $3)
-         GROUP BY name
-         ORDER BY name
+        "WITH RECURSIVE names AS (
+             SELECT min(name) AS name FROM metrics
+             UNION ALL
+             SELECT (SELECT min(name) FROM metrics WHERE name > n.name)
+             FROM names n WHERE n.name IS NOT NULL
+         )
+         SELECT n.name, r.service, r.kind, r.unit, r.last_time, r.last_value, r.spark
+         FROM names n
+         CROSS JOIN LATERAL (
+             SELECT (array_agg(service ORDER BY time DESC))[1] AS service,
+                    (array_agg(kind    ORDER BY time DESC))[1] AS kind,
+                    (array_agg(unit    ORDER BY time DESC))[1] AS unit,
+                    (array_agg(value   ORDER BY time DESC))[1] AS last_value,
+                    max(time)                                  AS last_time,
+                    array_agg(value ORDER BY time DESC) FILTER (WHERE value IS NOT NULL) AS spark
+             FROM (
+                 SELECT service, kind, unit, value, time
+                 FROM metrics
+                 WHERE name = n.name
+                   AND ($1::text IS NULL OR service = $1)
+                   AND ($2::timestamptz IS NULL OR time >= $2)
+                   AND ($3::timestamptz IS NULL OR time <= $3)
+                 ORDER BY time DESC
+                 LIMIT 30
+             ) recent
+         ) r
+         WHERE n.name IS NOT NULL AND r.last_time IS NOT NULL
+         ORDER BY n.name
          LIMIT $4",
     )
     .bind(q.service)

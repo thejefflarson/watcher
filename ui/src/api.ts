@@ -46,7 +46,6 @@ export interface MetricSummary {
   service: string | null;
   kind: string | null;
   unit: string | null;
-  points: number;
   last_time: string;
   last_value: number | null;
   spark: number[] | null;

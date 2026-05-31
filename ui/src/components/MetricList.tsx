@@ -82,7 +82,6 @@ export default function MetricList({
               <th>kind</th>
               <th>recent</th>
               <th className="num">last</th>
-              <th className="num">points</th>
             </tr>
           </thead>
           <tbody>
@@ -98,7 +97,6 @@ export default function MetricList({
                 <td className="muted">{m.kind ?? "—"}</td>
                 <td>{m.spark ? <Sparkline values={m.spark} /> : <span className="muted">—</span>}</td>
                 <td className="num">{formatValue(m.last_value, m.unit)}</td>
-                <td className="num muted">{m.points}</td>
               </tr>
             ))}
           </tbody>
