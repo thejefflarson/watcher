@@ -16,8 +16,9 @@ Copy [`0000-template.md`](0000-template.md) to start one.
 | [0005](0005-zalando-dedicated-postgres.md) | Dedicated Postgres via the Zalando operator | Accepted |
 | [0006](0006-single-origin-ui.md) | Single-origin deployment, path-split by Traefik | Superseded by 0010 |
 | [0007](0007-retention-by-deletion.md) | Retention by time-based deletion (defer downsampling) | Accepted |
-| [0008](0008-optional-bearer-auth.md) | Optional bearer-token auth, open by default | Accepted |
+| [0008](0008-optional-bearer-auth.md) | Optional bearer-token auth, open by default | Superseded by 0013 |
 | [0009](0009-minimal-tufte-ui.md) | Minimal, high-data-ink UI | Accepted |
 | [0010](0010-ui-embedded-in-server-binary.md) | Embed the UI in the server binary (drop nginx) | Accepted |
 | [0011](0011-metric-rollups.md) | Downsample metrics into rollup buckets | Accepted |
 | [0012](0012-alerting.md) | Threshold alerting with stored events and optional webhook | Accepted |
+| [0013](0013-auth-at-the-edge.md) | Authenticate at the edge (Cloudflare Access), not in the app | Accepted |

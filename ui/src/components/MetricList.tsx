@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
 import { listMetrics, type MetricSummary } from "../api";
-import MetricChart from "./MetricChart";
 
 // Inline sparkline — a small multiple, drawn with no axes or chrome.
 function Sparkline({ values }: { values: number[] }) {
@@ -27,11 +26,14 @@ function Sparkline({ values }: { values: number[] }) {
   );
 }
 
-export default function MetricList() {
+export default function MetricList({
+  onSelect,
+}: {
+  onSelect: (m: MetricSummary) => void;
+}) {
   const [metrics, setMetrics] = useState<MetricSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [service, setService] = useState("");
-  const [selected, setSelected] = useState<MetricSummary | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -50,16 +52,6 @@ export default function MetricList() {
       clearTimeout(handle);
     };
   }, [service]);
-
-  if (selected) {
-    return (
-      <MetricChart
-        name={selected.name}
-        service={selected.service}
-        onBack={() => setSelected(null)}
-      />
-    );
-  }
 
   if (error) return <p className="error">Failed to load: {error}</p>;
 
@@ -91,7 +83,7 @@ export default function MetricList() {
               <tr
                 key={m.name}
                 className="clickable"
-                onClick={() => setSelected(m)}
+                onClick={() => onSelect(m)}
                 title="View time series"
               >
                 <td className="mono">{m.name}</td>

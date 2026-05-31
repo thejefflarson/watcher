@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use tracing_subscriber::EnvFilter;
-use watcher_server::{alerts, app, db, grpc, retention, rollup, AuthConfig};
+use watcher_server::{alerts, app, db, grpc, retention, rollup};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,7 +39,6 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::connect(&database_url).await?;
     db::migrate(&pool).await?;
 
-    let auth = AuthConfig::from_env();
     tokio::spawn(retention::run(
         pool.clone(),
         retention_days,
@@ -54,21 +53,19 @@ async fn main() -> anyhow::Result<()> {
 
     let http = {
         let pool = pool.clone();
-        let auth = auth.clone();
         let bind = http_bind.clone();
         async move {
             let listener = tokio::net::TcpListener::bind(&bind).await?;
             tracing::info!("HTTP/OTLP + API on http://{bind}");
-            axum::serve(listener, app(pool, auth)).await?;
+            axum::serve(listener, app(pool)).await?;
             Ok::<(), anyhow::Error>(())
         }
     };
     let grpc = {
         let pool = pool.clone();
-        let ingest = auth.ingest.clone();
         async move {
             tracing::info!("gRPC/OTLP on {grpc_bind}");
-            grpc::serve(pool, grpc_bind, ingest).await?;
+            grpc::serve(pool, grpc_bind).await?;
             Ok::<(), anyhow::Error>(())
         }
     };

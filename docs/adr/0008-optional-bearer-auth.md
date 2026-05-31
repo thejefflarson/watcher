@@ -1,7 +1,11 @@
 # 0008. Optional bearer-token auth, open by default
 
-- Status: Accepted
+- Status: Superseded by [0013](0013-auth-at-the-edge.md)
 - Date: 2026-05-30
+
+> **Superseded.** The app-layer bearer tokens were removed in favour of edge auth
+> (Cloudflare Access) for the public read surface, with ingest kept in-cluster.
+> See [0013](0013-auth-at-the-edge.md).
 
 ## Context
 

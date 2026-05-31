@@ -20,7 +20,7 @@ use prost::Message;
 use serial_test::serial;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
-use watcher_server::{alerts, app, db, AuthConfig};
+use watcher_server::{alerts, app, db};
 
 fn now_nanos() -> u64 {
     SystemTime::now()
@@ -116,7 +116,7 @@ async fn ingest_and_query_a_trace() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let router = app(pool, AuthConfig::default());
+    let router = app(pool);
 
     let req = ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
@@ -181,7 +181,7 @@ async fn ingest_and_query_a_log() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let router = app(pool, AuthConfig::default());
+    let router = app(pool);
 
     let req = ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
@@ -246,7 +246,7 @@ async fn ingest_and_query_a_metric() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let router = app(pool, AuthConfig::default());
+    let router = app(pool);
 
     let req = ExportMetricsServiceRequest {
         resource_metrics: vec![ResourceMetrics {
@@ -314,7 +314,7 @@ async fn metric_series_returns_recent_points() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let router = app(pool, AuthConfig::default());
+    let router = app(pool);
 
     let now = now_nanos();
     let req = gauge_request("cpu.load", 0.7, now);
@@ -344,7 +344,7 @@ async fn alert_rule_fires_and_crud() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let router = app(pool.clone(), AuthConfig::default());
+    let router = app(pool.clone());
 
     // Create a rule: fire when avg(cpu.load) over the last hour exceeds 0.5.
     let body = serde_json::json!({
@@ -433,7 +433,7 @@ async fn ui_fallback_does_not_shadow_api() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let router = app(pool, AuthConfig::default());
+    let router = app(pool);
 
     // The query API must win over the SPA fallback — this is the regression that
     // caused JSON.parse errors when /api was served HTML.
@@ -576,7 +576,7 @@ async fn trace_counts_spans_and_errors() {
     .await
     .unwrap();
 
-    let router = app(pool, AuthConfig::default());
+    let router = app(pool);
     let (status, traces) = get_json(&router, "/api/traces").await;
     assert_eq!(status, StatusCode::OK);
     let arr = traces.as_array().unwrap();
@@ -593,7 +593,7 @@ async fn traces_service_filter_and_limit() {
     };
     insert_span_at(&pool, "alpha", "a", "a1", 1.0).await;
     insert_span_at(&pool, "beta", "b", "b1", 1.0).await;
-    let router = app(pool, AuthConfig::default());
+    let router = app(pool);
 
     let (_, only_alpha) = get_json(&router, "/api/traces?service=alpha").await;
     assert_eq!(only_alpha.as_array().unwrap().len(), 1);
@@ -611,7 +611,7 @@ async fn get_trace_returns_spans_in_order() {
     };
     insert_span_at(&pool, "svc", "trace-x", "later", 1.0).await;
     insert_span_at(&pool, "svc", "trace-x", "earlier", 10.0).await;
-    let router = app(pool, AuthConfig::default());
+    let router = app(pool);
 
     let (status, spans) = get_json(&router, "/api/traces/trace-x").await;
     assert_eq!(status, StatusCode::OK);
@@ -636,7 +636,7 @@ async fn logs_filter_by_service_and_trace() {
         .execute(&pool)
         .await
         .unwrap();
-    let router = app(pool, AuthConfig::default());
+    let router = app(pool);
 
     let (_, api_logs) = get_json(&router, "/api/logs?service=api").await;
     assert_eq!(api_logs.as_array().unwrap().len(), 2);
@@ -671,7 +671,7 @@ async fn metrics_summary_kinds_and_filter() {
     .await
     .unwrap();
     insert_metric_at(&pool, "cpu", Some("worker"), 0.5, 1.0).await;
-    let router = app(pool, AuthConfig::default());
+    let router = app(pool);
 
     let (_, all) = get_json(&router, "/api/metrics").await;
     assert_eq!(all.as_array().unwrap().len(), 3); // reqs, latency, cpu
@@ -764,7 +764,7 @@ async fn series_stitches_rollups_and_recent_raw_without_double_count() {
         .unwrap();
     insert_metric_at(&pool, "lat", Some("api"), 20.0, 0.0).await;
 
-    let router = app(pool, AuthConfig::default());
+    let router = app(pool);
     let (status, series) = get_json(&router, "/api/metrics/series?name=lat&hours=2").await;
     assert_eq!(status, StatusCode::OK);
     let arr = series.as_array().unwrap();
@@ -830,7 +830,7 @@ async fn alert_fires_then_resolves() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let router = app(pool.clone(), AuthConfig::default());
+    let router = app(pool.clone());
     assert_eq!(
         create_rule(
             &router,
@@ -866,7 +866,7 @@ async fn alert_lt_and_max_agg() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let router = app(pool.clone(), AuthConfig::default());
+    let router = app(pool.clone());
 
     // lt rule fires when the value drops below the floor.
     create_rule(
@@ -916,7 +916,7 @@ async fn alert_does_not_fire_twice() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let router = app(pool.clone(), AuthConfig::default());
+    let router = app(pool.clone());
     create_rule(
         &router,
         serde_json::json!({"name":"x","metric":"t","comparator":"gt","threshold":1,"window_secs":3600}),
@@ -959,7 +959,7 @@ async fn alert_rejects_bad_agg() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let router = app(pool, AuthConfig::default());
+    let router = app(pool);
     assert_eq!(
         create_rule(
             &router,
@@ -976,80 +976,4 @@ async fn alert_rejects_bad_agg() {
         .await,
         StatusCode::BAD_REQUEST
     );
-}
-
-// --- Auth ------------------------------------------------------------------
-
-fn authed(uri: &str, token: Option<&str>) -> Request<Body> {
-    let mut b = Request::builder().uri(uri);
-    if let Some(t) = token {
-        b = b.header("authorization", format!("Bearer {t}"));
-    }
-    b.body(Body::empty()).unwrap()
-}
-
-#[tokio::test]
-#[serial]
-async fn api_token_gates_queries_but_not_health() {
-    let Some(pool) = pool_or_skip().await else {
-        return;
-    };
-    let auth = AuthConfig {
-        api: Some("secret".into()),
-        ..Default::default()
-    };
-    let router = app(pool, auth);
-
-    let no_token = router
-        .clone()
-        .oneshot(authed("/api/traces", None))
-        .await
-        .unwrap();
-    assert_eq!(no_token.status(), StatusCode::UNAUTHORIZED);
-
-    let wrong = router
-        .clone()
-        .oneshot(authed("/api/traces", Some("nope")))
-        .await
-        .unwrap();
-    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
-
-    let ok = router
-        .clone()
-        .oneshot(authed("/api/traces", Some("secret")))
-        .await
-        .unwrap();
-    assert_eq!(ok.status(), StatusCode::OK);
-
-    // Health is always open.
-    let health = router.oneshot(authed("/healthz", None)).await.unwrap();
-    assert_eq!(health.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-#[serial]
-async fn ingest_token_gates_ingest() {
-    let Some(pool) = pool_or_skip().await else {
-        return;
-    };
-    let auth = AuthConfig {
-        ingest: Some("ingest-secret".into()),
-        ..Default::default()
-    };
-    let router = app(pool, auth);
-
-    let post = |token: Option<&str>| {
-        let mut b = Request::builder().method("POST").uri("/v1/traces");
-        if let Some(t) = token {
-            b = b.header("authorization", format!("Bearer {t}"));
-        }
-        b.body(Body::from(Vec::new())).unwrap()
-    };
-
-    let blocked = router.clone().oneshot(post(None)).await.unwrap();
-    assert_eq!(blocked.status(), StatusCode::UNAUTHORIZED);
-
-    // With the right token an empty body decodes to zero spans → 200.
-    let allowed = router.oneshot(post(Some("ingest-secret"))).await.unwrap();
-    assert_eq!(allowed.status(), StatusCode::OK);
 }

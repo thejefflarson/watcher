@@ -8,7 +8,8 @@ run on a Raspberry Pi.
 - **TypeScript** UI (Vite + React): traces & waterfall, log search, metric charts, service map, alerts —
   **embedded into the server binary**, so it's one image on one port (no nginx)
 - **Postgres** for storage (Timescale optional) — nothing else
-- Optional bearer-token auth, background retention, metric rollups, threshold alerting
+- Background retention, metric rollups, threshold alerting; auth at the edge
+  (Cloudflare Access), ingest kept in-cluster
 
 ## Architecture
 
@@ -102,7 +103,7 @@ docker-compose.yml   local Postgres
 - [x] Metrics (third pillar)
 - [x] OTLP/gRPC (`:4317`)
 - [x] End-to-end ingest→query integration tests
-- [x] Auth on ingest + UI (optional bearer tokens)
+- [x] Auth at the edge (Cloudflare Access); ingest kept in-cluster
 - [x] Retention (background prune; `WATCHER_RETENTION_DAYS`)
 - [x] Service map
 - [x] Downsampling / rollups for old data

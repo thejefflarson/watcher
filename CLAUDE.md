@@ -66,7 +66,8 @@ cluster. ARM images are required for Raspberry Pi nodes (CI builds them).
 
 Traces, logs, metrics (latest-value table **and** time-series charts), OTLP HTTP +
 gRPC, service map, retention, metric downsampling/rollups, threshold alerting
-(rules + events + optional webhook), and optional bearer-token auth.
+(rules + events + optional webhook). No app-layer auth — the public read surface is
+gated by Cloudflare Access at the edge and ingest stays in-cluster (ADR 0013).
 
 ## Not yet (good first issues)
 
