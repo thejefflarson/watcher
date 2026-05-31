@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { listTraces, type TraceSummary } from "../api";
 import { useControls, rangeParams } from "../timerange";
+import { useSort } from "../sort";
 
 export function fmtDuration(ms: number): string {
   if (ms < 1) return `${(ms * 1000).toFixed(0)}µs`;
@@ -34,6 +35,8 @@ export default function TraceList({ onSelect }: { onSelect: (traceId: string) =>
     };
   }, [serviceFilter, rangeKey, tick]);
 
+  const { sorted, onSort, indicator } = useSort(traces, "start_time");
+
   if (loading) return <p className="muted">Loading traces…</p>;
   if (error) return <p className="error">Failed to load: {error}</p>;
 
@@ -60,16 +63,16 @@ export default function TraceList({ onSelect }: { onSelect: (traceId: string) =>
       <table>
       <thead>
         <tr>
-          <th>Service</th>
-          <th>Root span</th>
-          <th>Started</th>
-          <th className="num">Duration</th>
-          <th className="num">Spans</th>
-          <th className="num">Errors</th>
+          <th className="sortable" onClick={() => onSort("service")}>Service{indicator("service")}</th>
+          <th className="sortable" onClick={() => onSort("root_name")}>Root span{indicator("root_name")}</th>
+          <th className="sortable" onClick={() => onSort("start_time")}>Started{indicator("start_time")}</th>
+          <th className="num sortable" onClick={() => onSort("duration_ms")}>Duration{indicator("duration_ms")}</th>
+          <th className="num sortable" onClick={() => onSort("span_count")}>Spans{indicator("span_count")}</th>
+          <th className="num sortable" onClick={() => onSort("error_count")}>Errors{indicator("error_count")}</th>
         </tr>
       </thead>
       <tbody>
-        {traces.map((t) => (
+        {sorted.map((t) => (
           <tr key={t.trace_id} className="clickable" onClick={() => onSelect(t.trace_id)}>
             <td>{t.service ?? "—"}</td>
             <td>{t.root_name ?? "—"}</td>
