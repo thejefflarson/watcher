@@ -9,6 +9,7 @@ import {
   type Comparator,
   type Agg,
 } from "../api";
+import { formatValue } from "../format";
 
 const COMPARATORS: { v: Comparator; label: string }[] = [
   { v: "gt", label: ">" },
@@ -188,7 +189,7 @@ export default function Alerts() {
               <tr key={e.id}>
                 <td>{e.rule_name}</td>
                 <td className="mono">{e.metric}</td>
-                <td className="num">{e.value ?? "—"}</td>
+                <td className="num">{formatValue(e.value)}</td>
                 <td className="muted">{fmtTime(e.fired_at)}</td>
                 <td className={e.resolved_at ? "muted" : "sev-error"}>
                   {e.resolved_at ? fmtTime(e.resolved_at) : "firing"}

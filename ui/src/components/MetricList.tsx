@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { listMetrics, type MetricSummary } from "../api";
+import { formatValue } from "../format";
 
 // Inline sparkline — a small multiple, drawn with no axes or chrome.
 function Sparkline({ values }: { values: number[] }) {
@@ -90,10 +91,7 @@ export default function MetricList({
                 <td>{m.service ?? "—"}</td>
                 <td className="muted">{m.kind ?? "—"}</td>
                 <td>{m.spark ? <Sparkline values={m.spark} /> : <span className="muted">—</span>}</td>
-                <td className="num">
-                  {m.last_value ?? "—"}
-                  {m.unit && m.unit !== "1" ? ` ${m.unit}` : ""}
-                </td>
+                <td className="num">{formatValue(m.last_value, m.unit)}</td>
                 <td className="num muted">{m.points}</td>
               </tr>
             ))}
