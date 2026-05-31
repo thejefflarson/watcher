@@ -1,7 +1,12 @@
 //! OTLP decode + storage. `store_*` are transport-agnostic (HTTP handlers and the
 //! gRPC services both call them); the `ingest_*` fns are the HTTP/protobuf entrypoints.
 
-use axum::{body::Bytes, extract::State, http::StatusCode, response::IntoResponse};
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+};
 use chrono::{DateTime, Utc};
 use opentelemetry_proto::tonic::{
     collector::logs::v1::ExportLogsServiceRequest,
@@ -15,13 +20,40 @@ use opentelemetry_proto::tonic::{
 use prost::Message;
 use serde_json::json;
 use sqlx::PgPool;
+use std::io::Read;
 
 // ---------------------------------------------------------------------------
 // HTTP entrypoints
 // ---------------------------------------------------------------------------
 
-pub async fn ingest_traces(State(pool): State<PgPool>, body: Bytes) -> impl IntoResponse {
-    match ExportTraceServiceRequest::decode(body) {
+/// Decompress the body if it's gzip-encoded. Most OTLP exporters (the OTel
+/// Collector, Traefik, the SDKs) gzip by default, so without this they 400.
+fn payload(headers: &HeaderMap, body: Bytes) -> Result<Vec<u8>, std::io::Error> {
+    let gzipped = headers
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("gzip"))
+        .unwrap_or(false)
+        || body.starts_with(&[0x1f, 0x8b]); // gzip magic, as a fallback
+    if gzipped {
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(&body[..]).read_to_end(&mut out)?;
+        Ok(out)
+    } else {
+        Ok(body.to_vec())
+    }
+}
+
+pub async fn ingest_traces(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let bytes = match payload(&headers, body) {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("gzip error: {e}")),
+    };
+    match ExportTraceServiceRequest::decode(&bytes[..]) {
         Ok(req) => {
             let n = store_traces(&pool, req).await;
             (StatusCode::OK, format!("ingested {n} spans"))
@@ -33,8 +65,16 @@ pub async fn ingest_traces(State(pool): State<PgPool>, body: Bytes) -> impl Into
     }
 }
 
-pub async fn ingest_logs(State(pool): State<PgPool>, body: Bytes) -> impl IntoResponse {
-    match ExportLogsServiceRequest::decode(body) {
+pub async fn ingest_logs(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let bytes = match payload(&headers, body) {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("gzip error: {e}")),
+    };
+    match ExportLogsServiceRequest::decode(&bytes[..]) {
         Ok(req) => {
             let n = store_logs(&pool, req).await;
             (StatusCode::OK, format!("ingested {n} logs"))
@@ -46,8 +86,16 @@ pub async fn ingest_logs(State(pool): State<PgPool>, body: Bytes) -> impl IntoRe
     }
 }
 
-pub async fn ingest_metrics(State(pool): State<PgPool>, body: Bytes) -> impl IntoResponse {
-    match ExportMetricsServiceRequest::decode(body) {
+pub async fn ingest_metrics(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let bytes = match payload(&headers, body) {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("gzip error: {e}")),
+    };
+    match ExportMetricsServiceRequest::decode(&bytes[..]) {
         Ok(req) => {
             let n = store_metrics(&pool, req).await;
             (StatusCode::OK, format!("ingested {n} metric points"))
@@ -98,10 +146,13 @@ pub async fn store_logs(pool: &PgPool, req: ExportLogsServiceRequest) -> u64 {
 pub async fn store_metrics(pool: &PgPool, req: ExportMetricsServiceRequest) -> u64 {
     let mut count = 0;
     for rm in &req.resource_metrics {
-        let service = service_name(resource_attrs(rm.resource.as_ref()));
+        // Resource attributes carry k8s.pod.name / node / container etc. — keep them
+        // so metrics are dimensioned, not flat.
+        let rattrs = resource_attrs(rm.resource.as_ref());
+        let service = service_name(rattrs);
         for sm in &rm.scope_metrics {
             for m in &sm.metrics {
-                count += insert_metric(pool, service.as_deref(), m).await;
+                count += insert_metric(pool, service.as_deref(), rattrs, m).await;
             }
         }
     }
@@ -183,24 +234,39 @@ async fn insert_log(pool: &PgPool, service: Option<&str>, rec: &LogRecord) -> an
     Ok(())
 }
 
-async fn insert_metric(pool: &PgPool, service: Option<&str>, m: &Metric) -> u64 {
+async fn insert_metric(
+    pool: &PgPool,
+    service: Option<&str>,
+    resource: &[KeyValue],
+    m: &Metric,
+) -> u64 {
     let unit = (!m.unit.is_empty()).then(|| m.unit.clone());
     let mut n = 0;
     match &m.data {
         Some(metric::Data::Gauge(g)) => {
             for dp in &g.data_points {
-                n += insert_number(pool, service, &m.name, "gauge", unit.as_deref(), dp).await
-                    as u64;
+                n += insert_number(
+                    pool,
+                    service,
+                    resource,
+                    &m.name,
+                    "gauge",
+                    unit.as_deref(),
+                    dp,
+                )
+                .await as u64;
             }
         }
         Some(metric::Data::Sum(s)) => {
             for dp in &s.data_points {
-                n += insert_number(pool, service, &m.name, "sum", unit.as_deref(), dp).await as u64;
+                n += insert_number(pool, service, resource, &m.name, "sum", unit.as_deref(), dp)
+                    .await as u64;
             }
         }
         Some(metric::Data::Histogram(h)) => {
             for dp in &h.data_points {
-                n += insert_histogram(pool, service, &m.name, unit.as_deref(), dp).await as u64;
+                n += insert_histogram(pool, service, resource, &m.name, unit.as_deref(), dp).await
+                    as u64;
             }
         }
         // Exponential histograms and summaries aren't stored in v0.
@@ -212,6 +278,7 @@ async fn insert_metric(pool: &PgPool, service: Option<&str>, m: &Metric) -> u64 
 async fn insert_number(
     pool: &PgPool,
     service: Option<&str>,
+    resource: &[KeyValue],
     name: &str,
     kind: &str,
     unit: Option<&str>,
@@ -232,7 +299,7 @@ async fn insert_number(
     .bind(kind)
     .bind(value)
     .bind(unit)
-    .bind(attrs_to_json(&dp.attributes))
+    .bind(merged_attrs(resource, &dp.attributes))
     .execute(pool)
     .await;
     match res {
@@ -247,6 +314,7 @@ async fn insert_number(
 async fn insert_histogram(
     pool: &PgPool,
     service: Option<&str>,
+    resource: &[KeyValue],
     name: &str,
     unit: Option<&str>,
     dp: &HistogramDataPoint,
@@ -261,7 +329,7 @@ async fn insert_histogram(
     .bind(dp.sum)
     .bind(dp.count as i64)
     .bind(unit)
-    .bind(attrs_to_json(&dp.attributes))
+    .bind(merged_attrs(resource, &dp.attributes))
     .execute(pool)
     .await;
     match res {
@@ -301,6 +369,19 @@ fn service_name(attrs: &[KeyValue]) -> Option<String> {
 fn attrs_to_json(attrs: &[KeyValue]) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     for kv in attrs {
+        if let Some(v) = &kv.value {
+            map.insert(kv.key.clone(), any_value_to_json(v));
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
+/// Resource attributes (k8s.pod.name / node / container, …) overlaid with a data
+/// point's own attributes — so stored metrics keep their dimensions. The point's
+/// attributes win on a key collision.
+fn merged_attrs(resource: &[KeyValue], point: &[KeyValue]) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for kv in resource.iter().chain(point.iter()) {
         if let Some(v) = &kv.value {
             map.insert(kv.key.clone(), any_value_to_json(v));
         }

@@ -977,3 +977,69 @@ async fn alert_rejects_bad_agg() {
         StatusCode::BAD_REQUEST
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn ingest_gzipped_metric_keeps_resource_dimensions() {
+    use std::io::Write;
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let router = app(pool.clone());
+
+    let req = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: vec![
+                    kv("service.name", "kubelet"),
+                    kv("k8s.pod.name", "watcher-server-abc"),
+                ],
+                ..Default::default()
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "container.memory.rss".to_string(),
+                    data: Some(metric::Data::Gauge(Gauge {
+                        data_points: vec![NumberDataPoint {
+                            time_unix_nano: 1_000_000_000,
+                            value: Some(number_data_point::Value::AsInt(1024)),
+                            ..Default::default()
+                        }],
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+
+    // gzip-compress the OTLP body, as the OTel Collector / Traefik / SDKs do.
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(&req.encode_to_vec()).unwrap();
+    let gz = enc.finish().unwrap();
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/metrics")
+                .header("content-type", "application/x-protobuf")
+                .header("content-encoding", "gzip")
+                .body(Body::from(gz))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "gzipped OTLP should ingest");
+
+    // The resource dimension must survive into the stored attributes.
+    let pod: Option<String> = sqlx::query_scalar(
+        "SELECT attributes->>'k8s.pod.name' FROM metrics WHERE name = 'container.memory.rss' LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pod.as_deref(), Some("watcher-server-abc"));
+}
