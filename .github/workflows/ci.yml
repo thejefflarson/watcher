@@ -59,17 +59,24 @@ jobs:
 
   # One image now: the server builds the UI and embeds it (rust-embed), so there
   # is no separate watcher-ui image. Build context is the repo root.
+  #
+  # Built on the in-cluster, self-hosted ARM runner (runs-on: watcher-runners),
+  # offloading to the shared BuildKit — native arm64, no QEMU. The cluster is
+  # ARM-only, so we build arm64 only. BuildKit's persistent daemon cache makes
+  # the explicit gha cache unnecessary.
   image:
     needs: [server, ui, chart]
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: watcher-runners
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
+        with:
+          driver: remote
+          endpoint: tcp://buildkit.dev.svc.cluster.local:1234
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -82,15 +89,11 @@ jobs:
           tags: |
             type=raw,value=latest
             type=sha
-      # arm64 (for Raspberry Pi) is built via QEMU emulation — slower, but the
-      # cluster is ARM. Switch to native arm64 runners later if it drags.
       - uses: docker/build-push-action@v6
         with:
           context: .
           file: server/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
