@@ -252,6 +252,35 @@ tr.clickable:hover td {
   background: var(--error);
 }
 
+.bar-row.selected {
+  background: var(--hover);
+}
+
+/* Span detail panel under the waterfall. */
+.span-detail {
+  margin-top: 1.2rem;
+  border-top: 1px solid var(--rule);
+  padding-top: 0.8rem;
+}
+
+.span-detail-head {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  margin-bottom: 0.5rem;
+}
+
+table.kv td {
+  padding: 0.2rem 1.2rem 0.2rem 0;
+  vertical-align: top;
+  white-space: normal;
+}
+
+table.kv td:first-child {
+  width: 160px;
+  white-space: nowrap;
+}
+
 .bar-dur {
   width: 70px;
   flex: 0 0 70px;
