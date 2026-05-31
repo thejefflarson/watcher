@@ -131,6 +131,14 @@ th.num {
   font-variant-numeric: tabular-nums;
 }
 
+th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+th.sortable:hover {
+  color: var(--text);
+}
+
 td.err,
 .num.err {
   color: var(--error);

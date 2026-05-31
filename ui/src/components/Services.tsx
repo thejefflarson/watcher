@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { listServices, type ServiceRed } from "../api";
 import { useControls, rangeParams } from "../timerange";
+import { useSort } from "../sort";
 import { fmtDuration } from "./TraceList";
 
 // RED table — one row per service: throughput, error rate, latency percentiles.
@@ -21,6 +22,8 @@ export default function Services() {
     };
   }, [rangeKey, tick]);
 
+  const { sorted, onSort, indicator } = useSort(rows, "spans");
+
   if (error) return <p className="error">Failed to load: {error}</p>;
   if (rows.length === 0) return <p className="muted">No spans in this window.</p>;
 
@@ -28,17 +31,17 @@ export default function Services() {
     <table>
       <thead>
         <tr>
-          <th>Service</th>
-          <th className="num">Spans</th>
-          <th className="num">Errors</th>
-          <th className="num">Error %</th>
-          <th className="num">p50</th>
-          <th className="num">p95</th>
-          <th className="num">p99</th>
+          <th className="sortable" onClick={() => onSort("service")}>Service{indicator("service")}</th>
+          <th className="num sortable" onClick={() => onSort("spans")}>Spans{indicator("spans")}</th>
+          <th className="num sortable" onClick={() => onSort("errors")}>Errors{indicator("errors")}</th>
+          <th className="num sortable" onClick={() => onSort("error_rate")}>Error %{indicator("error_rate")}</th>
+          <th className="num sortable" onClick={() => onSort("p50_ms")}>p50{indicator("p50_ms")}</th>
+          <th className="num sortable" onClick={() => onSort("p95_ms")}>p95{indicator("p95_ms")}</th>
+          <th className="num sortable" onClick={() => onSort("p99_ms")}>p99{indicator("p99_ms")}</th>
         </tr>
       </thead>
       <tbody>
-        {rows.map((r) => {
+        {sorted.map((r) => {
           const pct = (r.error_rate * 100).toFixed(r.error_rate >= 0.1 ? 0 : 1);
           return (
             <tr
