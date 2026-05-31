@@ -1123,3 +1123,38 @@ async fn time_window_filters_traces_and_logs() {
     let (_, all) = get_json(&router, "/api/traces").await;
     assert_eq!(all.as_array().unwrap().len(), 2);
 }
+
+#[tokio::test]
+#[serial]
+async fn service_red_aggregates() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // Four "api" spans: durations 10/20/30/40 ms, the last one an error.
+    let rows = [(10.0, None), (20.0, None), (30.0, None), (40.0, Some(2))];
+    for (i, (dur, code)) in rows.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO spans (trace_id, span_id, service, name, start_time, end_time, duration_ms, status_code)
+             VALUES ($1,$2,'api','op', now(), now(), $3, $4)",
+        )
+        .bind(format!("t{i}"))
+        .bind(format!("s{i}"))
+        .bind(dur)
+        .bind(*code as Option<i32>)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let router = app(pool);
+    let (status, svcs) = get_json(&router, "/api/services").await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = svcs.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    let s = &arr[0];
+    assert_eq!(s["service"], "api");
+    assert_eq!(s["spans"], 4);
+    assert_eq!(s["errors"], 1);
+    assert!((s["error_rate"].as_f64().unwrap() - 0.25).abs() < 1e-9);
+    // percentile_cont(0.5) of [10,20,30,40] = 25 (interpolated).
+    assert!((s["p50_ms"].as_f64().unwrap() - 25.0).abs() < 1e-6);
+}

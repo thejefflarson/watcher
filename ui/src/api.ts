@@ -127,6 +127,19 @@ export const getMetricSeriesGrouped = (p: { name: string; group_by: string; hour
 
 export const getServiceMap = () => get<ServiceMapData>(`/api/servicemap`);
 
+export interface ServiceRed {
+  service: string;
+  spans: number;
+  errors: number;
+  error_rate: number;
+  p50_ms: number | null;
+  p95_ms: number | null;
+  p99_ms: number | null;
+}
+
+export const listServices = (p: { from?: string; to?: string } = {}) =>
+  get<ServiceRed[]>(`/api/services?${qs(p)}`);
+
 // --- Alerts ---------------------------------------------------------------
 
 export type Comparator = "gt" | "lt";
