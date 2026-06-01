@@ -761,7 +761,9 @@ async fn metric_facet_splits_series_and_rates_a_counter() {
     .execute(&pool)
     .await
     .unwrap();
-    watcher_server::rollup::rollup_once(&pool, 300).await.unwrap();
+    watcher_server::rollup::rollup_once(&pool, 300)
+        .await
+        .unwrap();
     let router = app(pool);
 
     let (status, f) = get_json(&router, "/api/metrics/facet?name=reqs.total&hours=1").await;
@@ -805,7 +807,9 @@ async fn metric_histogram_interpolates_percentiles() {
     .execute(&pool)
     .await
     .unwrap();
-    watcher_server::rollup::rollup_once(&pool, 300).await.unwrap();
+    watcher_server::rollup::rollup_once(&pool, 300)
+        .await
+        .unwrap();
     let router = app(pool);
 
     let (status, h) = get_json(&router, "/api/metrics/histogram?name=lat&hours=1").await;
