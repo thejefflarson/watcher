@@ -7,8 +7,10 @@ use sqlx::PgPool;
 use std::time::Duration;
 
 /// Re-aggregate this many trailing buckets each pass so late-arriving points are
-/// folded in. The upsert makes re-running a bucket idempotent.
-const LOOKBACK_BUCKETS: f64 = 12.0;
+/// folded in. The upsert makes re-running a bucket idempotent. Kept small: each
+/// pass hash-aggregates this much raw across every series, so at high ingest a
+/// large lookback makes the sweep (and the Pi's DB) crawl.
+const LOOKBACK_BUCKETS: f64 = 8.0;
 
 /// Runs forever; ticks immediately, then every `bucket_secs`.
 pub async fn run(pool: PgPool, bucket_secs: i64) {
