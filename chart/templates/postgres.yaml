@@ -18,3 +18,10 @@ spec:
     {{ .Values.postgres.database }}: {{ .Values.postgres.user }}
   postgresql:
     version: {{ .Values.postgres.version | quote }}
+  {{- with .Values.postgres.resources }}
+  # Per-instance resources for the Spilo (Postgres) container. Without this the
+  # operator's cluster-wide default applies (often 500Mi), which OOM-kills the
+  # DB under sustained telemetry ingest.
+  resources:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}

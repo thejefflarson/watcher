@@ -35,6 +35,15 @@ postgres:
   volume:
     size: 10Gi
     storageClass: local-path
+  # Per-instance resources for the Postgres container. The operator default
+  # (~500Mi) OOM-kills the DB under sustained ingest, so give it real headroom.
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
 
 ingressRoute:
   enabled: true
