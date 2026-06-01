@@ -957,11 +957,21 @@ async fn ingest_aggregates_into_rollup_on_insert() {
     // count/sum/avg and the facet should read it live.
     let now = now_nanos();
     assert_eq!(
-        post_proto(&router, "/v1/metrics", gauge_request("g.live", 10.0, now).encode_to_vec()).await,
+        post_proto(
+            &router,
+            "/v1/metrics",
+            gauge_request("g.live", 10.0, now).encode_to_vec()
+        )
+        .await,
         StatusCode::OK
     );
     assert_eq!(
-        post_proto(&router, "/v1/metrics", gauge_request("g.live", 20.0, now).encode_to_vec()).await,
+        post_proto(
+            &router,
+            "/v1/metrics",
+            gauge_request("g.live", 20.0, now).encode_to_vec()
+        )
+        .await,
         StatusCode::OK
     );
 
