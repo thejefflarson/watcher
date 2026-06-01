@@ -1,30 +1,134 @@
-import { useEffect, useState } from "react";
-import { listMetrics, type MetricSummary } from "../api";
+import { Fragment, useEffect, useState } from "react";
+import {
+  getMetricFacet,
+  getMetricHistFacet,
+  listMetrics,
+  type FacetResponse,
+  type HistFacetResponse,
+  type MetricSummary,
+} from "../api";
 import { formatValue } from "../format";
+import { facetLabels } from "../metricLabels";
 import { useControls, rangeParams } from "../timerange";
+import Sparkline from "./Sparkline";
 
-// Inline sparkline — a small multiple, drawn with no axes or chrome.
-function Sparkline({ values }: { values: number[] }) {
-  const w = 90;
-  const h = 18;
-  if (values.length < 2) return <span className="muted">—</span>;
-  const lo = Math.min(...values);
-  const hi = Math.max(...values);
-  const span = hi - lo || 1;
-  // API returns newest-first; draw oldest→newest left to right.
-  const pts = values
-    .slice()
-    .reverse()
-    .map((v, i) => {
-      const x = (i / (values.length - 1)) * (w - 2) + 1;
-      const y = h - 1 - ((v - lo) / span) * (h - 2);
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .join(" ");
+// A few hours of recent buckets is enough for the inline per-series glance; the
+// detail page has the full range selector.
+const EXPAND_HOURS = 6;
+
+// Gauge/sum series rows: value (or per-second rate) sparkline + latest.
+function FacetSeriesRows({ name, unit }: { name: string; unit: string | null }) {
+  const [data, setData] = useState<FacetResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let active = true;
+    getMetricFacet({ name, hours: EXPAND_HOURS })
+      .then((d) => active && (setData(d), setError(null)))
+      .catch((e: unknown) => active && setError(String(e)));
+    return () => {
+      active = false;
+    };
+  }, [name]);
+
+  if (error) return <p className="error small">Failed to load: {error}</p>;
+  if (!data) return <p className="muted small">Loading…</p>;
+  const labels = facetLabels(data.series);
+  const u = data.rated ? `${unit ?? ""}/s` : unit;
   return (
-    <svg className="spark" width={w} height={h} aria-hidden="true">
-      <polyline points={pts} fill="none" stroke="#444" strokeWidth="1" />
-    </svg>
+    <table className="subseries">
+      <tbody>
+        {data.series.map((s, i) => {
+          const vals = s.points.map((p) => p.v).filter((v): v is number => v != null);
+          const latest = vals.length ? vals[vals.length - 1] : null;
+          return (
+            <tr key={i}>
+              <td className="mono sub-label">{labels[i]}</td>
+              <td>
+                {vals.length >= 2 ? (
+                  <Sparkline values={[...vals].reverse()} />
+                ) : (
+                  <span className="muted">—</span>
+                )}
+              </td>
+              <td className="num">{formatValue(latest, u)}</td>
+            </tr>
+          );
+        })}
+        {data.truncated > 0 && (
+          <tr>
+            <td className="muted small" colSpan={3}>
+              +{data.truncated} more series
+            </td>
+          </tr>
+        )}
+      </tbody>
+    </table>
+  );
+}
+
+// Histogram series rows: p95 trend sparkline + latest p50/p95/p99.
+function HistSeriesRows({ name, unit }: { name: string; unit: string | null }) {
+  const [data, setData] = useState<HistFacetResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let active = true;
+    getMetricHistFacet({ name, hours: EXPAND_HOURS })
+      .then((d) => active && (setData(d), setError(null)))
+      .catch((e: unknown) => active && setError(String(e)));
+    return () => {
+      active = false;
+    };
+  }, [name]);
+
+  if (error) return <p className="error small">Failed to load: {error}</p>;
+  if (!data) return <p className="muted small">Loading…</p>;
+  const labels = facetLabels(data.series);
+  return (
+    <table className="subseries">
+      <tbody>
+        {data.series.map((s, i) => {
+          const p95s = s.points.map((p) => p.p95).filter((v): v is number => v != null);
+          const last = s.points.length ? s.points[s.points.length - 1] : null;
+          return (
+            <tr key={i}>
+              <td className="mono sub-label">{labels[i]}</td>
+              <td title="p95 trend">
+                {p95s.length >= 2 ? (
+                  <Sparkline values={[...p95s].reverse()} />
+                ) : (
+                  <span className="muted">—</span>
+                )}
+              </td>
+              <td className="num">
+                {last ? (
+                  <span className="pcts">
+                    p50 {formatValue(last.p50, unit)} · p95 {formatValue(last.p95, unit)} · p99{" "}
+                    {formatValue(last.p99, unit)}
+                  </span>
+                ) : (
+                  "—"
+                )}
+              </td>
+            </tr>
+          );
+        })}
+        {data.truncated > 0 && (
+          <tr>
+            <td className="muted small" colSpan={3}>
+              +{data.truncated} more series
+            </td>
+          </tr>
+        )}
+      </tbody>
+    </table>
+  );
+}
+
+function ExpandedMetric({ m }: { m: MetricSummary }) {
+  return m.kind === "histogram" ? (
+    <HistSeriesRows name={m.name} unit={m.unit} />
+  ) : (
+    <FacetSeriesRows name={m.name} unit={m.unit} />
   );
 }
 
@@ -37,6 +141,7 @@ export default function MetricList({
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [service, setService] = useState("");
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const { rangeKey, tick } = useControls();
 
   useEffect(() => {
@@ -57,6 +162,13 @@ export default function MetricList({
       clearTimeout(handle);
     };
   }, [service, rangeKey, tick]);
+
+  const toggle = (name: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      next.has(name) ? next.delete(name) : next.add(name);
+      return next;
+    });
 
   if (error) return <p className="error">Failed to load: {error}</p>;
 
@@ -85,27 +197,57 @@ export default function MetricList({
             </tr>
           </thead>
           <tbody>
-            {metrics.map((m) => (
-              <tr
-                key={m.name}
-                className="clickable"
-                onClick={() => onSelect(m)}
-                title="View time series"
-              >
-                <td className="mono">
-                  {m.name}
-                  {m.series_count != null && m.series_count > 1 && (
-                    <span className="muted" title={`${m.series_count}+ series — open for the per-label breakdown`}>
-                      {" "}×{m.series_count}
-                    </span>
+            {metrics.map((m) => {
+              const multi = (m.series_count ?? 1) > 1;
+              const open = expanded.has(m.name);
+              return (
+                <Fragment key={m.name}>
+                  <tr className="clickable" onClick={() => onSelect(m)} title="View time series">
+                    <td className="mono">
+                      {multi && (
+                        <button
+                          className="expander"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggle(m.name);
+                          }}
+                          title={`${m.series_count} series — expand`}
+                        >
+                          {open ? "▾" : "▸"}
+                        </button>
+                      )}
+                      {m.name}
+                      {multi && <span className="muted"> ×{m.series_count}</span>}
+                    </td>
+                    <td>{m.service ?? "—"}</td>
+                    <td className="muted">{m.kind ?? "—"}</td>
+                    <td>
+                      {multi ? (
+                        <span className="muted">—</span>
+                      ) : m.spark ? (
+                        <Sparkline values={m.spark} />
+                      ) : (
+                        <span className="muted">—</span>
+                      )}
+                    </td>
+                    <td className="num">
+                      {multi ? (
+                        <span className="muted">—</span>
+                      ) : (
+                        formatValue(m.last_value, m.unit)
+                      )}
+                    </td>
+                  </tr>
+                  {open && (
+                    <tr className="subseries-row">
+                      <td colSpan={5}>
+                        <ExpandedMetric m={m} />
+                      </td>
+                    </tr>
                   )}
-                </td>
-                <td>{m.service ?? "—"}</td>
-                <td className="muted">{m.kind ?? "—"}</td>
-                <td>{m.spark ? <Sparkline values={m.spark} /> : <span className="muted">—</span>}</td>
-                <td className="num">{formatValue(m.last_value, m.unit)}</td>
-              </tr>
-            ))}
+                </Fragment>
+              );
+            })}
           </tbody>
         </table>
       )}

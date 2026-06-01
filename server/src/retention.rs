@@ -38,6 +38,7 @@ pub async fn prune_once(pool: &PgPool, days: i32, metrics_raw_days: i32) -> anyh
         ("logs", "time", days),
         ("metrics", "time", raw_days),
         ("metric_rollups", "bucket", days),
+        ("metric_series_rollups", "bucket", days),
     ] {
         let sql = format!("DELETE FROM {table} WHERE {col} < now() - make_interval(days => $1)");
         let r = sqlx::query(&sql).bind(window).execute(pool).await?;

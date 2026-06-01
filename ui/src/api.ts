@@ -159,6 +159,26 @@ export interface HistResponse {
 export const getMetricHistogram = (p: { name: string; hours?: number }) =>
   get<HistResponse>(`/api/metrics/histogram?${qs(p)}`);
 
+// Per-series histogram percentiles over time (one series per attribute set) —
+// for expanding a histogram metric in the list into its series' p50/p95/p99.
+export interface HistFacetPoint {
+  t: string;
+  p50: number | null;
+  p95: number | null;
+  p99: number | null;
+}
+export interface HistFacetSeries {
+  attrs: Record<string, string>;
+  points: HistFacetPoint[];
+}
+export interface HistFacetResponse {
+  unit: string | null;
+  series: HistFacetSeries[];
+  truncated: number;
+}
+export const getMetricHistFacet = (p: { name: string; hours?: number }) =>
+  get<HistFacetResponse>(`/api/metrics/hist_facet?${qs(p)}`);
+
 export const getServiceMap = () => get<ServiceMapData>(`/api/servicemap`);
 
 export interface ServiceRed {
