@@ -193,6 +193,9 @@ pub struct MetricSummary {
     /// a histogram's sum into an average-latency glyph: Δsum/Δcount). Null/zeros
     /// for non-histograms.
     count_spark: Option<Vec<f64>>,
+    /// Histograms only: the most recent per-bucket counts, so the list can draw a
+    /// mini distribution (the histogram's actual shape) rather than a line.
+    dist: Option<Vec<i64>>,
     /// Distinct series seen in the recent sample. 1 for a plain metric; >1 flags
     /// a multi-series metric whose per-label breakdown lives in the chart.
     series_count: Option<i64>,
@@ -217,7 +220,12 @@ pub async fn list_metrics(
              FROM names n WHERE n.name IS NOT NULL
          )
          SELECT n.name, r.service, r.kind, r.unit, r.last_time, r.last_value,
-                r.spark, r.count_spark, r.series_count
+                r.spark, r.count_spark, r.series_count,
+                CASE WHEN r.kind = 'histogram' THEN
+                    (SELECT m.bucket_counts FROM metrics m
+                     WHERE m.name = n.name AND m.bucket_counts IS NOT NULL
+                     ORDER BY m.time DESC LIMIT 1)
+                END AS dist
          FROM names n
          CROSS JOIN LATERAL (
              -- Read only the 30 most-recent points for the name (index-fast via

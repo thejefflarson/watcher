@@ -28,3 +28,36 @@ export default function Sparkline({
     </svg>
   );
 }
+
+// A tiny bar chart — for per-interval volume (counter rate, left→right = oldest→
+// newest) or a distribution (histogram bucket counts, left→right = low→high).
+export function Bars({
+  values,
+  width = 90,
+  height = 18,
+}: {
+  values: number[];
+  width?: number;
+  height?: number;
+}) {
+  if (values.length < 1) return <span className="muted">—</span>;
+  const max = Math.max(...values, 1);
+  const bw = width / values.length;
+  return (
+    <svg className="spark" width={width} height={height} aria-hidden="true">
+      {values.map((v, i) => {
+        const h = Math.max(0, (v / max) * (height - 1));
+        return (
+          <rect
+            key={i}
+            x={(i * bw).toFixed(1)}
+            y={(height - h).toFixed(1)}
+            width={Math.max(1, bw - 0.5).toFixed(1)}
+            height={h.toFixed(1)}
+            fill="#777"
+          />
+        );
+      })}
+    </svg>
+  );
+}
