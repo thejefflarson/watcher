@@ -2,11 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import {
   getMetricFacet,
   getMetricHistogram,
-  type FacetSeries,
   type HistResponse,
   type SeriesPoint,
 } from "../api";
 import { formatValue } from "../format";
+import { facetLabels } from "../metricLabels";
 
 const RANGES: { label: string; hours: number }[] = [
   { label: "1h", hours: 1 },
@@ -173,27 +173,6 @@ function Heatmap({ data }: { data: HistResponse }) {
         {fmtTime(buckets[cols - 1].t)}
       </text>
     </svg>
-  );
-}
-
-// Strip the noisy `k8s.` prefix so labels read pod.name=… not k8s.pod.name=….
-const shortKey = (k: string) => k.replace(/^k8s\./, "");
-
-// Label each facet series by only the attribute keys that vary across the set,
-// dropping uid-style keys when a friendlier varying key is available.
-function facetLabels(series: FacetSeries[]): string[] {
-  if (series.length <= 1) return series.map(() => "all");
-  const keys = new Set<string>();
-  series.forEach((s) => Object.keys(s.attrs).forEach((k) => keys.add(k)));
-  const varying = [...keys].filter((k) => {
-    const vals = new Set(series.map((s) => s.attrs[k] ?? ""));
-    return vals.size > 1;
-  });
-  const friendly = varying.filter((k) => !k.endsWith(".uid") && !k.endsWith("id"));
-  const labelKeys = (friendly.length ? friendly : varying).slice(0, 3);
-  return series.map(
-    (s) =>
-      labelKeys.map((k) => `${shortKey(k)}=${s.attrs[k] ?? "∅"}`).join(" · ") || "—",
   );
 }
 

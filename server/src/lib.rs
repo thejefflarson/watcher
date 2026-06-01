@@ -98,6 +98,7 @@ pub fn app(pool: PgPool) -> Router {
         .route("/api/metrics/dims", get(api::metric_dims))
         .route("/api/metrics/facet", get(api::metric_facet))
         .route("/api/metrics/histogram", get(api::metric_histogram))
+        .route("/api/metrics/hist_facet", get(api::metric_hist_facet))
         .route("/api/servicemap", get(api::service_map))
         .route("/api/services", get(api::service_red))
         .route("/api/alerts", get(api::list_alerts).post(api::create_alert))

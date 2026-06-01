@@ -169,6 +169,40 @@ tr.clickable:hover td {
   margin-top: 1rem;
 }
 
+.expander {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.8rem;
+  padding: 0 0.4rem 0 0;
+  line-height: 1;
+}
+.expander:hover {
+  color: inherit;
+}
+
+.subseries-row > td {
+  padding: 0;
+  background: var(--rule, #f6f6f6);
+}
+.subseries {
+  width: 100%;
+  margin: 0;
+}
+.subseries td {
+  border: none;
+  padding: 0.15rem 0.5rem;
+}
+.subseries .sub-label {
+  padding-left: 1.6rem;
+  color: var(--muted);
+}
+.pcts {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.85rem;
+}
+
 .error {
   color: var(--error);
 }

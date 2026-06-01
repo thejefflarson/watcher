@@ -815,6 +815,127 @@ async fn metric_histogram_interpolates_percentiles() {
     assert_eq!(b["counts"], serde_json::json!([0, 100, 0, 0]));
 }
 
+#[tokio::test]
+#[serial]
+async fn rollup_writes_per_series_and_sums_histogram_buckets() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // Completed (30-min-old) bucket: two gauge series + two histogram points of
+    // one series. The per-series rollup keeps each series; histogram bucket_counts
+    // are summed element-wise via array_sum.
+    sqlx::query(
+        "INSERT INTO metrics (time, service, name, kind, value, unit, attributes) VALUES
+            (now() - interval '1800 seconds','api','g','gauge',10,'1','{\"pod\":\"a\"}'),
+            (now() - interval '1800 seconds','api','g','gauge',20,'1','{\"pod\":\"a\"}'),
+            (now() - interval '1800 seconds','api','g','gauge', 5,'1','{\"pod\":\"b\"}')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO metrics (time, name, kind, value, count, unit, attributes, bucket_bounds, bucket_counts) VALUES
+            (now() - interval '1800 seconds','h','histogram',30,3,'ms','{}',ARRAY[10,20]::double precision[],ARRAY[1,2,0]::bigint[]),
+            (now() - interval '1800 seconds','h','histogram',30,3,'ms','{}',ARRAY[10,20]::double precision[],ARRAY[0,1,2]::bigint[])",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    watcher_server::rollup::rollup_once(&pool, 300)
+        .await
+        .unwrap();
+
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM metric_series_rollups WHERE name='g'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 2, "one rollup row per gauge series");
+    let a_avg: f64 = sqlx::query_scalar(
+        "SELECT avg FROM metric_series_rollups WHERE name='g' AND attrs->>'pod'='a'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(a_avg, 15.0, "pod=a avg of 10,20");
+    let counts: Vec<i64> =
+        sqlx::query_scalar("SELECT bucket_counts FROM metric_series_rollups WHERE name='h'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(counts, vec![1, 3, 2], "[1,2,0] + [0,1,2] element-wise");
+}
+
+#[tokio::test]
+#[serial]
+async fn metric_facet_reads_rollups_after_raw_pruned() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // Roll up a 30-min-old gauge, then delete the raw point (simulating raw
+    // retention). The faceted view must still find the series in the rollup.
+    sqlx::query(
+        "INSERT INTO metrics (time, service, name, kind, value, unit, attributes)
+         VALUES (now() - interval '1800 seconds','api','gx','gauge',42,'1','{\"pod\":\"a\"}')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    watcher_server::rollup::rollup_once(&pool, 300)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM metrics WHERE name='gx'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let router = app(pool);
+
+    let (status, f) = get_json(&router, "/api/metrics/facet?name=gx&hours=2").await;
+    assert_eq!(status, StatusCode::OK);
+    let series = f["series"].as_array().unwrap();
+    assert_eq!(series.len(), 1, "series survives in the rollup");
+    let v = series[0]["points"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|p| p["v"].as_f64())
+        .unwrap();
+    assert_eq!(v, 42.0);
+}
+
+#[tokio::test]
+#[serial]
+async fn metric_hist_facet_returns_per_series_percentiles() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // 100 observations in (10,20] for one series; rolled up then raw pruned.
+    sqlx::query(
+        "INSERT INTO metrics (time, name, kind, value, count, unit, attributes, bucket_bounds, bucket_counts)
+         VALUES (now() - interval '1800 seconds','hl','histogram',1500,100,'ms','{\"pod\":\"a\"}',
+                 ARRAY[10,20,30]::double precision[], ARRAY[0,100,0,0]::bigint[])",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    watcher_server::rollup::rollup_once(&pool, 300)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM metrics WHERE name='hl'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let router = app(pool);
+
+    let (status, h) = get_json(&router, "/api/metrics/hist_facet?name=hl&hours=2").await;
+    assert_eq!(status, StatusCode::OK);
+    let series = h["series"].as_array().unwrap();
+    assert_eq!(series.len(), 1);
+    let pt = &series[0]["points"].as_array().unwrap()[0];
+    let p95 = pt["p95"].as_f64().unwrap();
+    assert!((p95 - 19.5).abs() < 0.001, "p95 was {p95}");
+}
+
 // --- Rollups ---------------------------------------------------------------
 
 #[tokio::test]

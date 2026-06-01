@@ -430,9 +430,16 @@ pub async fn metric_facet(
     let hours = q.hours.unwrap_or(6).clamp(1, 24 * 7);
     let width = rollup_bucket_secs();
 
-    // kind / monotonicity / unit are constant per metric name.
+    // kind / monotonicity / unit are constant per metric name; read the most
+    // recent from raw or rollup (raw may be pruned past metrics_raw_days).
     let meta: Option<(String, Option<bool>, Option<String>)> = sqlx::query_as(
-        "SELECT kind, is_monotonic, unit FROM metrics WHERE name = $1 ORDER BY time DESC LIMIT 1",
+        "SELECT kind, is_monotonic, unit FROM (
+             (SELECT kind, is_monotonic, unit, time AS t FROM metrics
+              WHERE name = $1 ORDER BY time DESC LIMIT 1)
+             UNION ALL
+             (SELECT kind, is_monotonic, unit, bucket AS t FROM metric_series_rollups
+              WHERE name = $1 ORDER BY bucket DESC LIMIT 1)
+         ) z ORDER BY t DESC LIMIT 1",
     )
     .bind(&q.name)
     .fetch_optional(&pool)
@@ -452,15 +459,27 @@ pub async fn metric_facet(
     };
     let rated = kind.as_deref() == Some("sum") && is_monotonic;
 
-    // avg = bucket mean (for gauges); last = cumulative level (for rating counters).
+    // Per-series points from the downsampled rollup, stitched with recent raw
+    // buckets newer than the last rollup — so this is index-fast over the full
+    // range, not a raw scan. avg = bucket mean (gauges); last = cumulative level
+    // (counters, for rate differencing).
     let rows: Vec<FacetRow> = sqlx::query_as(
-        "SELECT attributes AS attrs,
+        "WITH last_roll AS (
+             SELECT max(bucket) AS b FROM metric_series_rollups WHERE name = $1
+         )
+         SELECT attrs, bucket AS t, avg, max AS last
+         FROM metric_series_rollups
+         WHERE name = $1 AND bucket >= now() - make_interval(hours => $2)
+         UNION ALL
+         SELECT attributes AS attrs,
                 to_timestamp(floor(extract(epoch FROM time)::float8 / $3) * $3) AS t,
                 avg(value) AS avg,
                 max(value) AS last
-         FROM metrics
-         WHERE name = $1 AND time >= now() - make_interval(hours => $2)
-         GROUP BY attrs, t
+         FROM metrics, last_roll
+         WHERE name = $1 AND value IS NOT NULL
+           AND time >= now() - make_interval(hours => $2)
+           AND (last_roll.b IS NULL OR time >= last_roll.b + make_interval(secs => $3))
+         GROUP BY attributes, t
          ORDER BY t ASC",
     )
     .bind(&q.name)
@@ -575,12 +594,25 @@ pub async fn metric_histogram(
     let hours = q.hours.unwrap_or(6).clamp(1, 24 * 7);
     let width = rollup_bucket_secs();
 
+    // Per-series rollup counts (already summed within series+bucket) stitched
+    // with recent raw points; the Rust pass below sums across series per time
+    // bucket. Stitch boundary prevents double-counting.
     let rows: Vec<HistRow> = sqlx::query_as(
-        "SELECT to_timestamp(floor(extract(epoch FROM time)::float8 / $3) * $3) AS t,
+        "WITH last_roll AS (
+             SELECT max(bucket) AS b FROM metric_series_rollups
+             WHERE name = $1 AND kind = 'histogram'
+         )
+         SELECT bucket AS t, bucket_bounds AS bounds, bucket_counts AS counts, unit
+         FROM metric_series_rollups
+         WHERE name = $1 AND kind = 'histogram' AND bucket_counts IS NOT NULL
+           AND bucket >= now() - make_interval(hours => $2)
+         UNION ALL
+         SELECT to_timestamp(floor(extract(epoch FROM time)::float8 / $3) * $3) AS t,
                 bucket_bounds AS bounds, bucket_counts AS counts, unit
-         FROM metrics
+         FROM metrics, last_roll
          WHERE name = $1 AND kind = 'histogram' AND bucket_counts IS NOT NULL
            AND time >= now() - make_interval(hours => $2)
+           AND (last_roll.b IS NULL OR time >= last_roll.b + make_interval(secs => $3))
          ORDER BY t ASC",
     )
     .bind(&q.name)
@@ -662,6 +694,115 @@ fn hist_quantile(bounds: &[f64], counts: &[i64], q: f64) -> Option<f64> {
         }
     }
     bounds.last().copied()
+}
+
+// --- Per-series histogram percentiles (for the expandable list) ------------
+
+#[derive(Serialize)]
+pub struct HistFacetPoint {
+    t: DateTime<Utc>,
+    p50: Option<f64>,
+    p95: Option<f64>,
+    p99: Option<f64>,
+}
+
+#[derive(Serialize)]
+pub struct HistFacetSeries {
+    attrs: serde_json::Value,
+    points: Vec<HistFacetPoint>,
+}
+
+#[derive(Serialize)]
+pub struct HistFacetResponse {
+    unit: Option<String>,
+    series: Vec<HistFacetSeries>,
+    truncated: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct HistFacetRow {
+    attrs: serde_json::Value,
+    t: DateTime<Utc>,
+    bounds: Option<Vec<f64>>,
+    counts: Option<Vec<i64>>,
+    unit: Option<String>,
+}
+
+/// GET /api/metrics/hist_facet — per-series p50/p95/p99 over time for a histogram
+/// metric, so the expandable list can show each series' latest percentiles and a
+/// p95 trend. Rollup-backed (+ recent raw), interpolated with `hist_quantile`.
+pub async fn metric_hist_facet(
+    State(pool): State<PgPool>,
+    Query(q): Query<HistQuery>,
+) -> Result<Json<HistFacetResponse>, ApiError> {
+    let hours = q.hours.unwrap_or(6).clamp(1, 24 * 7);
+    let width = rollup_bucket_secs();
+
+    let rows: Vec<HistFacetRow> = sqlx::query_as(
+        "WITH last_roll AS (
+             SELECT max(bucket) AS b FROM metric_series_rollups
+             WHERE name = $1 AND kind = 'histogram'
+         )
+         SELECT attrs, bucket AS t, bucket_bounds AS bounds, bucket_counts AS counts, unit
+         FROM metric_series_rollups
+         WHERE name = $1 AND kind = 'histogram' AND bucket_counts IS NOT NULL
+           AND bucket >= now() - make_interval(hours => $2)
+         UNION ALL
+         SELECT attributes AS attrs,
+                to_timestamp(floor(extract(epoch FROM time)::float8 / $3) * $3) AS t,
+                min(bucket_bounds) AS bounds,
+                array_sum(bucket_counts) AS counts,
+                max(unit) AS unit
+         FROM metrics, last_roll
+         WHERE name = $1 AND kind = 'histogram' AND bucket_counts IS NOT NULL
+           AND time >= now() - make_interval(hours => $2)
+           AND (last_roll.b IS NULL OR time >= last_roll.b + make_interval(secs => $3))
+         GROUP BY attributes, t
+         ORDER BY t ASC",
+    )
+    .bind(&q.name)
+    .bind(hours)
+    .bind(width)
+    .fetch_all(&pool)
+    .await
+    .map_err(internal)?;
+
+    let mut unit: Option<String> = None;
+    let mut map: std::collections::BTreeMap<String, (serde_json::Value, Vec<HistFacetPoint>)> =
+        std::collections::BTreeMap::new();
+    for r in rows {
+        if unit.is_none() {
+            unit = r.unit;
+        }
+        let (b, c) = match (r.bounds, r.counts) {
+            (Some(b), Some(c)) if c.len() == b.len() + 1 => (b, c),
+            _ => continue,
+        };
+        let point = HistFacetPoint {
+            t: r.t,
+            p50: hist_quantile(&b, &c, 0.50),
+            p95: hist_quantile(&b, &c, 0.95),
+            p99: hist_quantile(&b, &c, 0.99),
+        };
+        map.entry(r.attrs.to_string())
+            .or_insert_with(|| (r.attrs, Vec::new()))
+            .1
+            .push(point);
+    }
+
+    let mut series: Vec<HistFacetSeries> = map
+        .into_values()
+        .map(|(attrs, points)| HistFacetSeries { attrs, points })
+        .collect();
+    series.sort_by(|a, b| b.points.len().cmp(&a.points.len()));
+    let truncated = series.len().saturating_sub(FACET_MAX_SERIES) as i64;
+    series.truncate(FACET_MAX_SERIES);
+
+    Ok(Json(HistFacetResponse {
+        unit,
+        series,
+        truncated,
+    }))
 }
 
 #[derive(Deserialize)]
