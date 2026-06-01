@@ -730,6 +730,79 @@ async fn metrics_summary_sums_across_series() {
     assert_eq!(mem["series_count"].as_i64().unwrap(), 2);
 }
 
+#[tokio::test]
+#[serial]
+async fn metric_facet_splits_series_and_rates_a_counter() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // A monotonic sum (counter) with two series. The facet endpoint should
+    // return one series each and present per-second rates, not raw cumulatives.
+    sqlx::query(
+        "INSERT INTO metrics (time, service, name, kind, value, unit, attributes, is_monotonic) VALUES
+            (now() - interval '600 seconds','api','reqs.total','sum',100,'1','{\"pod\":\"a\"}',true),
+            (now(),                          'api','reqs.total','sum',160,'1','{\"pod\":\"a\"}',true),
+            (now() - interval '600 seconds','api','reqs.total','sum',500,'1','{\"pod\":\"b\"}',true),
+            (now(),                          'api','reqs.total','sum',500,'1','{\"pod\":\"b\"}',true)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let router = app(pool);
+
+    let (status, f) = get_json(&router, "/api/metrics/facet?name=reqs.total&hours=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(f["rated"], true, "monotonic sum should be rated");
+    assert_eq!(f["kind"], "sum");
+    let series = f["series"].as_array().unwrap();
+    assert_eq!(series.len(), 2, "one series per pod");
+    // pod=a climbed 100->160 over ~600s => a positive rate somewhere; pod=b flat => 0.
+    let max_rate = |s: &serde_json::Value| {
+        s["points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["v"].as_f64())
+            .fold(0.0_f64, f64::max)
+    };
+    let a = series.iter().find(|s| s["attrs"]["pod"] == "a").unwrap();
+    let b = series.iter().find(|s| s["attrs"]["pod"] == "b").unwrap();
+    assert!(
+        max_rate(a) > 0.0,
+        "counter pod=a should have a positive rate"
+    );
+    assert_eq!(max_rate(b), 0.0, "flat counter pod=b rate is 0");
+}
+
+#[tokio::test]
+#[serial]
+async fn metric_histogram_interpolates_percentiles() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // 100 observations all in the (10,20] bucket. Linear interpolation puts the
+    // median at the bucket midpoint (15) and p95 near the top (19.5).
+    sqlx::query(
+        "INSERT INTO metrics (time, name, kind, value, count, unit, attributes, bucket_bounds, bucket_counts)
+         VALUES (now(),'lat','histogram',1500,100,'ms','{}',
+                 ARRAY[10,20,30]::double precision[], ARRAY[0,100,0,0]::bigint[])",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let router = app(pool);
+
+    let (status, h) = get_json(&router, "/api/metrics/histogram?name=lat&hours=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(h["bounds"], serde_json::json!([10.0, 20.0, 30.0]));
+    let b = &h["buckets"].as_array().unwrap()[0];
+    let p50 = b["p50"].as_f64().unwrap();
+    let p95 = b["p95"].as_f64().unwrap();
+    assert!((p50 - 15.0).abs() < 0.001, "p50 was {p50}");
+    assert!((p95 - 19.5).abs() < 0.001, "p95 was {p95}");
+    assert_eq!(b["counts"], serde_json::json!([0, 100, 0, 0]));
+}
+
 // --- Rollups ---------------------------------------------------------------
 
 #[tokio::test]

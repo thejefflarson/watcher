@@ -161,6 +161,14 @@ tr.clickable:hover td {
   color: var(--muted);
 }
 
+.small {
+  font-size: 0.8rem;
+}
+
+.heatmap-label {
+  margin-top: 1rem;
+}
+
 .error {
   color: var(--error);
 }

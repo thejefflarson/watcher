@@ -126,6 +126,39 @@ export const getMetricDims = (name: string) => get<string[]>(`/api/metrics/dims?
 export const getMetricSeriesGrouped = (p: { name: string; group_by: string; hours?: number }) =>
   get<LabeledPoint[]>(`/api/metrics/series_grouped?${qs(p)}`);
 
+// Faceted series — one line per full attribute set (each pod × cpu, …). Gauges
+// carry bucket values; monotonic sums (counters) carry per-second rates.
+export interface FacetSeries {
+  attrs: Record<string, string>;
+  points: SeriesPoint[];
+}
+export interface FacetResponse {
+  kind: string | null;
+  rated: boolean;
+  unit: string | null;
+  series: FacetSeries[];
+  truncated: number;
+}
+export const getMetricFacet = (p: { name: string; hours?: number }) =>
+  get<FacetResponse>(`/api/metrics/facet?${qs(p)}`);
+
+// Histogram distribution over time: a heatmap row (counts per value bucket) plus
+// interpolated percentiles per time bucket.
+export interface HistBucket {
+  t: string;
+  counts: number[];
+  p50: number | null;
+  p95: number | null;
+  p99: number | null;
+}
+export interface HistResponse {
+  bounds: number[];
+  unit: string | null;
+  buckets: HistBucket[];
+}
+export const getMetricHistogram = (p: { name: string; hours?: number }) =>
+  get<HistResponse>(`/api/metrics/histogram?${qs(p)}`);
+
 export const getServiceMap = () => get<ServiceMapData>(`/api/servicemap`);
 
 export interface ServiceRed {
