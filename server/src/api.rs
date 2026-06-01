@@ -189,6 +189,10 @@ pub struct MetricSummary {
     last_value: Option<f64>,
     /// Up to 30 most-recent raw values (newest first) for an inline sparkline.
     spark: Option<Vec<f64>>,
+    /// Histogram observation counts aligned 1:1 with `spark` (so the UI can turn
+    /// a histogram's sum into an average-latency glyph: Δsum/Δcount). Null/zeros
+    /// for non-histograms.
+    count_spark: Option<Vec<f64>>,
     /// Distinct series seen in the recent sample. 1 for a plain metric; >1 flags
     /// a multi-series metric whose per-label breakdown lives in the chart.
     series_count: Option<i64>,
@@ -213,7 +217,7 @@ pub async fn list_metrics(
              FROM names n WHERE n.name IS NOT NULL
          )
          SELECT n.name, r.service, r.kind, r.unit, r.last_time, r.last_value,
-                r.spark, r.series_count
+                r.spark, r.count_spark, r.series_count
          FROM names n
          CROSS JOIN LATERAL (
              -- Read only the 30 most-recent points for the name (index-fast via
@@ -229,9 +233,10 @@ pub async fn list_metrics(
                     (array_agg(value   ORDER BY time DESC))[1] AS last_value,
                     max(time)                                  AS last_time,
                     array_agg(value ORDER BY time DESC) FILTER (WHERE value IS NOT NULL) AS spark,
+                    array_agg(count::float8 ORDER BY time DESC) FILTER (WHERE value IS NOT NULL AND count IS NOT NULL) AS count_spark,
                     count(DISTINCT coalesce(attributes::text, '')) AS series_count
              FROM (
-                 SELECT service, kind, unit, value, time, attributes
+                 SELECT service, kind, unit, value, count, time, attributes
                  FROM metrics
                  WHERE name = n.name
                    AND ($1::text IS NULL OR service = $1)
