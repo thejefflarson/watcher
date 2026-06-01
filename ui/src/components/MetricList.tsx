@@ -10,36 +10,40 @@ import {
 import { formatValue } from "../format";
 import { facetLabels } from "../metricLabels";
 import { useControls, rangeParams } from "../timerange";
-import Sparkline from "./Sparkline";
+import Sparkline, { Bars } from "./Sparkline";
 
 // A few hours of recent buckets is enough for the inline per-series glance; the
 // detail page has the full range selector.
 const EXPAND_HOURS = 6;
 
-// The small glyph for a single-series row's "recent" column, per type (values
-// newest-first, matching the API): gauges plot their value; counters plot the
-// per-interval rate (Δvalue, since the value is cumulative); histograms plot the
-// per-interval average (Δsum/Δcount) so you get a latency trend, not a ramp.
-function listSpark(m: MetricSummary): number[] | null {
-  if (!m.spark || m.spark.length < 2) return null;
-  if (m.kind === "gauge") return m.spark;
+// The "recent" glyph matches the metric type: a value sparkline for gauges, a
+// per-interval rate bar chart for counters, and a mini bucket distribution (the
+// histogram's actual shape) for histograms.
+function RecentGlyph({ m }: { m: MetricSummary }) {
+  if (m.kind === "gauge") {
+    return m.spark && m.spark.length >= 2 ? (
+      <Sparkline values={m.spark} />
+    ) : (
+      <span className="muted">—</span>
+    );
+  }
   if (m.kind === "histogram") {
-    const c = m.count_spark;
-    if (!c || c.length !== m.spark.length) return null;
-    const avg: number[] = [];
+    return m.dist && m.dist.length > 1 ? (
+      <Bars values={m.dist} />
+    ) : (
+      <span className="muted">—</span>
+    );
+  }
+  // counter / sum: per-interval rate (Δ of the cumulative value), oldest→newest.
+  if (m.spark && m.spark.length >= 2) {
+    const rate: number[] = [];
     for (let i = 0; i < m.spark.length - 1; i++) {
-      const dCount = c[i] - c[i + 1];
-      if (dCount > 0) avg.push((m.spark[i] - m.spark[i + 1]) / dCount); // cumulative
-      else if (c[i] > 0) avg.push(m.spark[i] / c[i]); // delta / per-point
-      else avg.push(0);
+      rate.push(Math.max(0, m.spark[i] - m.spark[i + 1]));
     }
-    return avg.length >= 2 ? avg : null;
+    rate.reverse();
+    return <Bars values={rate} />;
   }
-  const rate: number[] = [];
-  for (let i = 0; i < m.spark.length - 1; i++) {
-    rate.push(Math.max(0, m.spark[i] - m.spark[i + 1]));
-  }
-  return rate.length >= 2 ? rate : null;
+  return <span className="muted">—</span>;
 }
 
 // Gauge/sum series rows: value (or per-second rate) sparkline + latest.
@@ -227,9 +231,6 @@ export default function MetricList({
             {metrics.map((m) => {
               const multi = (m.series_count ?? 1) > 1;
               const open = expanded.has(m.name);
-              // Per-type small glyph for single-series rows; multi-series rows
-              // expand to the proper per-series viz instead.
-              const spark = multi ? null : listSpark(m);
               return (
                 <Fragment key={m.name}>
                   <tr className="clickable" onClick={() => onSelect(m)} title="View time series">
@@ -250,11 +251,7 @@ export default function MetricList({
                     </td>
                     <td className="muted">{m.kind ?? "—"}</td>
                     <td>
-                      {spark ? (
-                        <Sparkline values={spark} />
-                      ) : (
-                        <span className="muted">—</span>
-                      )}
+                      {multi ? <span className="muted">—</span> : <RecentGlyph m={m} />}
                     </td>
                     <td className="num">
                       {multi ? (

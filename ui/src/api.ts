@@ -50,6 +50,7 @@ export interface MetricSummary {
   last_value: number | null;
   spark: number[] | null;
   count_spark: number[] | null;
+  dist: number[] | null;
   series_count: number | null;
 }
 
