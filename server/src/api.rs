@@ -37,6 +37,7 @@ pub struct TraceSummary {
 }
 
 /// GET /api/traces — recent traces, one row per trace_id.
+#[tracing::instrument(skip_all)]
 pub async fn list_traces(
     State(pool): State<PgPool>,
     Query(q): Query<TraceQuery>,
@@ -131,6 +132,7 @@ pub struct LogRow {
 }
 
 /// GET /api/logs — recent logs with optional service / trace_id / full-text filters.
+#[tracing::instrument(skip_all)]
 pub async fn list_logs(
     State(pool): State<PgPool>,
     Query(q): Query<LogQuery>,
@@ -193,6 +195,7 @@ pub struct MetricSummary {
 }
 
 /// GET /api/metrics — one row per metric series with its latest value.
+#[tracing::instrument(skip_all)]
 pub async fn list_metrics(
     State(pool): State<PgPool>,
     Query(q): Query<MetricQuery>,
@@ -425,6 +428,7 @@ struct FacetRow {
 /// Gauges plot the bucket average; monotonic sums (counters) are differenced
 /// into a per-second rate. Top series by activity; the rest are reported as a
 /// count, never silently dropped.
+#[tracing::instrument(skip_all)]
 pub async fn metric_facet(
     State(pool): State<PgPool>,
     Query(q): Query<FacetQuery>,
@@ -574,6 +578,7 @@ struct HistRow {
 /// metric: the summed bucket counts (a heatmap row) plus p50/p95/p99 computed by
 /// linear interpolation across the buckets. Counts are summed within each time
 /// bucket (delta temporality — each data point carries its interval's counts).
+#[tracing::instrument(skip_all)]
 pub async fn metric_histogram(
     State(pool): State<PgPool>,
     Query(q): Query<HistQuery>,
@@ -704,6 +709,7 @@ struct HistFacetRow {
 /// GET /api/metrics/hist_facet — per-series p50/p95/p99 over time for a histogram
 /// metric, so the expandable list can show each series' latest percentiles and a
 /// p95 trend. Rollup-backed (+ recent raw), interpolated with `hist_quantile`.
+#[tracing::instrument(skip_all)]
 pub async fn metric_hist_facet(
     State(pool): State<PgPool>,
     Query(q): Query<HistQuery>,
@@ -780,6 +786,7 @@ pub struct ServiceRed {
 
 /// GET /api/services — RED (Rate, Errors, Duration) per service over a window:
 /// span count, error count + rate, and latency p50/p95/p99.
+#[tracing::instrument(skip_all)]
 pub async fn service_red(
     State(pool): State<PgPool>,
     Query(q): Query<RedQuery>,
@@ -822,6 +829,7 @@ pub struct ServiceMap {
 }
 
 /// GET /api/servicemap — service dependency graph derived from span parent/child links.
+#[tracing::instrument(skip_all)]
 pub async fn service_map(State(pool): State<PgPool>) -> Result<Json<ServiceMap>, ApiError> {
     let nodes: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT service FROM spans WHERE service IS NOT NULL ORDER BY 1",

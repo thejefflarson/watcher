@@ -6,6 +6,7 @@
 use serde::Serialize;
 use sqlx::PgPool;
 use std::time::Duration;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// A rule as stored. Shared by the evaluator and the CRUD API.
 #[derive(sqlx::FromRow)]
@@ -138,6 +139,21 @@ async fn evaluate(
     Ok(())
 }
 
+/// Injects W3C trace headers (`traceparent`, …) into the outbound webhook so the
+/// receiver can continue watcher's trace.
+struct HeaderInjector<'a>(&'a mut reqwest::header::HeaderMap);
+impl opentelemetry::propagation::Injector for HeaderInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        if let (Ok(name), Ok(val)) = (
+            reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+            reqwest::header::HeaderValue::from_str(&value),
+        ) {
+            self.0.insert(name, val);
+        }
+    }
+}
+
+#[tracing::instrument(name = "alert.notify", skip_all, fields(rule = %rule.name, state))]
 async fn notify(
     client: &reqwest::Client,
     webhook: Option<&str>,
@@ -155,7 +171,19 @@ async fn notify(
         threshold: rule.threshold,
         comparator: &rule.comparator,
     };
-    if let Err(e) = client.post(url).json(&payload).send().await {
+    // Propagate this span's context to the receiver.
+    let mut headers = reqwest::header::HeaderMap::new();
+    let cx = tracing::Span::current().context();
+    opentelemetry::global::get_text_map_propagator(|p| {
+        p.inject_context(&cx, &mut HeaderInjector(&mut headers))
+    });
+    if let Err(e) = client
+        .post(url)
+        .headers(headers)
+        .json(&payload)
+        .send()
+        .await
+    {
         tracing::warn!("alert webhook POST failed: {e}");
     }
 }
