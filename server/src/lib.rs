@@ -7,7 +7,8 @@ pub mod retention;
 pub mod rollup;
 
 use axum::{
-    http::{header, StatusCode, Uri},
+    body::Body,
+    http::{header, Request, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Router,
@@ -15,6 +16,39 @@ use axum::{
 use rust_embed::RustEmbed;
 use sqlx::PgPool;
 use tower_http::cors::CorsLayer;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+/// Reads W3C trace-context headers off an incoming request so watcher can
+/// continue the caller's trace (e.g. traefik's) rather than starting a new one.
+struct HeaderExtractor<'a>(&'a axum::http::HeaderMap);
+impl opentelemetry::propagation::Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|v| v.to_str().ok())
+    }
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|k| k.as_str()).collect()
+    }
+}
+
+/// Span for one `/api` request, parented to the upstream `traceparent` context
+/// so traefik → watcher → (DB) lands in a single trace instead of a fresh root.
+fn otel_request_span(req: &Request<Body>) -> tracing::Span {
+    let span = tracing::info_span!(
+        "http.request",
+        otel.name = tracing::field::Empty,
+        http.method = %req.method(),
+        http.route = %req.uri().path(),
+    );
+    span.record(
+        "otel.name",
+        format!("{} {}", req.method(), req.uri().path()).as_str(),
+    );
+    let parent = opentelemetry::global::get_text_map_propagator(|p| {
+        p.extract(&HeaderExtractor(req.headers()))
+    });
+    span.set_parent(parent);
+    span
+}
 
 /// The built UI (`ui/dist`), embedded into the binary at compile time so the
 /// server is a single self-contained artifact — no nginx, no static-file
@@ -107,11 +141,7 @@ pub fn app(pool: PgPool) -> Router {
         // Span each query-API request (INFO so it's recorded) for watcher's own
         // self-telemetry. Deliberately NOT on /v1, so exporting traces to self
         // can't create a feedback loop.
-        .layer(
-            tower_http::trace::TraceLayer::new_for_http().make_span_with(
-                tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::INFO),
-            ),
-        );
+        .layer(tower_http::trace::TraceLayer::new_for_http().make_span_with(otel_request_span));
 
     Router::new()
         .route("/healthz", get(healthz))

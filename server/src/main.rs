@@ -18,6 +18,13 @@ fn init_telemetry() -> Option<opentelemetry_sdk::trace::TracerProvider> {
     if off {
         return None;
     }
+    // W3C trace-context propagation, so incoming `traceparent` headers are
+    // honored (watcher's spans continue the caller's trace) and our own
+    // outbound calls can inject it.
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .unwrap_or_else(|_| "http://localhost:4318".to_string());
     let service = std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "watcher".to_string());
