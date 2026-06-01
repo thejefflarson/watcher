@@ -27,17 +27,44 @@ struct Ui;
 /// Serve an embedded UI asset, falling back to `index.html` for client-side
 /// routes (the SPA pattern). This is the router fallback, so it only runs for
 /// paths not claimed by `/api`, `/v1`, or `/healthz`.
+/// Cache policy for an embedded asset. Content-hashed bundles under `assets/`
+/// are immutable (new builds get new filenames), so they can cache forever. The
+/// SPA shell (index.html, served for `/` and every client route) must always be
+/// revalidated — otherwise a browser or CDN pins the old shell after a deploy and
+/// keeps loading stale JS even though the origin has updated.
+fn cache_control(path: &str) -> &'static str {
+    if path.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    }
+}
+
 async fn ui_handler(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
 
     if let Some(asset) = Ui::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
-        return ([(header::CONTENT_TYPE, mime.as_ref())], asset.data).into_response();
+        return (
+            [
+                (header::CONTENT_TYPE, mime.as_ref()),
+                (header::CACHE_CONTROL, cache_control(path)),
+            ],
+            asset.data,
+        )
+            .into_response();
     }
     // Unknown path: hand back the SPA shell so the client router can take over.
     match Ui::get("index.html") {
-        Some(asset) => ([(header::CONTENT_TYPE, "text/html")], asset.data).into_response(),
+        Some(asset) => (
+            [
+                (header::CONTENT_TYPE, "text/html"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            asset.data,
+        )
+            .into_response(),
         None => (
             StatusCode::NOT_FOUND,
             "UI not built — run `npm run build` in ui/ or use a release image.",
