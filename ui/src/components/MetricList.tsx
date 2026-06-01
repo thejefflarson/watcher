@@ -16,13 +16,25 @@ import Sparkline from "./Sparkline";
 // detail page has the full range selector.
 const EXPAND_HOURS = 6;
 
-// The small glyph for a single-series row's "recent" column, per type: gauges
-// plot their value; counters (and histogram sums) are cumulative, so plot the
-// per-interval delta (a rate) instead of an ever-climbing ramp. Values are
-// newest-first (matching the API's spark field).
+// The small glyph for a single-series row's "recent" column, per type (values
+// newest-first, matching the API): gauges plot their value; counters plot the
+// per-interval rate (Δvalue, since the value is cumulative); histograms plot the
+// per-interval average (Δsum/Δcount) so you get a latency trend, not a ramp.
 function listSpark(m: MetricSummary): number[] | null {
   if (!m.spark || m.spark.length < 2) return null;
   if (m.kind === "gauge") return m.spark;
+  if (m.kind === "histogram") {
+    const c = m.count_spark;
+    if (!c || c.length !== m.spark.length) return null;
+    const avg: number[] = [];
+    for (let i = 0; i < m.spark.length - 1; i++) {
+      const dCount = c[i] - c[i + 1];
+      if (dCount > 0) avg.push((m.spark[i] - m.spark[i + 1]) / dCount); // cumulative
+      else if (c[i] > 0) avg.push(m.spark[i] / c[i]); // delta / per-point
+      else avg.push(0);
+    }
+    return avg.length >= 2 ? avg : null;
+  }
   const rate: number[] = [];
   for (let i = 0; i < m.spark.length - 1; i++) {
     rate.push(Math.max(0, m.spark[i] - m.spark[i + 1]));

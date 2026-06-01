@@ -49,6 +49,7 @@ export interface MetricSummary {
   last_time: string;
   last_value: number | null;
   spark: number[] | null;
+  count_spark: number[] | null;
   series_count: number | null;
 }
 
