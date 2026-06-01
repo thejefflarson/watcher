@@ -408,7 +408,9 @@ pub struct FacetResponse {
     truncated: i64,
 }
 
-const FACET_MAX_SERIES: usize = 24;
+// Generous safety ceiling only — normal metrics return every series. Past this a
+// browser would choke on the sparkline count, so we report the remainder.
+const FACET_MAX_SERIES: usize = 500;
 
 #[derive(sqlx::FromRow)]
 struct FacetRow {

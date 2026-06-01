@@ -202,6 +202,10 @@ tr.clickable:hover td {
   font-variant-numeric: tabular-nums;
   font-size: 0.85rem;
 }
+.subseries-count {
+  text-align: left;
+  padding: 0.2rem 0.5rem;
+}
 
 .error {
   color: var(--error);
