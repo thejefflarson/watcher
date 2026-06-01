@@ -4,7 +4,7 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
-use watcher_server::{alerts, app, db, grpc, retention, rollup};
+use watcher_server::{alerts, app, db, grpc, retention};
 
 /// Self-instrumentation: export watcher's own traces over OTLP, tagged
 /// `service.name=watcher` by default, so it shows up in its own UI. Exports to
@@ -64,11 +64,9 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(default)
     };
     let retention_days = env_i32("WATCHER_RETENTION_DAYS", 7);
-    // Raw metric points are pruned sooner than everything else; rollups keep the
-    // history. 0 keeps raw points for the full retention window.
-    let metrics_raw_days = env_i32("WATCHER_METRICS_RAW_DAYS", 2);
-    // Width of a downsample bucket, in seconds (0 disables rollups).
-    let rollup_bucket_secs = env_i32("WATCHER_ROLLUP_BUCKET_SECS", 300) as i64;
+    // Raw metric points are aggregated into per-series rollups on ingest, so raw
+    // is kept only as a short full-resolution window for inspection.
+    let metrics_raw_hours = env_i32("WATCHER_METRICS_RAW_HOURS", 6);
     // How often to evaluate alert rules, and where to POST when one fires.
     let alert_interval_secs = env_i32("WATCHER_ALERT_INTERVAL_SECS", 30).max(5) as u64;
     let alert_webhook = std::env::var("WATCHER_ALERT_WEBHOOK")
@@ -78,12 +76,13 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::connect(&database_url).await?;
     db::migrate(&pool).await?;
 
+    // No downsample sweep: rollups are maintained incrementally on insert
+    // (see otlp::insert_number / insert_histogram).
     tokio::spawn(retention::run(
         pool.clone(),
         retention_days,
-        metrics_raw_days,
+        metrics_raw_hours,
     ));
-    tokio::spawn(rollup::run(pool.clone(), rollup_bucket_secs));
     tokio::spawn(alerts::run(
         pool.clone(),
         alert_webhook,

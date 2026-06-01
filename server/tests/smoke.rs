@@ -944,6 +944,42 @@ async fn metric_hist_facet_returns_per_series_percentiles() {
     assert!((p95 - 19.5).abs() < 0.001, "p95 was {p95}");
 }
 
+#[tokio::test]
+#[serial]
+async fn ingest_aggregates_into_rollup_on_insert() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let router = app(pool.clone());
+
+    // Two gauge points of the same series in the same bucket. Aggregation happens
+    // on ingest (no sweep), so the rollup row should already hold the merged
+    // count/sum/avg and the facet should read it live.
+    let now = now_nanos();
+    assert_eq!(
+        post_proto(&router, "/v1/metrics", gauge_request("g.live", 10.0, now).encode_to_vec()).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_proto(&router, "/v1/metrics", gauge_request("g.live", 20.0, now).encode_to_vec()).await,
+        StatusCode::OK
+    );
+
+    let (count, sum, avg): (i64, f64, f64) =
+        sqlx::query_as("SELECT count, sum, avg FROM metric_series_rollups WHERE name = 'g.live'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 2, "two points merged into one rollup row");
+    assert_eq!(sum, 30.0);
+    assert_eq!(avg, 15.0, "avg derived from merged sum/count");
+
+    // No rollup_once call — the facet reads the live rollup straight away.
+    let (status, f) = get_json(&router, "/api/metrics/facet?name=g.live&hours=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(f["series"].as_array().unwrap().len(), 1);
+}
+
 // --- Rollups ---------------------------------------------------------------
 
 #[tokio::test]
@@ -1031,19 +1067,20 @@ async fn retention_prunes_raw_metrics_before_rollups() {
         return;
     };
     let day = 86_400.0;
+    let hour = 3_600.0;
     // spans/logs: old gone, recent kept (window = 7d).
     insert_span_at(&pool, "svc", "old", "o", 10.0 * day).await;
     insert_span_at(&pool, "svc", "new", "n", 1.0 * day).await;
     insert_log_at(&pool, "svc", 10.0 * day).await;
     insert_log_at(&pool, "svc", 1.0 * day).await;
-    // raw metrics: window = 2d, so the 3-day-old point goes, the 1-day stays.
-    insert_metric_at(&pool, "m", None, 1.0, 3.0 * day).await;
-    insert_metric_at(&pool, "m", None, 1.0, 1.0 * day).await;
+    // raw metrics: window = 6h, so the 10-hour-old point goes, the 1-hour stays.
+    insert_metric_at(&pool, "m", None, 1.0, 10.0 * hour).await;
+    insert_metric_at(&pool, "m", None, 1.0, 1.0 * hour).await;
     // rollups: window = 7d, so the 10-day rollup goes, the 3-day stays.
     insert_rollup_at(&pool, "m", 10.0 * day).await;
     insert_rollup_at(&pool, "m", 3.0 * day).await;
 
-    let deleted = watcher_server::retention::prune_once(&pool, 7, 2)
+    let deleted = watcher_server::retention::prune_once(&pool, 7, 6)
         .await
         .unwrap();
     assert!(deleted >= 4);
