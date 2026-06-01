@@ -381,6 +381,289 @@ pub async fn metric_series_grouped(
     Ok(Json(rows))
 }
 
+// --- Faceted series (one line per full attribute set) ----------------------
+
+#[derive(Deserialize)]
+pub struct FacetQuery {
+    name: String,
+    hours: Option<i32>,
+}
+
+#[derive(Serialize)]
+pub struct FacetSeries {
+    /// The series' full attribute set; the UI labels each line by the keys that
+    /// vary across the set (e.g. pod=a, cpu=0).
+    attrs: serde_json::Value,
+    points: Vec<SeriesPoint>,
+}
+
+#[derive(Serialize)]
+pub struct FacetResponse {
+    kind: Option<String>,
+    /// true when values are per-second rates (a monotonic sum / counter).
+    rated: bool,
+    unit: Option<String>,
+    series: Vec<FacetSeries>,
+    /// Series omitted beyond the display cap (0 if none).
+    truncated: i64,
+}
+
+const FACET_MAX_SERIES: usize = 24;
+
+#[derive(sqlx::FromRow)]
+struct FacetRow {
+    attrs: serde_json::Value,
+    t: DateTime<Utc>,
+    avg: Option<f64>,
+    last: Option<f64>,
+}
+
+/// GET /api/metrics/facet — one bucketed series per distinct attribute set, so a
+/// per-pod/per-cpu metric shows each real series instead of one blended line.
+/// Gauges plot the bucket average; monotonic sums (counters) are differenced
+/// into a per-second rate. Top series by activity; the rest are reported as a
+/// count, never silently dropped.
+pub async fn metric_facet(
+    State(pool): State<PgPool>,
+    Query(q): Query<FacetQuery>,
+) -> Result<Json<FacetResponse>, ApiError> {
+    let hours = q.hours.unwrap_or(6).clamp(1, 24 * 7);
+    let width = rollup_bucket_secs();
+
+    // kind / monotonicity / unit are constant per metric name.
+    let meta: Option<(String, Option<bool>, Option<String>)> = sqlx::query_as(
+        "SELECT kind, is_monotonic, unit FROM metrics WHERE name = $1 ORDER BY time DESC LIMIT 1",
+    )
+    .bind(&q.name)
+    .fetch_optional(&pool)
+    .await
+    .map_err(internal)?;
+    let (kind, is_monotonic, unit) = match meta {
+        Some((k, m, u)) => (Some(k), m.unwrap_or(false), u),
+        None => {
+            return Ok(Json(FacetResponse {
+                kind: None,
+                rated: false,
+                unit: None,
+                series: vec![],
+                truncated: 0,
+            }))
+        }
+    };
+    let rated = kind.as_deref() == Some("sum") && is_monotonic;
+
+    // avg = bucket mean (for gauges); last = cumulative level (for rating counters).
+    let rows: Vec<FacetRow> = sqlx::query_as(
+        "SELECT attributes AS attrs,
+                to_timestamp(floor(extract(epoch FROM time)::float8 / $3) * $3) AS t,
+                avg(value) AS avg,
+                max(value) AS last
+         FROM metrics
+         WHERE name = $1 AND time >= now() - make_interval(hours => $2)
+         GROUP BY attrs, t
+         ORDER BY t ASC",
+    )
+    .bind(&q.name)
+    .bind(hours)
+    .bind(width)
+    .fetch_all(&pool)
+    .await
+    .map_err(internal)?;
+
+    // Group rows into series keyed by their attribute set.
+    let mut map: std::collections::BTreeMap<String, (serde_json::Value, Vec<FacetRow>)> =
+        std::collections::BTreeMap::new();
+    for r in rows {
+        let key = r.attrs.to_string();
+        map.entry(key)
+            .or_insert_with(|| (r.attrs.clone(), Vec::new()))
+            .1
+            .push(r);
+    }
+
+    let mut series: Vec<FacetSeries> = map
+        .into_values()
+        .map(|(attrs, pts)| {
+            let points = if rated {
+                // Difference the cumulative level into a per-second rate; a reset
+                // (level drops) yields 0 rather than a spurious negative spike.
+                let mut out = Vec::with_capacity(pts.len());
+                let mut prev: Option<(DateTime<Utc>, f64)> = None;
+                for r in pts {
+                    let v = match (prev, r.last) {
+                        (Some((pt, pv)), Some(cur)) => {
+                            let dt = (r.t - pt).num_seconds() as f64;
+                            if dt > 0.0 && cur >= pv {
+                                Some((cur - pv) / dt)
+                            } else {
+                                Some(0.0)
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(c) = r.last {
+                        prev = Some((r.t, c));
+                    }
+                    out.push(SeriesPoint { t: r.t, v });
+                }
+                out
+            } else {
+                pts.into_iter()
+                    .map(|r| SeriesPoint { t: r.t, v: r.avg })
+                    .collect()
+            };
+            FacetSeries { attrs, points }
+        })
+        .collect();
+
+    // Most-active series first; cap and report the remainder.
+    series.sort_by(|a, b| b.points.len().cmp(&a.points.len()));
+    let truncated = series.len().saturating_sub(FACET_MAX_SERIES) as i64;
+    series.truncate(FACET_MAX_SERIES);
+
+    Ok(Json(FacetResponse {
+        kind,
+        rated,
+        unit,
+        series,
+        truncated,
+    }))
+}
+
+// --- Histogram percentiles + heatmap ---------------------------------------
+
+#[derive(Deserialize)]
+pub struct HistQuery {
+    name: String,
+    hours: Option<i32>,
+}
+
+#[derive(Serialize)]
+pub struct HistBucket {
+    t: DateTime<Utc>,
+    /// Per-value-bucket observation counts (heatmap row), aligned to `bounds`.
+    counts: Vec<i64>,
+    p50: Option<f64>,
+    p95: Option<f64>,
+    p99: Option<f64>,
+}
+
+#[derive(Serialize)]
+pub struct HistResponse {
+    /// Explicit upper bounds shared by the buckets (length = counts - 1).
+    bounds: Vec<f64>,
+    unit: Option<String>,
+    buckets: Vec<HistBucket>,
+}
+
+#[derive(sqlx::FromRow)]
+struct HistRow {
+    t: DateTime<Utc>,
+    bounds: Option<Vec<f64>>,
+    counts: Option<Vec<i64>>,
+    unit: Option<String>,
+}
+
+/// GET /api/metrics/histogram — per-time-bucket distribution for a histogram
+/// metric: the summed bucket counts (a heatmap row) plus p50/p95/p99 computed by
+/// linear interpolation across the buckets. Counts are summed within each time
+/// bucket (delta temporality — each data point carries its interval's counts).
+pub async fn metric_histogram(
+    State(pool): State<PgPool>,
+    Query(q): Query<HistQuery>,
+) -> Result<Json<HistResponse>, ApiError> {
+    let hours = q.hours.unwrap_or(6).clamp(1, 24 * 7);
+    let width = rollup_bucket_secs();
+
+    let rows: Vec<HistRow> = sqlx::query_as(
+        "SELECT to_timestamp(floor(extract(epoch FROM time)::float8 / $3) * $3) AS t,
+                bucket_bounds AS bounds, bucket_counts AS counts, unit
+         FROM metrics
+         WHERE name = $1 AND kind = 'histogram' AND bucket_counts IS NOT NULL
+           AND time >= now() - make_interval(hours => $2)
+         ORDER BY t ASC",
+    )
+    .bind(&q.name)
+    .bind(hours)
+    .bind(width)
+    .fetch_all(&pool)
+    .await
+    .map_err(internal)?;
+
+    // Element-wise sum the counts within each time bucket. Use the first row's
+    // bounds as the reference and skip points with a mismatched schema.
+    let mut bounds: Vec<f64> = Vec::new();
+    let mut unit: Option<String> = None;
+    let mut agg: std::collections::BTreeMap<i64, (DateTime<Utc>, Vec<i64>)> =
+        std::collections::BTreeMap::new();
+    for r in rows {
+        let (b, c) = match (r.bounds, r.counts) {
+            (Some(b), Some(c)) if c.len() == b.len() + 1 => (b, c),
+            _ => continue,
+        };
+        if bounds.is_empty() {
+            bounds = b;
+            unit = r.unit;
+        }
+        if c.len() != bounds.len() + 1 {
+            continue;
+        }
+        let entry = agg
+            .entry(r.t.timestamp())
+            .or_insert_with(|| (r.t, vec![0i64; c.len()]));
+        for (s, v) in entry.1.iter_mut().zip(c.iter()) {
+            *s += *v;
+        }
+    }
+
+    let buckets = agg
+        .into_values()
+        .map(|(t, counts)| HistBucket {
+            p50: hist_quantile(&bounds, &counts, 0.50),
+            p95: hist_quantile(&bounds, &counts, 0.95),
+            p99: hist_quantile(&bounds, &counts, 0.99),
+            t,
+            counts,
+        })
+        .collect();
+
+    Ok(Json(HistResponse {
+        bounds,
+        unit,
+        buckets,
+    }))
+}
+
+/// Linear-interpolated quantile from explicit-bound histogram buckets, à la
+/// Prometheus `histogram_quantile`. `bounds` are the upper bounds; `counts` has
+/// one extra entry for the +Inf overflow bucket.
+fn hist_quantile(bounds: &[f64], counts: &[i64], q: f64) -> Option<f64> {
+    let total: i64 = counts.iter().sum();
+    if total == 0 || bounds.is_empty() {
+        return None;
+    }
+    let rank = q * total as f64;
+    let mut cum = 0i64;
+    for (i, &c) in counts.iter().enumerate() {
+        let prev_cum = cum;
+        cum += c;
+        if cum as f64 >= rank {
+            let lower = if i == 0 { 0.0 } else { bounds[i - 1] };
+            // +Inf overflow bucket: clamp to the largest finite bound.
+            let upper = match bounds.get(i) {
+                Some(&u) => u,
+                None => return bounds.last().copied(),
+            };
+            if c == 0 {
+                return Some(upper);
+            }
+            let frac = (rank - prev_cum as f64) / c as f64;
+            return Some(lower + (upper - lower) * frac);
+        }
+    }
+    bounds.last().copied()
+}
+
 #[derive(Deserialize)]
 pub struct RedQuery {
     from: Option<DateTime<Utc>>,

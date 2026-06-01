@@ -47,6 +47,7 @@ function MetricsRoute() {
         const qs = new URLSearchParams();
         if (m.service) qs.set("service", m.service);
         if (m.unit) qs.set("unit", m.unit);
+        if (m.kind) qs.set("kind", m.kind);
         const s = qs.toString();
         navigate(`/metrics/${encodeURIComponent(m.name)}${s ? `?${s}` : ""}`);
       }}
@@ -63,6 +64,7 @@ function MetricRoute() {
       name={name!}
       service={params.get("service")}
       unit={params.get("unit")}
+      kind={params.get("kind")}
       onBack={() => navigate("/metrics")}
     />
   );

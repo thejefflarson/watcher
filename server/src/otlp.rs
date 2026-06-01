@@ -266,15 +266,27 @@ async fn insert_metric(
                     &m.name,
                     "gauge",
                     unit.as_deref(),
+                    None,
                     dp,
                 )
                 .await as u64;
             }
         }
         Some(metric::Data::Sum(s)) => {
+            // is_monotonic distinguishes a counter (rate it) from an
+            // UpDownCounter (a gauge-like running value).
             for dp in &s.data_points {
-                n += insert_number(pool, service, resource, &m.name, "sum", unit.as_deref(), dp)
-                    .await as u64;
+                n += insert_number(
+                    pool,
+                    service,
+                    resource,
+                    &m.name,
+                    "sum",
+                    unit.as_deref(),
+                    Some(s.is_monotonic),
+                    dp,
+                )
+                .await as u64;
             }
         }
         Some(metric::Data::Histogram(h)) => {
@@ -296,6 +308,7 @@ async fn insert_number(
     name: &str,
     kind: &str,
     unit: Option<&str>,
+    is_monotonic: Option<bool>,
     dp: &NumberDataPoint,
 ) -> bool {
     let value = match dp.value {
@@ -304,8 +317,8 @@ async fn insert_number(
         None => return false,
     };
     let res = sqlx::query(
-        "INSERT INTO metrics (time, service, name, kind, value, unit, attributes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        "INSERT INTO metrics (time, service, name, kind, value, unit, attributes, is_monotonic)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
     )
     .bind(ts(dp.time_unix_nano))
     .bind(service)
@@ -314,6 +327,7 @@ async fn insert_number(
     .bind(value)
     .bind(unit)
     .bind(merged_attrs(resource, &dp.attributes))
+    .bind(is_monotonic)
     .execute(pool)
     .await;
     match res {
@@ -333,9 +347,13 @@ async fn insert_histogram(
     unit: Option<&str>,
     dp: &HistogramDataPoint,
 ) -> bool {
+    // bucket_counts has one more entry than explicit_bounds (the +Inf bucket).
+    let bounds: Vec<f64> = dp.explicit_bounds.clone();
+    let counts: Vec<i64> = dp.bucket_counts.iter().map(|&c| c as i64).collect();
     let res = sqlx::query(
-        "INSERT INTO metrics (time, service, name, kind, value, count, unit, attributes)
-         VALUES ($1,$2,$3,'histogram',$4,$5,$6,$7)",
+        "INSERT INTO metrics
+            (time, service, name, kind, value, count, unit, attributes, bucket_bounds, bucket_counts)
+         VALUES ($1,$2,$3,'histogram',$4,$5,$6,$7,$8,$9)",
     )
     .bind(ts(dp.time_unix_nano))
     .bind(service)
@@ -344,6 +362,8 @@ async fn insert_histogram(
     .bind(dp.count as i64)
     .bind(unit)
     .bind(merged_attrs(resource, &dp.attributes))
+    .bind(&bounds)
+    .bind(&counts)
     .execute(pool)
     .await;
     match res {
