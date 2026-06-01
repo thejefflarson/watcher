@@ -316,9 +316,29 @@ async fn insert_number(
         Some(number_data_point::Value::AsInt(i)) => i as f64,
         None => return false,
     };
+    // Aggregate-on-insert: keep the raw point (short, capped retention) AND fold
+    // it into its per-series rollup bucket in one statement, so the rollup's
+    // current bucket is always live — no batch sweep, and reads stay fresh.
     let res = sqlx::query(
-        "INSERT INTO metrics (time, service, name, kind, value, unit, attributes, is_monotonic)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+        "WITH raw AS (
+             INSERT INTO metrics (time, service, name, kind, value, unit, attributes, is_monotonic)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         )
+         INSERT INTO metric_series_rollups
+             (bucket, name, series_key, attrs, service, kind, unit, is_monotonic,
+              count, sum, min, max, avg)
+         VALUES (to_timestamp(floor(extract(epoch FROM $1::timestamptz) / $9) * $9),
+                 $3, md5(coalesce($2,'') || '|' || $7::text), $7, $2, $4, $6, $8,
+                 1, $5, $5, $5, $5)
+         ON CONFLICT (name, series_key, bucket) DO UPDATE SET
+             count = metric_series_rollups.count + 1,
+             sum   = metric_series_rollups.sum + EXCLUDED.sum,
+             min   = least(metric_series_rollups.min, EXCLUDED.min),
+             max   = greatest(metric_series_rollups.max, EXCLUDED.max),
+             avg   = (metric_series_rollups.sum + EXCLUDED.sum)
+                     / (metric_series_rollups.count + 1),
+             unit  = EXCLUDED.unit,
+             is_monotonic = EXCLUDED.is_monotonic",
     )
     .bind(ts(dp.time_unix_nano))
     .bind(service)
@@ -328,6 +348,7 @@ async fn insert_number(
     .bind(unit)
     .bind(merged_attrs(resource, &dp.attributes))
     .bind(is_monotonic)
+    .bind(rollup_width())
     .execute(pool)
     .await;
     match res {
@@ -350,10 +371,30 @@ async fn insert_histogram(
     // bucket_counts has one more entry than explicit_bounds (the +Inf bucket).
     let bounds: Vec<f64> = dp.explicit_bounds.clone();
     let counts: Vec<i64> = dp.bucket_counts.iter().map(|&c| c as i64).collect();
+    // Raw point + additive fold into the per-series histogram rollup (counts
+    // summed element-wise via array_add) in one statement — see insert_number.
     let res = sqlx::query(
-        "INSERT INTO metrics
-            (time, service, name, kind, value, count, unit, attributes, bucket_bounds, bucket_counts)
-         VALUES ($1,$2,$3,'histogram',$4,$5,$6,$7,$8,$9)",
+        "WITH raw AS (
+             INSERT INTO metrics
+                 (time, service, name, kind, value, count, unit, attributes, bucket_bounds, bucket_counts)
+             VALUES ($1,$2,$3,'histogram',$4,$5,$6,$7,$8,$9)
+         )
+         INSERT INTO metric_series_rollups
+             (bucket, name, series_key, attrs, service, kind, unit,
+              count, sum, min, max, avg, bucket_bounds, bucket_counts)
+         VALUES (to_timestamp(floor(extract(epoch FROM $1::timestamptz) / $10) * $10),
+                 $3, md5(coalesce($2,'') || '|' || $7::text), $7, $2, 'histogram', $6,
+                 $5, $4, $4, $4, $4, $8, $9)
+         ON CONFLICT (name, series_key, bucket) DO UPDATE SET
+             count = metric_series_rollups.count + EXCLUDED.count,
+             sum   = metric_series_rollups.sum + EXCLUDED.sum,
+             min   = least(metric_series_rollups.min, EXCLUDED.min),
+             max   = greatest(metric_series_rollups.max, EXCLUDED.max),
+             avg   = (metric_series_rollups.sum + EXCLUDED.sum)
+                     / nullif(metric_series_rollups.count + EXCLUDED.count, 0),
+             unit  = EXCLUDED.unit,
+             bucket_bounds = coalesce(metric_series_rollups.bucket_bounds, EXCLUDED.bucket_bounds),
+             bucket_counts = array_add(metric_series_rollups.bucket_counts, EXCLUDED.bucket_counts)",
     )
     .bind(ts(dp.time_unix_nano))
     .bind(service)
@@ -364,6 +405,7 @@ async fn insert_histogram(
     .bind(merged_attrs(resource, &dp.attributes))
     .bind(&bounds)
     .bind(&counts)
+    .bind(rollup_width())
     .execute(pool)
     .await;
     match res {
@@ -381,6 +423,19 @@ async fn insert_histogram(
 
 fn ts(nanos: u64) -> DateTime<Utc> {
     DateTime::from_timestamp_nanos(nanos as i64)
+}
+
+/// Rollup bucket width in seconds (`WATCHER_ROLLUP_BUCKET_SECS`, default 300),
+/// read once. Must match api.rs' `rollup_bucket_secs` so buckets line up.
+fn rollup_width() -> f64 {
+    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("WATCHER_ROLLUP_BUCKET_SECS")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|s| *s > 0.0)
+            .unwrap_or(300.0)
+    })
 }
 
 fn resource_attrs(
