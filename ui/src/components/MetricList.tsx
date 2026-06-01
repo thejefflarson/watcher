@@ -16,6 +16,20 @@ import Sparkline from "./Sparkline";
 // detail page has the full range selector.
 const EXPAND_HOURS = 6;
 
+// The small glyph for a single-series row's "recent" column, per type: gauges
+// plot their value; counters (and histogram sums) are cumulative, so plot the
+// per-interval delta (a rate) instead of an ever-climbing ramp. Values are
+// newest-first (matching the API's spark field).
+function listSpark(m: MetricSummary): number[] | null {
+  if (!m.spark || m.spark.length < 2) return null;
+  if (m.kind === "gauge") return m.spark;
+  const rate: number[] = [];
+  for (let i = 0; i < m.spark.length - 1; i++) {
+    rate.push(Math.max(0, m.spark[i] - m.spark[i + 1]));
+  }
+  return rate.length >= 2 ? rate : null;
+}
+
 // Gauge/sum series rows: value (or per-second rate) sparkline + latest.
 function FacetSeriesRows({ name, unit }: { name: string; unit: string | null }) {
   const [data, setData] = useState<FacetResponse | null>(null);
@@ -36,6 +50,7 @@ function FacetSeriesRows({ name, unit }: { name: string; unit: string | null }) 
   const u = data.rated ? `${unit ?? ""}/s` : unit;
   return (
     <table className="subseries">
+      <caption className="muted small subseries-count">{data.series.length} series</caption>
       <tbody>
         {data.series.map((s, i) => {
           const vals = s.points.map((p) => p.v).filter((v): v is number => v != null);
@@ -85,6 +100,7 @@ function HistSeriesRows({ name, unit }: { name: string; unit: string | null }) {
   const labels = facetLabels(data.series);
   return (
     <table className="subseries">
+      <caption className="muted small subseries-count">{data.series.length} series</caption>
       <tbody>
         {data.series.map((s, i) => {
           const p95s = s.points.map((p) => p.p95).filter((v): v is number => v != null);
@@ -190,7 +206,6 @@ export default function MetricList({
           <thead>
             <tr>
               <th>metric</th>
-              <th>service</th>
               <th>kind</th>
               <th>recent</th>
               <th className="num">last</th>
@@ -200,6 +215,9 @@ export default function MetricList({
             {metrics.map((m) => {
               const multi = (m.series_count ?? 1) > 1;
               const open = expanded.has(m.name);
+              // Per-type small glyph for single-series rows; multi-series rows
+              // expand to the proper per-series viz instead.
+              const spark = multi ? null : listSpark(m);
               return (
                 <Fragment key={m.name}>
                   <tr className="clickable" onClick={() => onSelect(m)} title="View time series">
@@ -211,21 +229,17 @@ export default function MetricList({
                             e.stopPropagation();
                             toggle(m.name);
                           }}
-                          title={`${m.series_count} series — expand`}
+                          title="Expand series"
                         >
                           {open ? "▾" : "▸"}
                         </button>
                       )}
                       {m.name}
-                      {multi && <span className="muted"> ×{m.series_count}</span>}
                     </td>
-                    <td>{m.service ?? "—"}</td>
                     <td className="muted">{m.kind ?? "—"}</td>
                     <td>
-                      {multi ? (
-                        <span className="muted">—</span>
-                      ) : m.spark ? (
-                        <Sparkline values={m.spark} />
+                      {spark ? (
+                        <Sparkline values={spark} />
                       ) : (
                         <span className="muted">—</span>
                       )}
@@ -240,7 +254,7 @@ export default function MetricList({
                   </tr>
                   {open && (
                     <tr className="subseries-row">
-                      <td colSpan={5}>
+                      <td colSpan={4}>
                         <ExpandedMetric m={m} />
                       </td>
                     </tr>
