@@ -65,6 +65,9 @@ pub async fn ingest_traces(
     }
 }
 
+// Spanned (unlike ingest_traces): exported spans go to /v1/traces, which is NOT
+// spanned, so a metric/log ingest span can't trigger a self-export loop.
+#[tracing::instrument(name = "ingest.logs", skip_all)]
 pub async fn ingest_logs(
     State(pool): State<PgPool>,
     headers: HeaderMap,
@@ -86,6 +89,7 @@ pub async fn ingest_logs(
     }
 }
 
+#[tracing::instrument(name = "ingest.metrics", skip_all)]
 pub async fn ingest_metrics(
     State(pool): State<PgPool>,
     headers: HeaderMap,
