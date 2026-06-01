@@ -75,10 +75,13 @@ function FacetSeriesRows({ name, unit }: { name: string; unit: string | null }) 
             <tr key={i}>
               <td className="mono sub-label">{labels[i]}</td>
               <td>
-                {vals.length >= 2 ? (
-                  <Sparkline values={[...vals].reverse()} />
-                ) : (
+                {vals.length < 2 ? (
                   <span className="muted">—</span>
+                ) : data.rated ? (
+                  // counter: per-interval rate as bars (points are oldest→newest)
+                  <Bars values={vals} />
+                ) : (
+                  <Sparkline values={[...vals].reverse()} />
                 )}
               </td>
               <td className="num">{formatValue(latest, u)}</td>
@@ -97,7 +100,7 @@ function FacetSeriesRows({ name, unit }: { name: string; unit: string | null }) 
   );
 }
 
-// Histogram series rows: p95 trend sparkline + latest p50/p95/p99.
+// Histogram series rows: latency distribution bars + latest p50/p95/p99.
 function HistSeriesRows({ name, unit }: { name: string; unit: string | null }) {
   const [data, setData] = useState<HistFacetResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -119,14 +122,13 @@ function HistSeriesRows({ name, unit }: { name: string; unit: string | null }) {
       <caption className="muted small subseries-count">{data.series.length} series</caption>
       <tbody>
         {data.series.map((s, i) => {
-          const p95s = s.points.map((p) => p.p95).filter((v): v is number => v != null);
           const last = s.points.length ? s.points[s.points.length - 1] : null;
           return (
             <tr key={i}>
               <td className="mono sub-label">{labels[i]}</td>
-              <td title="p95 trend">
-                {p95s.length >= 2 ? (
-                  <Sparkline values={[...p95s].reverse()} />
+              <td title="latency distribution">
+                {s.dist && s.dist.length > 1 ? (
+                  <Bars values={s.dist} />
                 ) : (
                   <span className="muted">—</span>
                 )}

@@ -172,9 +172,11 @@ export interface HistFacetPoint {
 export interface HistFacetSeries {
   attrs: Record<string, string>;
   points: HistFacetPoint[];
+  dist: number[];
 }
 export interface HistFacetResponse {
   unit: string | null;
+  bounds: number[];
   series: HistFacetSeries[];
   truncated: number;
 }

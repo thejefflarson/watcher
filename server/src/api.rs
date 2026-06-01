@@ -701,11 +701,16 @@ pub struct HistFacetPoint {
 pub struct HistFacetSeries {
     attrs: serde_json::Value,
     points: Vec<HistFacetPoint>,
+    /// This series' most recent per-bucket counts, so the row can draw the
+    /// distribution shape (bars) rather than just a percentile line.
+    dist: Vec<i64>,
 }
 
 #[derive(Serialize)]
 pub struct HistFacetResponse {
     unit: Option<String>,
+    /// Bucket upper bounds shared by the series' `dist` arrays.
+    bounds: Vec<f64>,
     series: Vec<HistFacetSeries>,
     truncated: i64,
 }
@@ -743,8 +748,14 @@ pub async fn metric_hist_facet(
     .map_err(internal)?;
 
     let mut unit: Option<String> = None;
-    let mut map: std::collections::BTreeMap<String, (serde_json::Value, Vec<HistFacetPoint>)> =
-        std::collections::BTreeMap::new();
+    let mut bounds: Vec<f64> = Vec::new();
+    // Rows are ordered t ASC, so the last counts seen per series is the latest
+    // distribution.
+    #[allow(clippy::type_complexity)]
+    let mut map: std::collections::BTreeMap<
+        String,
+        (serde_json::Value, Vec<HistFacetPoint>, Vec<i64>),
+    > = std::collections::BTreeMap::new();
     for r in rows {
         if unit.is_none() {
             unit = r.unit;
@@ -753,21 +764,29 @@ pub async fn metric_hist_facet(
             (Some(b), Some(c)) if c.len() == b.len() + 1 => (b, c),
             _ => continue,
         };
+        if bounds.is_empty() {
+            bounds = b.clone();
+        }
         let point = HistFacetPoint {
             t: r.t,
             p50: hist_quantile(&b, &c, 0.50),
             p95: hist_quantile(&b, &c, 0.95),
             p99: hist_quantile(&b, &c, 0.99),
         };
-        map.entry(r.attrs.to_string())
-            .or_insert_with(|| (r.attrs, Vec::new()))
-            .1
-            .push(point);
+        let entry = map
+            .entry(r.attrs.to_string())
+            .or_insert_with(|| (r.attrs, Vec::new(), Vec::new()));
+        entry.1.push(point);
+        entry.2 = c;
     }
 
     let mut series: Vec<HistFacetSeries> = map
         .into_values()
-        .map(|(attrs, points)| HistFacetSeries { attrs, points })
+        .map(|(attrs, points, dist)| HistFacetSeries {
+            attrs,
+            points,
+            dist,
+        })
         .collect();
     series.sort_by(|a, b| b.points.len().cmp(&a.points.len()));
     let truncated = series.len().saturating_sub(FACET_MAX_SERIES) as i64;
@@ -775,6 +794,7 @@ pub async fn metric_hist_facet(
 
     Ok(Json(HistFacetResponse {
         unit,
+        bounds,
         series,
         truncated,
     }))
