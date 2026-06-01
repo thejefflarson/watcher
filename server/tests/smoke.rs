@@ -748,18 +748,20 @@ async fn metric_facet_splits_series_and_rates_a_counter() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    // A monotonic sum (counter) with two series. The facet endpoint should
+    // A monotonic sum (counter) with two series across two completed buckets.
+    // The facet endpoint reads rollups, so roll the raw up first; it should
     // return one series each and present per-second rates, not raw cumulatives.
     sqlx::query(
         "INSERT INTO metrics (time, service, name, kind, value, unit, attributes, is_monotonic) VALUES
-            (now() - interval '600 seconds','api','reqs.total','sum',100,'1','{\"pod\":\"a\"}',true),
-            (now(),                          'api','reqs.total','sum',160,'1','{\"pod\":\"a\"}',true),
-            (now() - interval '600 seconds','api','reqs.total','sum',500,'1','{\"pod\":\"b\"}',true),
-            (now(),                          'api','reqs.total','sum',500,'1','{\"pod\":\"b\"}',true)",
+            (now() - interval '900 seconds','api','reqs.total','sum',100,'1','{\"pod\":\"a\"}',true),
+            (now() - interval '600 seconds','api','reqs.total','sum',160,'1','{\"pod\":\"a\"}',true),
+            (now() - interval '900 seconds','api','reqs.total','sum',500,'1','{\"pod\":\"b\"}',true),
+            (now() - interval '600 seconds','api','reqs.total','sum',500,'1','{\"pod\":\"b\"}',true)",
     )
     .execute(&pool)
     .await
     .unwrap();
+    watcher_server::rollup::rollup_once(&pool, 300).await.unwrap();
     let router = app(pool);
 
     let (status, f) = get_json(&router, "/api/metrics/facet?name=reqs.total&hours=1").await;
@@ -792,16 +794,18 @@ async fn metric_histogram_interpolates_percentiles() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    // 100 observations all in the (10,20] bucket. Linear interpolation puts the
-    // median at the bucket midpoint (15) and p95 near the top (19.5).
+    // 100 observations all in the (10,20] bucket, in a completed time bucket so
+    // the rollup picks them up (the endpoint reads rollups). Linear interpolation
+    // puts the median at the bucket midpoint (15) and p95 near the top (19.5).
     sqlx::query(
         "INSERT INTO metrics (time, name, kind, value, count, unit, attributes, bucket_bounds, bucket_counts)
-         VALUES (now(),'lat','histogram',1500,100,'ms','{}',
+         VALUES (now() - interval '600 seconds','lat','histogram',1500,100,'ms','{}',
                  ARRAY[10,20,30]::double precision[], ARRAY[0,100,0,0]::bigint[])",
     )
     .execute(&pool)
     .await
     .unwrap();
+    watcher_server::rollup::rollup_once(&pool, 300).await.unwrap();
     let router = app(pool);
 
     let (status, h) = get_json(&router, "/api/metrics/histogram?name=lat&hours=1").await;

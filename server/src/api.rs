@@ -428,7 +428,6 @@ pub async fn metric_facet(
     Query(q): Query<FacetQuery>,
 ) -> Result<Json<FacetResponse>, ApiError> {
     let hours = q.hours.unwrap_or(6).clamp(1, 24 * 7);
-    let width = rollup_bucket_secs();
 
     // kind / monotonicity / unit are constant per metric name; read the most
     // recent from raw or rollup (raw may be pruned past metrics_raw_days).
@@ -459,32 +458,18 @@ pub async fn metric_facet(
     };
     let rated = kind.as_deref() == Some("sum") && is_monotonic;
 
-    // Per-series points from the downsampled rollup, stitched with recent raw
-    // buckets newer than the last rollup — so this is index-fast over the full
-    // range, not a raw scan. avg = bucket mean (gauges); last = cumulative level
-    // (counters, for rate differencing).
+    // Per-series points straight from the downsampled rollup — index-fast, no
+    // raw scan. The current (still-filling) bucket isn't rolled yet, so the
+    // newest point lags by up to one bucket; fine for charts. avg = bucket mean
+    // (gauges); max = cumulative level (counters, for rate differencing).
     let rows: Vec<FacetRow> = sqlx::query_as(
-        "WITH last_roll AS (
-             SELECT max(bucket) AS b FROM metric_series_rollups WHERE name = $1
-         )
-         SELECT attrs, bucket AS t, avg, max AS last
+        "SELECT attrs, bucket AS t, avg, max AS last
          FROM metric_series_rollups
          WHERE name = $1 AND bucket >= now() - make_interval(hours => $2)
-         UNION ALL
-         SELECT attributes AS attrs,
-                to_timestamp(floor(extract(epoch FROM time)::float8 / $3) * $3) AS t,
-                avg(value) AS avg,
-                max(value) AS last
-         FROM metrics, last_roll
-         WHERE name = $1 AND value IS NOT NULL
-           AND time >= now() - make_interval(hours => $2)
-           AND (last_roll.b IS NULL OR time >= last_roll.b + make_interval(secs => $3))
-         GROUP BY attributes, t
          ORDER BY t ASC",
     )
     .bind(&q.name)
     .bind(hours)
-    .bind(width)
     .fetch_all(&pool)
     .await
     .map_err(internal)?;
@@ -592,32 +577,18 @@ pub async fn metric_histogram(
     Query(q): Query<HistQuery>,
 ) -> Result<Json<HistResponse>, ApiError> {
     let hours = q.hours.unwrap_or(6).clamp(1, 24 * 7);
-    let width = rollup_bucket_secs();
 
-    // Per-series rollup counts (already summed within series+bucket) stitched
-    // with recent raw points; the Rust pass below sums across series per time
-    // bucket. Stitch boundary prevents double-counting.
+    // Per-series rollup counts (already summed within series+bucket) straight
+    // from the rollup; the Rust pass below sums across series per time bucket.
     let rows: Vec<HistRow> = sqlx::query_as(
-        "WITH last_roll AS (
-             SELECT max(bucket) AS b FROM metric_series_rollups
-             WHERE name = $1 AND kind = 'histogram'
-         )
-         SELECT bucket AS t, bucket_bounds AS bounds, bucket_counts AS counts, unit
+        "SELECT bucket AS t, bucket_bounds AS bounds, bucket_counts AS counts, unit
          FROM metric_series_rollups
          WHERE name = $1 AND kind = 'histogram' AND bucket_counts IS NOT NULL
            AND bucket >= now() - make_interval(hours => $2)
-         UNION ALL
-         SELECT to_timestamp(floor(extract(epoch FROM time)::float8 / $3) * $3) AS t,
-                bucket_bounds AS bounds, bucket_counts AS counts, unit
-         FROM metrics, last_roll
-         WHERE name = $1 AND kind = 'histogram' AND bucket_counts IS NOT NULL
-           AND time >= now() - make_interval(hours => $2)
-           AND (last_roll.b IS NULL OR time >= last_roll.b + make_interval(secs => $3))
          ORDER BY t ASC",
     )
     .bind(&q.name)
     .bind(hours)
-    .bind(width)
     .fetch_all(&pool)
     .await
     .map_err(internal)?;
@@ -736,33 +707,16 @@ pub async fn metric_hist_facet(
     Query(q): Query<HistQuery>,
 ) -> Result<Json<HistFacetResponse>, ApiError> {
     let hours = q.hours.unwrap_or(6).clamp(1, 24 * 7);
-    let width = rollup_bucket_secs();
 
     let rows: Vec<HistFacetRow> = sqlx::query_as(
-        "WITH last_roll AS (
-             SELECT max(bucket) AS b FROM metric_series_rollups
-             WHERE name = $1 AND kind = 'histogram'
-         )
-         SELECT attrs, bucket AS t, bucket_bounds AS bounds, bucket_counts AS counts, unit
+        "SELECT attrs, bucket AS t, bucket_bounds AS bounds, bucket_counts AS counts, unit
          FROM metric_series_rollups
          WHERE name = $1 AND kind = 'histogram' AND bucket_counts IS NOT NULL
            AND bucket >= now() - make_interval(hours => $2)
-         UNION ALL
-         SELECT attributes AS attrs,
-                to_timestamp(floor(extract(epoch FROM time)::float8 / $3) * $3) AS t,
-                min(bucket_bounds) AS bounds,
-                array_sum(bucket_counts) AS counts,
-                max(unit) AS unit
-         FROM metrics, last_roll
-         WHERE name = $1 AND kind = 'histogram' AND bucket_counts IS NOT NULL
-           AND time >= now() - make_interval(hours => $2)
-           AND (last_roll.b IS NULL OR time >= last_roll.b + make_interval(secs => $3))
-         GROUP BY attributes, t
          ORDER BY t ASC",
     )
     .bind(&q.name)
     .bind(hours)
-    .bind(width)
     .fetch_all(&pool)
     .await
     .map_err(internal)?;
