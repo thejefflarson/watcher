@@ -8,6 +8,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use tracing::Instrument;
 
 type ApiError = (StatusCode, String);
 
@@ -66,6 +67,7 @@ pub async fn list_traces(
     .bind(q.to)
     .bind(limit)
     .fetch_all(&pool)
+    .instrument(tracing::info_span!("db.query"))
     .await
     .map_err(internal)?;
     Ok(Json(rows))
@@ -101,6 +103,7 @@ pub async fn get_trace(
     )
     .bind(trace_id)
     .fetch_all(&pool)
+    .instrument(tracing::info_span!("db.query"))
     .await
     .map_err(internal)?;
     Ok(Json(rows))
@@ -166,6 +169,7 @@ pub async fn list_logs(
     .bind(attr_json)
     .bind(limit)
     .fetch_all(&pool)
+    .instrument(tracing::info_span!("db.query"))
     .await
     .map_err(internal)?;
     Ok(Json(rows))
@@ -263,6 +267,7 @@ pub async fn list_metrics(
     .bind(q.to)
     .bind(limit)
     .fetch_all(&pool)
+    .instrument(tracing::info_span!("db.query"))
     .await
     .map_err(internal)?;
     Ok(Json(rows))
@@ -325,6 +330,7 @@ pub async fn metric_series(
     .bind(hours)
     .bind(width)
     .fetch_all(&pool)
+    .instrument(tracing::info_span!("db.query"))
     .await
     .map_err(internal)?;
     Ok(Json(rows))
@@ -349,6 +355,7 @@ pub async fn metric_dims(
     )
     .bind(q.name)
     .fetch_all(&pool)
+    .instrument(tracing::info_span!("db.query"))
     .await
     .map_err(internal)?;
     Ok(Json(keys))
@@ -392,6 +399,7 @@ pub async fn metric_series_grouped(
     .bind(hours)
     .bind(width)
     .fetch_all(&pool)
+    .instrument(tracing::info_span!("db.query"))
     .await
     .map_err(internal)?;
     Ok(Json(rows))
@@ -461,6 +469,7 @@ pub async fn metric_facet(
     )
     .bind(&q.name)
     .fetch_optional(&pool)
+    .instrument(tracing::info_span!("db.query"))
     .await
     .map_err(internal)?;
     let (kind, is_monotonic, unit) = match meta {
@@ -490,6 +499,7 @@ pub async fn metric_facet(
     .bind(&q.name)
     .bind(hours)
     .fetch_all(&pool)
+    .instrument(tracing::info_span!("db.query"))
     .await
     .map_err(internal)?;
 
@@ -610,6 +620,7 @@ pub async fn metric_histogram(
     .bind(&q.name)
     .bind(hours)
     .fetch_all(&pool)
+    .instrument(tracing::info_span!("db.query"))
     .await
     .map_err(internal)?;
 
@@ -744,6 +755,7 @@ pub async fn metric_hist_facet(
     .bind(&q.name)
     .bind(hours)
     .fetch_all(&pool)
+    .instrument(tracing::info_span!("db.query"))
     .await
     .map_err(internal)?;
 
@@ -843,6 +855,7 @@ pub async fn service_red(
     .bind(q.from)
     .bind(q.to)
     .fetch_all(&pool)
+    .instrument(tracing::info_span!("db.query"))
     .await
     .map_err(internal)?;
     Ok(Json(rows))
@@ -872,6 +885,7 @@ pub async fn service_map(State(pool): State<PgPool>) -> Result<Json<ServiceMap>,
          ORDER BY 1",
     )
     .fetch_all(&pool)
+    .instrument(tracing::info_span!("db.query"))
     .await
     .map_err(internal)?;
 
@@ -889,6 +903,7 @@ pub async fn service_map(State(pool): State<PgPool>) -> Result<Json<ServiceMap>,
          ORDER BY calls DESC",
     )
     .fetch_all(&pool)
+    .instrument(tracing::info_span!("db.query"))
     .await
     .map_err(internal)?;
 
@@ -930,6 +945,7 @@ pub async fn list_alerts(State(pool): State<PgPool>) -> Result<Json<Vec<AlertRul
          ORDER BY r.created_at DESC",
     )
     .fetch_all(&pool)
+    .instrument(tracing::info_span!("db.query"))
     .await
     .map_err(internal)?;
     Ok(Json(rows))
@@ -977,6 +993,7 @@ pub async fn create_alert(
     .bind(agg)
     .bind(window_secs)
     .fetch_one(&pool)
+    .instrument(tracing::info_span!("db.query"))
     .await
     .map_err(internal)?;
     Ok(Json(id))
@@ -1029,6 +1046,7 @@ pub async fn list_alert_events(
     )
     .bind(limit)
     .fetch_all(&pool)
+    .instrument(tracing::info_span!("db.query"))
     .await
     .map_err(internal)?;
     Ok(Json(rows))
