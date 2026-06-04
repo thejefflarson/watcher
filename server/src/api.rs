@@ -864,8 +864,12 @@ pub struct ServiceMap {
 /// GET /api/servicemap — service dependency graph derived from span parent/child links.
 #[tracing::instrument(skip_all)]
 pub async fn service_map(State(pool): State<PgPool>) -> Result<Json<ServiceMap>, ApiError> {
+    // Current topology only: bound to the recent window so this is a tiny
+    // index scan, not a self-join over the whole (retention-deep) spans table.
     let nodes: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT service FROM spans WHERE service IS NOT NULL ORDER BY 1",
+        "SELECT DISTINCT service FROM spans
+         WHERE service IS NOT NULL AND start_time > now() - interval '1 hour'
+         ORDER BY 1",
     )
     .fetch_all(&pool)
     .await
@@ -877,7 +881,8 @@ pub async fn service_map(State(pool): State<PgPool>) -> Result<Json<ServiceMap>,
          JOIN spans parent
            ON child.parent_span_id = parent.span_id
           AND child.trace_id = parent.trace_id
-         WHERE parent.service IS NOT NULL
+         WHERE child.start_time > now() - interval '1 hour'
+           AND parent.service IS NOT NULL
            AND child.service IS NOT NULL
            AND parent.service IS DISTINCT FROM child.service
          GROUP BY parent.service, child.service
