@@ -29,12 +29,15 @@ postgres:
   teamId: watcher
   clusterName: watcher-db
   version: "17"
-  numberOfInstances: 1
+  # 2 instances for HA: a node loss/cordon fails over to the replica instead of
+  # taking the DB down (a single local-path instance was stranded for ~2 days
+  # when its node was cordoned). On nfs-client so pods reschedule to any node.
+  numberOfInstances: 2
   user: watcher
   database: watcher
   volume:
     size: 10Gi
-    storageClass: local-path
+    storageClass: nfs-client
   # Per-instance resources for the Postgres container. The operator default
   # (~500Mi) OOM-kills the DB under sustained ingest, so give it real headroom.
   resources:
