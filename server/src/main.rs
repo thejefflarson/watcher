@@ -83,8 +83,8 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::connect(&database_url).await?;
     db::migrate(&pool).await?;
 
-    // No downsample sweep: rollups are maintained incrementally on insert
-    // (see otlp::insert_number / insert_histogram).
+    // No downsample sweep: per-series rollups are maintained incrementally on
+    // ingest (see otlp::flush_numbers / flush_histograms).
     tokio::spawn(retention::run(
         pool.clone(),
         retention_days,

@@ -237,7 +237,7 @@ pub async fn list_metrics(
              -- cheap count of distinct series in that sample so the list can flag
              -- multi-series metrics (×N) and point at the chart's per-label
              -- breakdown. A truly coherent per-series-summed spark needs
-             -- per-series rollups (see metric_rollups) — too costly to compute
+             -- per-series rollups (see metric_series_rollups) — too costly to compute
              -- per-request here, where this endpoint is polled.
              SELECT (array_agg(service ORDER BY time DESC))[1] AS service,
                     (array_agg(kind    ORDER BY time DESC))[1] AS kind,
@@ -296,9 +296,10 @@ pub struct SeriesPoint {
     v: Option<f64>,
 }
 
-/// GET /api/metrics/series — a time series for one metric, stitched from
-/// rollups (older buckets) and raw points (newer than the last rollup bucket),
-/// so it stays continuous after raw points are pruned. Bucket-average values.
+/// GET /api/metrics/series — a time series for one metric, stitched from the
+/// per-series rollups (older buckets, collapsed across series) and raw points
+/// (newer than the last rollup bucket), so it stays continuous after raw points
+/// are pruned. Bucket-average values across all of the metric's series.
 pub async fn metric_series(
     State(pool): State<PgPool>,
     Query(q): Query<SeriesQuery>,
@@ -308,15 +309,16 @@ pub async fn metric_series(
     let rows = sqlx::query_as::<_, SeriesPoint>(
         "WITH last_roll AS (
              SELECT max(bucket) AS b
-             FROM metric_rollups
+             FROM metric_series_rollups
              WHERE name = $1 AND ($2::text IS NULL OR service = $2)
          )
-         SELECT bucket AS t, avg AS v
-         FROM metric_rollups
+         SELECT bucket AS t, sum(sum) / nullif(sum(count), 0) AS v
+         FROM metric_series_rollups
          WHERE name = $1 AND ($2::text IS NULL OR service = $2)
            AND bucket >= now() - make_interval(hours => $3)
+         GROUP BY bucket
          UNION ALL
-         SELECT to_timestamp(floor(extract(epoch FROM time)::float8 / $4) * $4) AS t,
+         SELECT metric_bucket(time, $4) AS t,
                 avg(value) AS v
          FROM metrics, last_roll
          WHERE name = $1 AND ($2::text IS NULL OR service = $2)
@@ -386,7 +388,7 @@ pub async fn metric_series_grouped(
     let width = rollup_bucket_secs();
     let rows = sqlx::query_as::<_, LabeledPoint>(
         "SELECT attributes->>$2 AS label,
-                to_timestamp(floor(extract(epoch FROM time)::float8 / $4) * $4) AS t,
+                metric_bucket(time, $4) AS t,
                 avg(value) AS v
          FROM metrics
          WHERE name = $1 AND attributes ? $2
