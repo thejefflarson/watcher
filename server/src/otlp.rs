@@ -451,6 +451,10 @@ async fn flush_numbers(pool: &PgPool, rows: Vec<NumRow>) -> u64 {
                 is_monotonic, count(*), sum(value), min(value), max(value), avg(value)
          FROM pts
          GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+         -- Lock the conflict rows in a fixed (name, series_key, bucket) order so
+         -- concurrent ingest batches can't deadlock acquiring the same hot
+         -- current-bucket rows in different orders.
+         ORDER BY 2, 3, 1
          ON CONFLICT (name, series_key, bucket) DO UPDATE SET
              count = metric_series_rollups.count + EXCLUDED.count,
              sum   = metric_series_rollups.sum + EXCLUDED.sum,
@@ -537,6 +541,8 @@ async fn flush_histograms(pool: &PgPool, rows: Vec<HistRow>) -> u64 {
                 min(bounds), array_sum(counts)
          FROM pts
          GROUP BY 1, 2, 3, 4, 5, 7
+         -- Fixed conflict-row lock order; see flush_numbers.
+         ORDER BY 2, 3, 1
          ON CONFLICT (name, series_key, bucket) DO UPDATE SET
              count = metric_series_rollups.count + EXCLUDED.count,
              sum   = metric_series_rollups.sum + EXCLUDED.sum,
