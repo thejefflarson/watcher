@@ -455,7 +455,7 @@ async fn metric_series_returns_recent_points() {
         StatusCode::OK
     );
 
-    // No rollups yet, so the series comes straight from raw points.
+    // Aggregate-on-insert wrote the rollup, so the series reads it back.
     let (status, series) = get_json(&router, "/api/metrics/series?name=cpu.load&hours=1").await;
     assert_eq!(status, StatusCode::OK);
     let arr = series.as_array().expect("array");
