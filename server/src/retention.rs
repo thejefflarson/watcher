@@ -1,6 +1,7 @@
 //! Background retention: periodically delete telemetry older than the configured
 //! window. Raw metric points are pruned on a shorter window than everything else
-//! because `metric_rollups` (see rollup.rs) preserves their downsampled history.
+//! because `metric_series_rollups` (maintained on ingest) preserves their
+//! downsampled per-series history.
 
 use sqlx::PgPool;
 use std::time::Duration;
@@ -28,12 +29,10 @@ pub async fn run(pool: PgPool, days: i32, raw_hours: i32) {
 /// one-shot use; `run` calls it hourly.
 pub async fn prune_once(pool: &PgPool, days: i32, raw_hours: i32) -> anyhow::Result<u64> {
     let mut total = 0;
-    // History tables age out on the day window. (metric_rollups is legacy — no
-    // longer written — but still pruned so it drains.)
+    // History tables age out on the day window.
     for (table, col) in [
         ("spans", "start_time"),
         ("logs", "time"),
-        ("metric_rollups", "bucket"),
         ("metric_series_rollups", "bucket"),
     ] {
         let sql = format!("DELETE FROM {table} WHERE {col} < now() - make_interval(days => $1)");

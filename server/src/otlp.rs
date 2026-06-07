@@ -14,7 +14,7 @@ use opentelemetry_proto::tonic::{
     collector::trace::v1::ExportTraceServiceRequest,
     common::v1::{any_value, AnyValue, KeyValue},
     logs::v1::LogRecord,
-    metrics::v1::{metric, number_data_point, HistogramDataPoint, Metric, NumberDataPoint},
+    metrics::v1::{metric, number_data_point, Metric, NumberDataPoint},
     trace::v1::Span,
 };
 use prost::Message;
@@ -25,6 +25,12 @@ use std::io::Read;
 // ---------------------------------------------------------------------------
 // HTTP entrypoints
 // ---------------------------------------------------------------------------
+
+/// Cap on a decompressed request body. Axum's default 2 MB limit bounds the
+/// *compressed* body, but gzip can expand ~1000:1, so without a ceiling a tiny
+/// request could balloon to gigabytes and OOM the server (a decompression bomb).
+/// 64 MiB is far above any legitimate OTLP batch yet stops the bomb.
+const MAX_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Decompress the body if it's gzip-encoded. Most OTLP exporters (the OTel
 /// Collector, Traefik, the SDKs) gzip by default, so without this they 400.
@@ -37,7 +43,17 @@ fn payload(headers: &HeaderMap, body: Bytes) -> Result<Vec<u8>, std::io::Error> 
         || body.starts_with(&[0x1f, 0x8b]); // gzip magic, as a fallback
     if gzipped {
         let mut out = Vec::new();
-        flate2::read::GzDecoder::new(&body[..]).read_to_end(&mut out)?;
+        // Read through a limited reader: take(MAX + 1) so that crossing the cap is
+        // detectable, then reject — bounding memory before we allocate gigabytes.
+        flate2::read::GzDecoder::new(&body[..])
+            .take(MAX_DECOMPRESSED_BYTES + 1)
+            .read_to_end(&mut out)?;
+        if out.len() as u64 > MAX_DECOMPRESSED_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "decompressed body exceeds limit",
+            ));
+        }
         Ok(out)
     } else {
         Ok(body.to_vec())
@@ -151,8 +167,19 @@ pub async fn store_logs(pool: &PgPool, req: ExportLogsServiceRequest) -> u64 {
     count
 }
 
+/// A whole request is buffered in memory before the batched write, so cap how many
+/// points one request can contribute — a crafted export could otherwise declare
+/// millions of points and exhaust memory. Legitimate collector batches are orders
+/// of magnitude smaller; points past the cap are dropped.
+const MAX_POINTS_PER_REQUEST: usize = 100_000;
+
 pub async fn store_metrics(pool: &PgPool, req: ExportMetricsServiceRequest) -> u64 {
-    let mut count = 0;
+    // Collect the whole request's points up front, then write them in two batched
+    // statements (numbers, histograms) instead of one round-trip per point. A
+    // single OTLP export from the collector carries hundreds of points; batching
+    // turns hundreds of INSERT round-trips into two.
+    let mut nums: Vec<NumRow> = Vec::new();
+    let mut hists: Vec<HistRow> = Vec::new();
     for rm in &req.resource_metrics {
         // Resource attributes carry k8s.pod.name / node / container etc. — keep them
         // so metrics are dimensioned, not flat.
@@ -160,11 +187,19 @@ pub async fn store_metrics(pool: &PgPool, req: ExportMetricsServiceRequest) -> u
         let service = service_name(rattrs);
         for sm in &rm.scope_metrics {
             for m in &sm.metrics {
-                count += insert_metric(pool, service.as_deref(), rattrs, m).await;
+                collect_metric(service.as_deref(), rattrs, m, &mut nums, &mut hists);
             }
         }
     }
-    count
+    if nums.len() + hists.len() >= MAX_POINTS_PER_REQUEST {
+        tracing::warn!(
+            "metrics request hit the {MAX_POINTS_PER_REQUEST}-point cap; extra points dropped"
+        );
+    }
+    // The two flushes hit disjoint rollup rows (different kinds), so run them
+    // concurrently rather than one after the other.
+    let (n, h) = tokio::join!(flush_numbers(pool, nums), flush_histograms(pool, hists));
+    n + h
 }
 
 // ---------------------------------------------------------------------------
@@ -252,143 +287,256 @@ async fn insert_log(
     Ok(())
 }
 
-async fn insert_metric(
-    pool: &PgPool,
+/// One decoded numeric (gauge / sum) point, ready to batch-insert.
+struct NumRow {
+    time: DateTime<Utc>,
+    service: Option<String>,
+    name: String,
+    kind: &'static str,
+    value: f64,
+    unit: Option<String>,
+    is_monotonic: Option<bool>,
+    attrs: serde_json::Value,
+}
+
+/// One decoded histogram point, ready to batch-insert.
+struct HistRow {
+    time: DateTime<Utc>,
+    service: Option<String>,
+    name: String,
+    unit: Option<String>,
+    attrs: serde_json::Value,
+    sum: Option<f64>,
+    count: i64,
+    bounds: Vec<f64>,
+    counts: Vec<i64>,
+}
+
+/// Decode one metric's data points into the per-request batches. No DB I/O here —
+/// `store_metrics` flushes the accumulated batches once at the end.
+fn collect_metric(
     service: Option<&str>,
     resource: &[KeyValue],
     m: &Metric,
-) -> u64 {
+    nums: &mut Vec<NumRow>,
+    hists: &mut Vec<HistRow>,
+) {
     let unit = (!m.unit.is_empty()).then(|| m.unit.clone());
-    let mut n = 0;
+    let full = |nums: &Vec<NumRow>, hists: &Vec<HistRow>| {
+        nums.len() + hists.len() >= MAX_POINTS_PER_REQUEST
+    };
     match &m.data {
         Some(metric::Data::Gauge(g)) => {
             for dp in &g.data_points {
-                n += insert_number(
-                    pool,
-                    service,
-                    resource,
-                    &m.name,
-                    "gauge",
-                    unit.as_deref(),
-                    None,
-                    dp,
-                )
-                .await as u64;
+                if full(nums, hists) {
+                    break;
+                }
+                if let Some(row) = num_row(service, resource, m, "gauge", &unit, None, dp) {
+                    nums.push(row);
+                }
             }
         }
         Some(metric::Data::Sum(s)) => {
             // is_monotonic distinguishes a counter (rate it) from an
             // UpDownCounter (a gauge-like running value).
             for dp in &s.data_points {
-                n += insert_number(
-                    pool,
-                    service,
-                    resource,
-                    &m.name,
-                    "sum",
-                    unit.as_deref(),
-                    Some(s.is_monotonic),
-                    dp,
-                )
-                .await as u64;
+                if full(nums, hists) {
+                    break;
+                }
+                if let Some(row) =
+                    num_row(service, resource, m, "sum", &unit, Some(s.is_monotonic), dp)
+                {
+                    nums.push(row);
+                }
             }
         }
         Some(metric::Data::Histogram(h)) => {
             for dp in &h.data_points {
-                n += insert_histogram(pool, service, resource, &m.name, unit.as_deref(), dp).await
-                    as u64;
+                if full(nums, hists) {
+                    break;
+                }
+                hists.push(HistRow {
+                    time: ts(dp.time_unix_nano),
+                    service: service.map(str::to_string),
+                    name: m.name.clone(),
+                    unit: unit.clone(),
+                    attrs: merged_attrs(resource, &dp.attributes),
+                    sum: dp.sum,
+                    count: dp.count as i64,
+                    // bucket_counts has one more entry than explicit_bounds (+Inf).
+                    bounds: dp.explicit_bounds.clone(),
+                    counts: dp.bucket_counts.iter().map(|&c| c as i64).collect(),
+                });
             }
         }
         // Exponential histograms and summaries aren't stored in v0.
         _ => {}
     }
-    n
 }
 
-async fn insert_number(
-    pool: &PgPool,
+/// Decode one numeric data point into a `NumRow`, or `None` if it carries no value.
+fn num_row(
     service: Option<&str>,
     resource: &[KeyValue],
-    name: &str,
-    kind: &str,
-    unit: Option<&str>,
+    m: &Metric,
+    kind: &'static str,
+    unit: &Option<String>,
     is_monotonic: Option<bool>,
     dp: &NumberDataPoint,
-) -> bool {
+) -> Option<NumRow> {
     let value = match dp.value {
         Some(number_data_point::Value::AsDouble(d)) => d,
         Some(number_data_point::Value::AsInt(i)) => i as f64,
-        None => return false,
+        None => return None,
     };
-    // Aggregate-on-insert: keep the raw point (short, capped retention) AND fold
-    // it into its per-series rollup bucket in one statement, so the rollup's
-    // current bucket is always live — no batch sweep, and reads stay fresh.
+    Some(NumRow {
+        time: ts(dp.time_unix_nano),
+        service: service.map(str::to_string),
+        name: m.name.clone(),
+        kind,
+        value,
+        unit: unit.clone(),
+        is_monotonic,
+        attrs: merged_attrs(resource, &dp.attributes),
+    })
+}
+
+/// Batch-insert all numeric points from one request. Mirrors the per-point
+/// aggregate-on-insert (keep the raw point AND fold it into its live rollup
+/// bucket) but over the whole batch in a single statement: `unnest` expands the
+/// parallel arrays, a data-modifying CTE writes the raw rows, then a GROUP BY
+/// pre-aggregates points that share a (name, series_key, bucket) so the
+/// ON CONFLICT upsert never touches the same rollup row twice. Returns the number
+/// of raw points written (0 on error or empty batch).
+async fn flush_numbers(pool: &PgPool, rows: Vec<NumRow>) -> u64 {
+    let n = rows.len();
+    if n == 0 {
+        return 0;
+    }
+    // One move pass into the parallel arrays sqlx's `unnest` binds — owned fields
+    // (attrs, service, …) move out of each row rather than being cloned.
+    let mut times = Vec::with_capacity(n);
+    let mut services = Vec::with_capacity(n);
+    let mut names = Vec::with_capacity(n);
+    let mut kinds: Vec<&str> = Vec::with_capacity(n);
+    let mut values = Vec::with_capacity(n);
+    let mut units = Vec::with_capacity(n);
+    let mut attrs = Vec::with_capacity(n);
+    let mut monos = Vec::with_capacity(n);
+    for r in rows {
+        times.push(r.time);
+        services.push(r.service);
+        names.push(r.name);
+        kinds.push(r.kind);
+        values.push(r.value);
+        units.push(r.unit);
+        attrs.push(r.attrs);
+        monos.push(r.is_monotonic);
+    }
     let res = sqlx::query(
-        "WITH raw AS (
+        "WITH pts AS (
+             SELECT * FROM unnest($1::timestamptz[], $2::text[], $3::text[], $4::text[],
+                                  $5::float8[], $6::text[], $7::jsonb[], $8::bool[])
+                 AS t(time, service, name, kind, value, unit, attrs, is_monotonic)
+         ),
+         raw AS (
              INSERT INTO metrics (time, service, name, kind, value, unit, attributes, is_monotonic)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+             SELECT time, service, name, kind, value, unit, attrs, is_monotonic FROM pts
          )
          INSERT INTO metric_series_rollups
              (bucket, name, series_key, attrs, service, kind, unit, is_monotonic,
               count, sum, min, max, avg)
-         VALUES (to_timestamp(floor(extract(epoch FROM $1::timestamptz) / $9) * $9),
-                 $3, md5(coalesce($2,'') || '|' || $7::text), $7, $2, $4, $6, $8,
-                 1, $5, $5, $5, $5)
+         SELECT metric_bucket(time, $9),
+                name, metric_series_key(service, attrs), attrs, service, kind, unit,
+                is_monotonic, count(*), sum(value), min(value), max(value), avg(value)
+         FROM pts
+         GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
          ON CONFLICT (name, series_key, bucket) DO UPDATE SET
-             count = metric_series_rollups.count + 1,
+             count = metric_series_rollups.count + EXCLUDED.count,
              sum   = metric_series_rollups.sum + EXCLUDED.sum,
              min   = least(metric_series_rollups.min, EXCLUDED.min),
              max   = greatest(metric_series_rollups.max, EXCLUDED.max),
              avg   = (metric_series_rollups.sum + EXCLUDED.sum)
-                     / (metric_series_rollups.count + 1),
+                     / (metric_series_rollups.count + EXCLUDED.count),
              unit  = EXCLUDED.unit,
              is_monotonic = EXCLUDED.is_monotonic",
     )
-    .bind(ts(dp.time_unix_nano))
-    .bind(service)
-    .bind(name)
-    .bind(kind)
-    .bind(value)
-    .bind(unit)
-    .bind(merged_attrs(resource, &dp.attributes))
-    .bind(is_monotonic)
+    .bind(&times)
+    .bind(&services)
+    .bind(&names)
+    .bind(&kinds)
+    .bind(&values)
+    .bind(&units)
+    .bind(&attrs)
+    .bind(&monos)
     .bind(rollup_width())
     .execute(pool)
     .await;
     match res {
-        Ok(_) => true,
+        Ok(_) => n as u64,
         Err(e) => {
-            tracing::warn!("insert metric failed: {e}");
-            false
+            tracing::warn!("batch insert metrics failed: {e}");
+            0
         }
     }
 }
 
-async fn insert_histogram(
-    pool: &PgPool,
-    service: Option<&str>,
-    resource: &[KeyValue],
-    name: &str,
-    unit: Option<&str>,
-    dp: &HistogramDataPoint,
-) -> bool {
-    // bucket_counts has one more entry than explicit_bounds (the +Inf bucket).
-    let bounds: Vec<f64> = dp.explicit_bounds.clone();
-    let counts: Vec<i64> = dp.bucket_counts.iter().map(|&c| c as i64).collect();
-    // Raw point + additive fold into the per-series histogram rollup (counts
-    // summed element-wise via array_add) in one statement — see insert_number.
+/// Batch-insert all histogram points from one request. Same shape as
+/// `flush_numbers`, but the per-point bucket arrays are variable-length, so the
+/// batch travels as a JSONB array (one object per point) that `jsonb_array_elements`
+/// expands and casts back to `float8[]`/`bigint[]`. The rollup fold sums
+/// bucket_counts element-wise via the `array_sum` aggregate. Returns the number of
+/// points written (0 on error or empty batch).
+async fn flush_histograms(pool: &PgPool, rows: Vec<HistRow>) -> u64 {
+    let n = rows.len();
+    if n == 0 {
+        return 0;
+    }
+    // Move each row's fields into the JSONB payload rather than cloning them.
+    let payload = serde_json::Value::Array(
+        rows.into_iter()
+            .map(|r| {
+                json!({
+                    "time": r.time,
+                    "service": r.service,
+                    "name": r.name,
+                    "unit": r.unit,
+                    "attrs": r.attrs,
+                    "sum": r.sum,
+                    "count": r.count,
+                    "bounds": r.bounds,
+                    "counts": r.counts,
+                })
+            })
+            .collect(),
+    );
     let res = sqlx::query(
-        "WITH raw AS (
+        "WITH pts AS (
+             SELECT (e->>'time')::timestamptz AS time,
+                    e->>'service' AS service,
+                    e->>'name' AS name,
+                    e->>'unit' AS unit,
+                    e->'attrs' AS attrs,
+                    (e->>'sum')::float8 AS sum,
+                    (e->>'count')::bigint AS count,
+                    (SELECT array_agg(x::float8) FROM jsonb_array_elements_text(e->'bounds') x) AS bounds,
+                    (SELECT array_agg(x::bigint) FROM jsonb_array_elements_text(e->'counts') x) AS counts
+             FROM jsonb_array_elements($1::jsonb) e
+         ),
+         raw AS (
              INSERT INTO metrics
                  (time, service, name, kind, value, count, unit, attributes, bucket_bounds, bucket_counts)
-             VALUES ($1,$2,$3,'histogram',$4,$5,$6,$7,$8,$9)
+             SELECT time, service, name, 'histogram', sum, count, unit, attrs, bounds, counts FROM pts
          )
          INSERT INTO metric_series_rollups
              (bucket, name, series_key, attrs, service, kind, unit,
               count, sum, min, max, avg, bucket_bounds, bucket_counts)
-         VALUES (to_timestamp(floor(extract(epoch FROM $1::timestamptz) / $10) * $10),
-                 $3, md5(coalesce($2,'') || '|' || $7::text), $7, $2, 'histogram', $6,
-                 $5, $4, $4, $4, $4, $8, $9)
+         SELECT metric_bucket(time, $2),
+                name, metric_series_key(service, attrs), attrs, service, 'histogram', unit,
+                sum(count), sum(sum), min(sum), max(sum), sum(sum) / nullif(sum(count), 0),
+                min(bounds), array_sum(counts)
+         FROM pts
+         GROUP BY 1, 2, 3, 4, 5, 7
          ON CONFLICT (name, series_key, bucket) DO UPDATE SET
              count = metric_series_rollups.count + EXCLUDED.count,
              sum   = metric_series_rollups.sum + EXCLUDED.sum,
@@ -400,23 +548,15 @@ async fn insert_histogram(
              bucket_bounds = coalesce(metric_series_rollups.bucket_bounds, EXCLUDED.bucket_bounds),
              bucket_counts = array_add(metric_series_rollups.bucket_counts, EXCLUDED.bucket_counts)",
     )
-    .bind(ts(dp.time_unix_nano))
-    .bind(service)
-    .bind(name)
-    .bind(dp.sum)
-    .bind(dp.count as i64)
-    .bind(unit)
-    .bind(merged_attrs(resource, &dp.attributes))
-    .bind(&bounds)
-    .bind(&counts)
+    .bind(payload)
     .bind(rollup_width())
     .execute(pool)
     .await;
     match res {
-        Ok(_) => true,
+        Ok(_) => n as u64,
         Err(e) => {
-            tracing::warn!("insert histogram failed: {e}");
-            false
+            tracing::warn!("batch insert histograms failed: {e}");
+            0
         }
     }
 }

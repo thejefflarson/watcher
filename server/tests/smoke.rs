@@ -11,7 +11,8 @@ use opentelemetry_proto::tonic::{
     common::v1::{any_value, AnyValue, KeyValue},
     logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
     metrics::v1::{
-        metric, number_data_point, Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+        metric, number_data_point, Gauge, Histogram, HistogramDataPoint, Metric, NumberDataPoint,
+        ResourceMetrics, ScopeMetrics, Sum,
     },
     resource::v1::Resource,
     trace::v1::{ResourceSpans, ScopeSpans, Span},
@@ -55,6 +56,137 @@ fn gauge_request(name: &str, value: f64, nanos: u64) -> ExportMetricsServiceRequ
             ..Default::default()
         }],
     }
+}
+
+/// One metrics request carrying several gauge points (each tagged `pod=`), so the
+/// batched ingest path sees multiple series — and a repeated pod — in one request.
+fn gauge_points_request(
+    name: &str,
+    points: &[(&str, f64)],
+    nanos: u64,
+) -> ExportMetricsServiceRequest {
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", "api")],
+                ..Default::default()
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: name.to_string(),
+                    unit: "1".to_string(),
+                    data: Some(metric::Data::Gauge(Gauge {
+                        data_points: points
+                            .iter()
+                            .map(|(pod, v)| NumberDataPoint {
+                                time_unix_nano: nanos,
+                                value: Some(number_data_point::Value::AsDouble(*v)),
+                                attributes: vec![kv("pod", pod)],
+                                ..Default::default()
+                            })
+                            .collect(),
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+/// Unix-nanos timestamp `secs` in the past, for ingesting points into a past bucket.
+fn nanos_ago(secs: u64) -> u64 {
+    now_nanos() - secs * 1_000_000_000
+}
+
+/// Wrap one metric (already built) in a single-service OTLP request.
+fn metric_request(name: &str, service: &str, data: metric::Data) -> ExportMetricsServiceRequest {
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", service)],
+                ..Default::default()
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: name.to_string(),
+                    unit: "1".to_string(),
+                    data: Some(data),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+/// One gauge (`monotonic == None`) or sum/counter point, optionally `pod`-tagged.
+fn one_number(
+    name: &str,
+    monotonic: Option<bool>,
+    service: &str,
+    pod: Option<&str>,
+    value: f64,
+    nanos: u64,
+) -> ExportMetricsServiceRequest {
+    let dp = NumberDataPoint {
+        time_unix_nano: nanos,
+        value: Some(number_data_point::Value::AsDouble(value)),
+        attributes: pod.map(|p| vec![kv("pod", p)]).unwrap_or_default(),
+        ..Default::default()
+    };
+    let data = match monotonic {
+        None => metric::Data::Gauge(Gauge {
+            data_points: vec![dp],
+        }),
+        Some(is_monotonic) => metric::Data::Sum(Sum {
+            data_points: vec![dp],
+            is_monotonic,
+            aggregation_temporality: 2, // cumulative
+        }),
+    };
+    metric_request(name, service, data)
+}
+
+/// One histogram point with the given bounds/counts, optionally `pod`-tagged.
+fn one_histogram(
+    name: &str,
+    service: &str,
+    pod: Option<&str>,
+    bounds: Vec<f64>,
+    counts: Vec<u64>,
+    count: u64,
+    sum: f64,
+    nanos: u64,
+) -> ExportMetricsServiceRequest {
+    let dp = HistogramDataPoint {
+        time_unix_nano: nanos,
+        count,
+        sum: Some(sum),
+        explicit_bounds: bounds,
+        bucket_counts: counts,
+        attributes: pod.map(|p| vec![kv("pod", p)]).unwrap_or_default(),
+        ..Default::default()
+    };
+    metric_request(
+        name,
+        service,
+        metric::Data::Histogram(Histogram {
+            aggregation_temporality: 2,
+            data_points: vec![dp],
+        }),
+    )
+}
+
+/// Ingest a metrics request through the real OTLP path (so aggregate-on-insert
+/// populates the per-series rollup), asserting it's accepted.
+async fn ingest(router: &axum::Router, req: ExportMetricsServiceRequest) {
+    assert_eq!(
+        post_proto(router, "/v1/metrics", req.encode_to_vec()).await,
+        StatusCode::OK
+    );
 }
 
 async fn post_proto(router: &axum::Router, uri: &str, body: Vec<u8>) -> StatusCode {
@@ -102,7 +234,7 @@ async fn pool_or_skip() -> Option<sqlx::PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
     let pool = db::connect(&url).await.expect("connect");
     db::migrate(&pool).await.expect("migrate");
-    sqlx::query("TRUNCATE spans, logs, metrics, metric_rollups, alert_rules, alert_events")
+    sqlx::query("TRUNCATE spans, logs, metrics, metric_series_rollups, alert_rules, alert_events")
         .execute(&pool)
         .await
         .expect("truncate");
@@ -526,8 +658,9 @@ async fn insert_metric_at(
 
 async fn insert_rollup_at(pool: &sqlx::PgPool, name: &str, secs_ago: f64) {
     sqlx::query(
-        "INSERT INTO metric_rollups (bucket, name, kind, count, sum, min, max, avg)
-         VALUES (now() - make_interval(secs => $1), $2, 'gauge', 1, 1, 1, 1, 1)",
+        "INSERT INTO metric_series_rollups
+             (bucket, name, series_key, attrs, kind, count, sum, min, max, avg)
+         VALUES (now() - make_interval(secs => $1), $2, md5($2), '{}', 'gauge', 1, 1, 1, 1, 1)",
     )
     .bind(secs_ago)
     .bind(name)
@@ -748,23 +881,30 @@ async fn metric_facet_splits_series_and_rates_a_counter() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    // A monotonic sum (counter) with two series across two completed buckets.
-    // The facet endpoint reads rollups, so roll the raw up first; it should
-    // return one series each and present per-second rates, not raw cumulatives.
-    sqlx::query(
-        "INSERT INTO metrics (time, service, name, kind, value, unit, attributes, is_monotonic) VALUES
-            (now() - interval '900 seconds','api','reqs.total','sum',100,'1','{\"pod\":\"a\"}',true),
-            (now() - interval '600 seconds','api','reqs.total','sum',160,'1','{\"pod\":\"a\"}',true),
-            (now() - interval '900 seconds','api','reqs.total','sum',500,'1','{\"pod\":\"b\"}',true),
-            (now() - interval '600 seconds','api','reqs.total','sum',500,'1','{\"pod\":\"b\"}',true)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    watcher_server::rollup::rollup_once(&pool, 300)
-        .await
-        .unwrap();
+    // A monotonic sum (counter) with two series across two buckets. Ingested via
+    // the real path, so aggregate-on-insert builds the per-series rollups the
+    // facet reads. It should return one series each and present per-second rates,
+    // not raw cumulatives.
     let router = app(pool);
+    for (pod, value, secs) in [
+        ("a", 100.0, 900),
+        ("a", 160.0, 600),
+        ("b", 500.0, 900),
+        ("b", 500.0, 600),
+    ] {
+        ingest(
+            &router,
+            one_number(
+                "reqs.total",
+                Some(true),
+                "api",
+                Some(pod),
+                value,
+                nanos_ago(secs),
+            ),
+        )
+        .await;
+    }
 
     let (status, f) = get_json(&router, "/api/metrics/facet?name=reqs.total&hours=1").await;
     assert_eq!(status, StatusCode::OK);
@@ -796,21 +936,25 @@ async fn metric_histogram_interpolates_percentiles() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    // 100 observations all in the (10,20] bucket, in a completed time bucket so
-    // the rollup picks them up (the endpoint reads rollups). Linear interpolation
-    // puts the median at the bucket midpoint (15) and p95 near the top (19.5).
-    sqlx::query(
-        "INSERT INTO metrics (time, name, kind, value, count, unit, attributes, bucket_bounds, bucket_counts)
-         VALUES (now() - interval '600 seconds','lat','histogram',1500,100,'ms','{}',
-                 ARRAY[10,20,30]::double precision[], ARRAY[0,100,0,0]::bigint[])",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    watcher_server::rollup::rollup_once(&pool, 300)
-        .await
-        .unwrap();
+    // 100 observations all in the (10,20] bucket. Ingested via the real path so
+    // the per-series histogram rollup the endpoint reads is built on insert.
+    // Linear interpolation puts the median at the bucket midpoint (15) and p95
+    // near the top (19.5).
     let router = app(pool);
+    ingest(
+        &router,
+        one_histogram(
+            "lat",
+            "api",
+            None,
+            vec![10.0, 20.0, 30.0],
+            vec![0, 100, 0, 0],
+            100,
+            1500.0,
+            nanos_ago(600),
+        ),
+    )
+    .await;
 
     let (status, h) = get_json(&router, "/api/metrics/histogram?name=lat&hours=1").await;
     assert_eq!(status, StatusCode::OK);
@@ -825,78 +969,23 @@ async fn metric_histogram_interpolates_percentiles() {
 
 #[tokio::test]
 #[serial]
-async fn rollup_writes_per_series_and_sums_histogram_buckets() {
-    let Some(pool) = pool_or_skip().await else {
-        return;
-    };
-    // Completed (30-min-old) bucket: two gauge series + two histogram points of
-    // one series. The per-series rollup keeps each series; histogram bucket_counts
-    // are summed element-wise via array_sum.
-    sqlx::query(
-        "INSERT INTO metrics (time, service, name, kind, value, unit, attributes) VALUES
-            (now() - interval '1800 seconds','api','g','gauge',10,'1','{\"pod\":\"a\"}'),
-            (now() - interval '1800 seconds','api','g','gauge',20,'1','{\"pod\":\"a\"}'),
-            (now() - interval '1800 seconds','api','g','gauge', 5,'1','{\"pod\":\"b\"}')",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO metrics (time, name, kind, value, count, unit, attributes, bucket_bounds, bucket_counts) VALUES
-            (now() - interval '1800 seconds','h','histogram',30,3,'ms','{}',ARRAY[10,20]::double precision[],ARRAY[1,2,0]::bigint[]),
-            (now() - interval '1800 seconds','h','histogram',30,3,'ms','{}',ARRAY[10,20]::double precision[],ARRAY[0,1,2]::bigint[])",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    watcher_server::rollup::rollup_once(&pool, 300)
-        .await
-        .unwrap();
-
-    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM metric_series_rollups WHERE name='g'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(n, 2, "one rollup row per gauge series");
-    let a_avg: f64 = sqlx::query_scalar(
-        "SELECT avg FROM metric_series_rollups WHERE name='g' AND attrs->>'pod'='a'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(a_avg, 15.0, "pod=a avg of 10,20");
-    let counts: Vec<i64> =
-        sqlx::query_scalar("SELECT bucket_counts FROM metric_series_rollups WHERE name='h'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(counts, vec![1, 3, 2], "[1,2,0] + [0,1,2] element-wise");
-}
-
-#[tokio::test]
-#[serial]
 async fn metric_facet_reads_rollups_after_raw_pruned() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    // Roll up a 30-min-old gauge, then delete the raw point (simulating raw
-    // retention). The faceted view must still find the series in the rollup.
-    sqlx::query(
-        "INSERT INTO metrics (time, service, name, kind, value, unit, attributes)
-         VALUES (now() - interval '1800 seconds','api','gx','gauge',42,'1','{\"pod\":\"a\"}')",
+    // Ingest a 30-min-old gauge (so the rollup row is written on insert), then
+    // delete the raw point (simulating raw retention). The faceted view must
+    // still find the series in the rollup.
+    let router = app(pool.clone());
+    ingest(
+        &router,
+        one_number("gx", None, "api", Some("a"), 42.0, nanos_ago(1800)),
     )
-    .execute(&pool)
-    .await
-    .unwrap();
-    watcher_server::rollup::rollup_once(&pool, 300)
-        .await
-        .unwrap();
+    .await;
     sqlx::query("DELETE FROM metrics WHERE name='gx'")
         .execute(&pool)
         .await
         .unwrap();
-    let router = app(pool);
 
     let (status, f) = get_json(&router, "/api/metrics/facet?name=gx&hours=2").await;
     assert_eq!(status, StatusCode::OK);
@@ -917,23 +1006,27 @@ async fn metric_hist_facet_returns_per_series_percentiles() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    // 100 observations in (10,20] for one series; rolled up then raw pruned.
-    sqlx::query(
-        "INSERT INTO metrics (time, name, kind, value, count, unit, attributes, bucket_bounds, bucket_counts)
-         VALUES (now() - interval '1800 seconds','hl','histogram',1500,100,'ms','{\"pod\":\"a\"}',
-                 ARRAY[10,20,30]::double precision[], ARRAY[0,100,0,0]::bigint[])",
+    // 100 observations in (10,20] for one series, ingested (rolled up on insert)
+    // then raw pruned.
+    let router = app(pool.clone());
+    ingest(
+        &router,
+        one_histogram(
+            "hl",
+            "api",
+            Some("a"),
+            vec![10.0, 20.0, 30.0],
+            vec![0, 100, 0, 0],
+            100,
+            1500.0,
+            nanos_ago(1800),
+        ),
     )
-    .execute(&pool)
-    .await
-    .unwrap();
-    watcher_server::rollup::rollup_once(&pool, 300)
-        .await
-        .unwrap();
+    .await;
     sqlx::query("DELETE FROM metrics WHERE name='hl'")
         .execute(&pool)
         .await
         .unwrap();
-    let router = app(pool);
 
     let (status, h) = get_json(&router, "/api/metrics/hist_facet?name=hl&hours=2").await;
     assert_eq!(status, StatusCode::OK);
@@ -990,80 +1083,146 @@ async fn ingest_aggregates_into_rollup_on_insert() {
     assert_eq!(f["series"].as_array().unwrap().len(), 1);
 }
 
+#[tokio::test]
+#[serial]
+async fn batched_numbers_aggregate_within_one_request() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let router = app(pool.clone());
+    let now = now_nanos();
+
+    // A single request with three gauge points: pod=a twice (same series + bucket,
+    // so the batch must pre-aggregate them) and pod=b once (a separate series).
+    assert_eq!(
+        post_proto(
+            &router,
+            "/v1/metrics",
+            gauge_points_request("gb", &[("a", 10.0), ("a", 20.0), ("b", 5.0)], now)
+                .encode_to_vec()
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    // Every raw point is still kept.
+    let raw: i64 = sqlx::query_scalar("SELECT count(*) FROM metrics WHERE name='gb'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(raw, 3);
+
+    // One rollup row per series; pod=a's two points merged inside the batch.
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM metric_series_rollups WHERE name='gb'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 2, "one rollup row per series");
+    let (count, sum, avg): (i64, f64, f64) = sqlx::query_as(
+        "SELECT count, sum, avg FROM metric_series_rollups WHERE name='gb' AND attrs->>'pod'='a'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((count, sum, avg), (2, 30.0, 15.0), "pod=a merged 10+20");
+}
+
+#[tokio::test]
+#[serial]
+async fn batched_histograms_sum_within_one_request() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let router = app(pool.clone());
+    let now = now_nanos();
+
+    // Two histogram points of one series in a single request: their bucket_counts
+    // must be summed element-wise (array_sum) and their observation counts added.
+    let req = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", "api")],
+                ..Default::default()
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "hb".to_string(),
+                    unit: "ms".to_string(),
+                    data: Some(metric::Data::Histogram(Histogram {
+                        aggregation_temporality: 0,
+                        data_points: vec![
+                            HistogramDataPoint {
+                                time_unix_nano: now,
+                                count: 3,
+                                sum: Some(30.0),
+                                explicit_bounds: vec![10.0, 20.0],
+                                bucket_counts: vec![1, 2, 0],
+                                ..Default::default()
+                            },
+                            HistogramDataPoint {
+                                time_unix_nano: now,
+                                count: 3,
+                                sum: Some(30.0),
+                                explicit_bounds: vec![10.0, 20.0],
+                                bucket_counts: vec![0, 1, 2],
+                                ..Default::default()
+                            },
+                        ],
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    assert_eq!(
+        post_proto(&router, "/v1/metrics", req.encode_to_vec()).await,
+        StatusCode::OK
+    );
+
+    let counts: Vec<i64> =
+        sqlx::query_scalar("SELECT bucket_counts FROM metric_series_rollups WHERE name='hb'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(counts, vec![1, 3, 2], "[1,2,0] + [0,1,2] element-wise");
+    let count: i64 = sqlx::query_scalar("SELECT count FROM metric_series_rollups WHERE name='hb'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 6, "3 + 3 observations");
+}
+
 // --- Rollups ---------------------------------------------------------------
 
 #[tokio::test]
 #[serial]
-async fn rollup_aggregates_completed_bucket() {
+async fn series_collapses_per_bucket_without_double_count() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    // Three points 30 minutes ago land in the same completed 5-min bucket.
-    insert_metric_at(&pool, "lat", Some("api"), 10.0, 1800.0).await;
-    insert_metric_at(&pool, "lat", Some("api"), 20.0, 1800.0).await;
-    insert_metric_at(&pool, "lat", Some("api"), 30.0, 1800.0).await;
-
-    let wrote = watcher_server::rollup::rollup_once(&pool, 300)
-        .await
-        .unwrap();
-    assert!(wrote >= 1);
-
-    let row: (i64, f64, f64, f64, f64) =
-        sqlx::query_as("SELECT count, sum, min, max, avg FROM metric_rollups WHERE name = 'lat'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(row.0, 3); // count
-    assert_eq!(row.1, 60.0); // sum
-    assert_eq!(row.2, 10.0); // min
-    assert_eq!(row.3, 30.0); // max
-    assert_eq!(row.4, 20.0); // avg
-}
-
-#[tokio::test]
-#[serial]
-async fn rollup_is_idempotent_and_skips_current_bucket() {
-    let Some(pool) = pool_or_skip().await else {
-        return;
-    };
-    insert_metric_at(&pool, "lat", Some("api"), 10.0, 1800.0).await;
-    insert_metric_at(&pool, "now_pt", Some("api"), 99.0, 0.0).await; // current bucket
-
-    watcher_server::rollup::rollup_once(&pool, 300)
-        .await
-        .unwrap();
-    watcher_server::rollup::rollup_once(&pool, 300)
-        .await
-        .unwrap(); // re-run
-
-    // The 30-min-old point rolls up to exactly one bucket (upsert, not dup).
-    assert_eq!(count(&pool, "metric_rollups WHERE name = 'lat'").await, 1);
-    // The current (still-filling) bucket is not rolled up yet.
-    assert_eq!(
-        count(&pool, "metric_rollups WHERE name = 'now_pt'").await,
-        0
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn series_stitches_rollups_and_recent_raw_without_double_count() {
-    let Some(pool) = pool_or_skip().await else {
-        return;
-    };
-    // Old point → rolled up; recent point → stays raw.
-    insert_metric_at(&pool, "lat", Some("api"), 10.0, 1800.0).await;
-    watcher_server::rollup::rollup_once(&pool, 300)
-        .await
-        .unwrap();
-    insert_metric_at(&pool, "lat", Some("api"), 20.0, 0.0).await;
-
+    // Two points in two different buckets (30 min ago and now), both folded into
+    // the per-series rollup on ingest. The collapsed series must return exactly
+    // one value per bucket — the rollup branch and the recent-raw stitch must not
+    // double-count the same bucket.
     let router = app(pool);
+    ingest(
+        &router,
+        one_number("lat", None, "api", None, 10.0, nanos_ago(1800)),
+    )
+    .await;
+    ingest(
+        &router,
+        one_number("lat", None, "api", None, 20.0, nanos_ago(0)),
+    )
+    .await;
+
     let (status, series) = get_json(&router, "/api/metrics/series?name=lat&hours=2").await;
     assert_eq!(status, StatusCode::OK);
     let arr = series.as_array().unwrap();
-    // One rollup bucket (10) + one recent raw bucket (20), no overlap double-count.
-    assert_eq!(arr.len(), 2, "series = {arr:?}");
+    assert_eq!(arr.len(), 2, "one value per bucket, series = {arr:?}");
     assert_eq!(arr[0]["v"], 10.0);
     assert_eq!(arr[1]["v"], 20.0);
 }
@@ -1086,7 +1245,7 @@ async fn retention_prunes_raw_metrics_before_rollups() {
     // raw metrics: window = 6h, so the 10-hour-old point goes, the 1-hour stays.
     insert_metric_at(&pool, "m", None, 1.0, 10.0 * hour).await;
     insert_metric_at(&pool, "m", None, 1.0, 1.0 * hour).await;
-    // rollups: window = 7d, so the 10-day rollup goes, the 3-day stays.
+    // per-series rollups: window = 7d, so the 10-day rollup goes, the 3-day stays.
     insert_rollup_at(&pool, "m", 10.0 * day).await;
     insert_rollup_at(&pool, "m", 3.0 * day).await;
 
@@ -1098,7 +1257,7 @@ async fn retention_prunes_raw_metrics_before_rollups() {
     assert_eq!(count(&pool, "spans").await, 1);
     assert_eq!(count(&pool, "logs").await, 1);
     assert_eq!(count(&pool, "metrics").await, 1);
-    assert_eq!(count(&pool, "metric_rollups").await, 1);
+    assert_eq!(count(&pool, "metric_series_rollups").await, 1);
 }
 
 // --- Alerts ----------------------------------------------------------------
@@ -1337,6 +1496,45 @@ async fn ingest_gzipped_metric_keeps_resource_dimensions() {
     .await
     .unwrap();
     assert_eq!(pod.as_deref(), Some("watcher-server-abc"));
+}
+
+#[tokio::test]
+#[serial]
+async fn gzip_decompression_bomb_is_rejected() {
+    use std::io::Write;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let router = app(pool);
+
+    // 80 MiB of zeros gzips to a tiny body (well under axum's 2 MB body limit) but
+    // decompresses past the 64 MiB cap — payload() must reject it rather than
+    // allocating it all. Without the cap this would balloon memory (a zip bomb).
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(&vec![0u8; 80 * 1024 * 1024]).unwrap();
+    let gz = enc.finish().unwrap();
+    assert!(
+        gz.len() < 2 * 1024 * 1024,
+        "compressed bomb must clear the body limit to reach payload()"
+    );
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/metrics")
+                .header("content-type", "application/x-protobuf")
+                .header("content-encoding", "gzip")
+                .body(Body::from(gz))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "an over-cap decompressed body must be rejected"
+    );
 }
 
 #[tokio::test]

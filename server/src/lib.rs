@@ -4,7 +4,6 @@ pub mod db;
 pub mod grpc;
 pub mod otlp;
 pub mod retention;
-pub mod rollup;
 
 use axum::{
     body::Body,
