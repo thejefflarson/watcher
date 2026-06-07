@@ -297,40 +297,25 @@ pub struct SeriesPoint {
 }
 
 /// GET /api/metrics/series — a time series for one metric, stitched from the
-/// per-series rollups (older buckets, collapsed across series) and raw points
-/// (newer than the last rollup bucket), so it stays continuous after raw points
-/// are pruned. Bucket-average values across all of the metric's series.
+/// per-series rollups, collapsed across series into one bucket-average value per
+/// bucket. Rollups are maintained on ingest, so the current bucket is already
+/// present (no raw stitch needed) and the series stays intact after raw is pruned.
 pub async fn metric_series(
     State(pool): State<PgPool>,
     Query(q): Query<SeriesQuery>,
 ) -> Result<Json<Vec<SeriesPoint>>, ApiError> {
     let hours = q.hours.unwrap_or(24).clamp(1, 24 * 90);
-    let width = rollup_bucket_secs();
     let rows = sqlx::query_as::<_, SeriesPoint>(
-        "WITH last_roll AS (
-             SELECT max(bucket) AS b
-             FROM metric_series_rollups
-             WHERE name = $1 AND ($2::text IS NULL OR service = $2)
-         )
-         SELECT bucket AS t, sum(sum) / nullif(sum(count), 0) AS v
+        "SELECT bucket AS t, sum(sum) / nullif(sum(count), 0) AS v
          FROM metric_series_rollups
          WHERE name = $1 AND ($2::text IS NULL OR service = $2)
            AND bucket >= now() - make_interval(hours => $3)
          GROUP BY bucket
-         UNION ALL
-         SELECT metric_bucket(time, $4) AS t,
-                avg(value) AS v
-         FROM metrics, last_roll
-         WHERE name = $1 AND ($2::text IS NULL OR service = $2)
-           AND time >= now() - make_interval(hours => $3)
-           AND (last_roll.b IS NULL OR time >= last_roll.b + make_interval(secs => $4))
-         GROUP BY t
          ORDER BY t ASC",
     )
     .bind(q.name)
     .bind(q.service)
     .bind(hours)
-    .bind(width)
     .fetch_all(&pool)
     .instrument(tracing::info_span!("db.query"))
     .await
@@ -489,9 +474,9 @@ pub async fn metric_facet(
     let rated = kind.as_deref() == Some("sum") && is_monotonic;
 
     // Per-series points straight from the downsampled rollup — index-fast, no
-    // raw scan. The current (still-filling) bucket isn't rolled yet, so the
-    // newest point lags by up to one bucket; fine for charts. avg = bucket mean
-    // (gauges); max = cumulative level (counters, for rate differencing).
+    // raw scan. Rollups are maintained on ingest, so the current (still-filling)
+    // bucket is present, just partial. avg = bucket mean (gauges); max =
+    // cumulative level (counters, for rate differencing).
     let rows: Vec<FacetRow> = sqlx::query_as(
         "SELECT attrs, bucket AS t, avg, max AS last
          FROM metric_series_rollups
