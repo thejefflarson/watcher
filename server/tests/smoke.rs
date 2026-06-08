@@ -250,6 +250,7 @@ async fn ingest_and_query_a_trace() {
     };
     let router = app(pool);
 
+    let start = nanos_ago(5);
     let req = ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
             resource: Some(Resource {
@@ -261,8 +262,9 @@ async fn ingest_and_query_a_trace() {
                     trace_id: vec![1u8; 16],
                     span_id: vec![2u8; 8],
                     name: "GET /checkout".to_string(),
-                    start_time_unix_nano: 1_000_000_000,
-                    end_time_unix_nano: 1_050_000_000,
+                    // recent (within the list's default window), +50ms duration
+                    start_time_unix_nano: start,
+                    end_time_unix_nano: start + 50_000_000,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -1668,9 +1670,11 @@ async fn time_window_filters_traces_and_logs() {
     let (_, logs) = get_json(&router, &format!("/api/logs?from={from}")).await;
     assert_eq!(logs.as_array().unwrap().len(), 1, "only the recent log");
 
-    // No window → both.
+    // No window → defaults to the recent (24h) window, so the 3-day-old trace is
+    // excluded and only the recent one comes back.
     let (_, all) = get_json(&router, "/api/traces").await;
-    assert_eq!(all.as_array().unwrap().len(), 2);
+    assert_eq!(all.as_array().unwrap().len(), 1);
+    assert_eq!(all[0]["trace_id"], "recent");
 }
 
 #[tokio::test]
