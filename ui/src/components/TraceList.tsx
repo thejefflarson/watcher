@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { listTraces, type TraceSummary } from "../api";
+import { listTraces, listServices, type TraceSummary } from "../api";
 import { useControls, rangeParams } from "../timerange";
 import { useSort } from "../sort";
 
@@ -28,6 +28,18 @@ export default function TraceList({ onSelect }: { onSelect: (traceId: string) =>
   const [attr, setAttr] = useState("");
   const [errorsOnly, setErrorsOnly] = useState(false);
   const [minDuration, setMinDuration] = useState("");
+  const [services, setServices] = useState<string[]>([]);
+
+  // Populate the service dropdown from the services that have traces in range.
+  useEffect(() => {
+    let active = true;
+    listServices(rangeParams(rangeKey))
+      .then((rows) => active && setServices(rows.map((r) => r.service).sort()))
+      .catch(() => active && setServices([]));
+    return () => {
+      active = false;
+    };
+  }, [rangeKey, tick]);
 
   useEffect(() => {
     let active = true;
@@ -61,11 +73,17 @@ export default function TraceList({ onSelect }: { onSelect: (traceId: string) =>
 
   const filters = (
     <div className="filters">
-      <input
-        placeholder="service"
-        value={service}
-        onChange={(e) => setService(e.target.value)}
-      />
+      <select value={service} onChange={(e) => setService(e.target.value)}>
+        <option value="">all services</option>
+        {/* keep a drill-down service selectable even if it's outside the window's list */}
+        {(services.includes(service) || !service ? services : [service, ...services]).map(
+          (s) => (
+            <option key={s} value={s}>
+              {s}
+            </option>
+          ),
+        )}
+      </select>
       <input
         placeholder="root span name…"
         value={name}
