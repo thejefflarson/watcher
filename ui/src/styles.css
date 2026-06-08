@@ -256,6 +256,24 @@ tr.clickable:hover td {
   border-bottom-color: var(--text);
 }
 
+.filters .checkbox {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.9rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.filters .checkbox input {
+  border: none;
+  padding: 0;
+}
+
+.filters input[type="number"] {
+  width: 5rem;
+}
+
 /* Trace waterfall — bars are the data; grey ink, red only for errors. */
 .back {
   background: none;
