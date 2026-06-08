@@ -77,7 +77,9 @@ pub async fn list_traces(
                 count(*) FILTER (WHERE status_code = 2)                        AS error_count
          FROM spans
          WHERE ($1::text IS NULL OR service = $1)
-           AND ($2::timestamptz IS NULL OR start_time >= $2)
+           -- default to a recent window when unbounded so this can't turn into a
+           -- full-table GROUP BY (which times out); the UI always passes a range.
+           AND start_time >= COALESCE($2::timestamptz, now() - interval '24 hours')
            AND ($3::timestamptz IS NULL OR start_time <= $3)
            AND ($6::jsonb IS NULL
                 OR trace_id IN (SELECT trace_id FROM spans WHERE attributes @> $6))
@@ -866,7 +868,9 @@ pub async fn service_red(
                 percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_ms) AS p99_ms
          FROM spans
          WHERE service IS NOT NULL
-           AND ($1::timestamptz IS NULL OR start_time >= $1)
+           -- default to a recent window when unbounded so the per-service
+           -- percentile aggregate can't full-scan the spans table and time out.
+           AND start_time >= COALESCE($1::timestamptz, now() - interval '24 hours')
            AND ($2::timestamptz IS NULL OR start_time <= $2)
          GROUP BY service
          ORDER BY spans DESC",
