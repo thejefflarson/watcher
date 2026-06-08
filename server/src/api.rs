@@ -60,8 +60,10 @@ pub async fn list_traces(
         .and_then(|s| s.split_once('='))
         .filter(|(k, _)| !k.is_empty())
         .map(|(k, v)| serde_json::json!({ k: v }));
-    // service + time bound the spans scanned (index-friendly); the trace-level
-    // filters (name / attribute / errors / duration) are applied with HAVING so
+    // service + time bound the spans scanned (index-friendly). The attribute
+    // filter selects whole traces that contain a matching span via a subquery the
+    // spans_attrs_gin index can serve (a HAVING bool_or couldn't use the index).
+    // The remaining trace-level filters (name / errors / duration) are HAVING, so
     // the per-trace aggregates stay computed over the whole trace.
     let rows = sqlx::query_as::<_, TraceSummary>(
         "SELECT trace_id,
@@ -77,10 +79,11 @@ pub async fn list_traces(
          WHERE ($1::text IS NULL OR service = $1)
            AND ($2::timestamptz IS NULL OR start_time >= $2)
            AND ($3::timestamptz IS NULL OR start_time <= $3)
+           AND ($6::jsonb IS NULL
+                OR trace_id IN (SELECT trace_id FROM spans WHERE attributes @> $6))
          GROUP BY trace_id
          HAVING ($5::text IS NULL
                  OR (array_agg(name ORDER BY start_time))[1] ILIKE '%' || $5 || '%')
-            AND ($6::jsonb IS NULL OR bool_or(attributes @> $6))
             AND (NOT $7::bool OR count(*) FILTER (WHERE status_code = 2) > 0)
             AND ($8::float8 IS NULL
                  OR extract(epoch FROM (max(end_time) - min(start_time))) * 1000.0 >= $8)
