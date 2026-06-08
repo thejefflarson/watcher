@@ -20,6 +20,15 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
 pub struct TraceQuery {
     limit: Option<i64>,
     service: Option<String>,
+    /// Substring match on the trace's root span name (operation).
+    name: Option<String>,
+    /// Attribute equality filter, `key=value`, matched against any span in the trace.
+    attr: Option<String>,
+    /// Only traces that contain at least one error span.
+    #[serde(default)]
+    errors_only: bool,
+    /// Only traces at least this long (ms) — for finding slow traces.
+    min_duration_ms: Option<f64>,
     /// Time window (RFC3339); both optional. Absent ends are unbounded.
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
@@ -44,6 +53,16 @@ pub async fn list_traces(
     Query(q): Query<TraceQuery>,
 ) -> Result<Json<Vec<TraceSummary>>, ApiError> {
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    // `key=value` → JSONB containment, matched against any span in the trace.
+    let attr_json = q
+        .attr
+        .as_deref()
+        .and_then(|s| s.split_once('='))
+        .filter(|(k, _)| !k.is_empty())
+        .map(|(k, v)| serde_json::json!({ k: v }));
+    // service + time bound the spans scanned (index-friendly); the trace-level
+    // filters (name / attribute / errors / duration) are applied with HAVING so
+    // the per-trace aggregates stay computed over the whole trace.
     let rows = sqlx::query_as::<_, TraceSummary>(
         "SELECT trace_id,
                 max(service)                                                   AS service,
@@ -59,6 +78,12 @@ pub async fn list_traces(
            AND ($2::timestamptz IS NULL OR start_time >= $2)
            AND ($3::timestamptz IS NULL OR start_time <= $3)
          GROUP BY trace_id
+         HAVING ($5::text IS NULL
+                 OR (array_agg(name ORDER BY start_time))[1] ILIKE '%' || $5 || '%')
+            AND ($6::jsonb IS NULL OR bool_or(attributes @> $6))
+            AND (NOT $7::bool OR count(*) FILTER (WHERE status_code = 2) > 0)
+            AND ($8::float8 IS NULL
+                 OR extract(epoch FROM (max(end_time) - min(start_time))) * 1000.0 >= $8)
          ORDER BY start_time DESC
          LIMIT $4",
     )
@@ -66,6 +91,10 @@ pub async fn list_traces(
     .bind(q.from)
     .bind(q.to)
     .bind(limit)
+    .bind(q.name)
+    .bind(attr_json)
+    .bind(q.errors_only)
+    .bind(q.min_duration_ms)
     .fetch_all(&pool)
     .instrument(tracing::info_span!("db.query"))
     .await

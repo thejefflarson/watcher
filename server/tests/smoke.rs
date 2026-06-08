@@ -750,6 +750,62 @@ async fn traces_service_filter_and_limit() {
 
 #[tokio::test]
 #[serial]
+async fn traces_filter_by_name_attr_errors_and_duration() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // Three single-span traces with distinct name / attr / duration / status.
+    sqlx::query(
+        "INSERT INTO spans (trace_id, span_id, service, name, start_time, end_time, duration_ms, status_code, attributes) VALUES
+            ('tf','s','api','GET /health',     now()-interval '60 s', now()-interval '60 s' + interval '10 ms',  10, 0, '{\"http.method\":\"GET\"}'),
+            ('ts','s','api','POST /checkout',  now()-interval '60 s', now()-interval '60 s' + interval '500 ms', 500,0, '{\"http.method\":\"POST\"}'),
+            ('te','s','worker','process job',  now()-interval '60 s', now()-interval '60 s' + interval '50 ms',  50, 2, '{\"http.method\":\"POST\"}')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let router = app(pool);
+
+    let ids = |v: &serde_json::Value| {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["trace_id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    // Baseline: all three.
+    let (_, all) = get_json(&router, "/api/traces").await;
+    assert_eq!(all.as_array().unwrap().len(), 3);
+
+    // Root-name substring.
+    let (_, byname) = get_json(&router, "/api/traces?name=checkout").await;
+    assert_eq!(ids(&byname), vec!["ts"]);
+
+    // Errors only.
+    let (_, errs) = get_json(&router, "/api/traces?errors_only=true").await;
+    assert_eq!(ids(&errs), vec!["te"]);
+    assert_eq!(errs[0]["error_count"], 1);
+
+    // Min duration — only the 500ms trace clears 100ms.
+    let (_, slow) = get_json(&router, "/api/traces?min_duration_ms=100").await;
+    assert_eq!(ids(&slow), vec!["ts"]);
+
+    // Attribute equality (value's '=' is %3D-encoded in the query string).
+    let (_, get_only) = get_json(&router, "/api/traces?attr=http.method%3DGET").await;
+    assert_eq!(ids(&get_only), vec!["tf"]);
+
+    // Filters compose: POST traces at least 100ms → just the checkout one.
+    let (_, post_slow) = get_json(
+        &router,
+        "/api/traces?attr=http.method%3DPOST&min_duration_ms=100",
+    )
+    .await;
+    assert_eq!(ids(&post_slow), vec!["ts"]);
+}
+
+#[tokio::test]
+#[serial]
 async fn get_trace_returns_spans_in_order() {
     let Some(pool) = pool_or_skip().await else {
         return;

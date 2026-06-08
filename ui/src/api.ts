@@ -77,7 +77,7 @@ async function send<T>(method: string, path: string, body?: unknown): Promise<T 
   return (await res.json()) as T;
 }
 
-function qs(params: Record<string, string | number | undefined>): string {
+function qs(params: Record<string, string | number | boolean | undefined>): string {
   const q = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== "") q.set(k, String(v));
@@ -86,7 +86,16 @@ function qs(params: Record<string, string | number | undefined>): string {
 }
 
 export const listTraces = (
-  p: { service?: string; limit?: number; from?: string; to?: string } = {},
+  p: {
+    service?: string;
+    name?: string;
+    attr?: string;
+    errors_only?: boolean;
+    min_duration_ms?: number;
+    limit?: number;
+    from?: string;
+    to?: string;
+  } = {},
 ) => get<TraceSummary[]>(`/api/traces?${qs(p)}`);
 
 export const getTrace = (traceId: string) => get<SpanRow[]>(`/api/traces/${traceId}`);
