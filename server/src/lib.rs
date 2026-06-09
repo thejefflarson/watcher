@@ -45,15 +45,6 @@ fn otel_request_span(req: &Request<Body>) -> tracing::Span {
     let parent = opentelemetry::global::get_text_map_propagator(|p| {
         p.extract(&HeaderExtractor(req.headers()))
     });
-    // TEMP DEBUG (remove after diagnosing the missing traefik→watcher edge):
-    // log whether an upstream traceparent actually reached the app, to tell apart
-    // "traefik isn't injecting it" from "the linkerd sidecar strips it".
-    tracing::info!(
-        target: "tp_debug",
-        path = %req.uri().path(),
-        traceparent_present = req.headers().contains_key("traceparent"),
-        "incoming request trace-context"
-    );
     span.set_parent(parent);
     span
 }
