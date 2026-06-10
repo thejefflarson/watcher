@@ -55,8 +55,9 @@ jobs:
     runs-on: watcher-runners
     steps:
       - uses: actions/checkout@v6
-      - name: Install helm
-        run: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      # setup-helm installs to the tool cache (no sudo). get-helm-3's sudo install
+      # fails on the ARC runners, which run with no_new_privileges.
+      - uses: azure/setup-helm@v4
       - run: helm lint chart
 
   # One image now: the server builds the UI and embeds it (rust-embed), so there
