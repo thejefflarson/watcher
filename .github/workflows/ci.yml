@@ -57,7 +57,7 @@ jobs:
       - uses: actions/checkout@v6
       # setup-helm installs to the tool cache (no sudo). get-helm-3's sudo install
       # fails on the ARC runners, which run with no_new_privileges.
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
       - run: helm lint chart
 
   # One image now: the server builds the UI and embeds it (rust-embed), so there
