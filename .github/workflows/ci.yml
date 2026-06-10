@@ -72,6 +72,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write # keyless cosign signing (OIDC token -> Sigstore Fulcio)
     steps:
       - uses: actions/checkout@v6
       - name: Connect to BuildKit (mTLS)
@@ -101,6 +102,7 @@ jobs:
             type=raw,value=latest
             type=sha
       - uses: docker/build-push-action@v7
+        id: build
         with:
           context: .
           file: server/Dockerfile
@@ -108,3 +110,12 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign the image (keyless)
+        # Sign by immutable digest, not tag. Keyless: GitHub's OIDC token is
+        # exchanged for a short-lived Fulcio cert and the signature is recorded in
+        # the Rekor transparency log — no private key to store. cosign reuses the
+        # docker login above to push the signature to GHCR.
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/${{ github.repository_owner }}/watcher-server@${DIGEST}"
