@@ -10,6 +10,8 @@ permissions:
 
 jobs:
   server:
+    # Stays on GitHub-hosted: the watcher-runners (ARC, no local Docker — image
+    # builds offload to remote BuildKit) can't run the postgres service container.
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -35,7 +37,7 @@ jobs:
       - run: cargo test --locked   # runs the ingest->query integration test against the service DB
 
   ui:
-    runs-on: ubuntu-latest
+    runs-on: watcher-runners
     defaults:
       run:
         working-directory: ui
@@ -50,7 +52,7 @@ jobs:
       - run: npm run build
 
   chart:
-    runs-on: ubuntu-latest
+    runs-on: watcher-runners
     steps:
       - uses: actions/checkout@v6
       - name: Install helm
