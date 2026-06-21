@@ -3,6 +3,9 @@
 //! logs the transition, and optionally POSTs a webhook. Storage + log are always
 //! on; the webhook fires only when `WATCHER_ALERT_WEBHOOK` is set.
 
+use lettre::message::Mailbox;
+use lettre::transport::smtp::authentication::Credentials;
+use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use serde::Serialize;
 use sqlx::PgPool;
 use std::time::Duration;
@@ -32,6 +35,83 @@ struct WebhookPayload<'a> {
     comparator: &'a str,
 }
 
+/// SMTP settings for emailing alert transitions. All fields come from the
+/// `WATCHER_ALERT_SMTP_*` env vars; absent/empty config disables email (the
+/// webhook and the stored events + log line are independent of this).
+pub struct EmailConfig {
+    pub relay: String,
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+    pub from: String,
+    pub to: String,
+}
+
+/// A built mailer: an async STARTTLS SMTP transport plus the parsed from/to
+/// addresses. Constructed once in `run`; building is fallible (bad address or
+/// relay), in which case email is logged-and-disabled rather than fatal.
+struct Mailer {
+    transport: AsyncSmtpTransport<Tokio1Executor>,
+    from: Mailbox,
+    to: Mailbox,
+}
+
+impl Mailer {
+    fn build(cfg: &EmailConfig) -> anyhow::Result<Self> {
+        let from: Mailbox = cfg.from.parse()?;
+        let to: Mailbox = cfg.to.parse()?;
+        let transport = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.relay)?
+            .port(cfg.port)
+            .credentials(Credentials::new(cfg.username.clone(), cfg.password.clone()))
+            .build();
+        Ok(Self {
+            transport,
+            from,
+            to,
+        })
+    }
+
+    async fn send(&self, subject: &str, body: String) -> anyhow::Result<()> {
+        let email = Message::builder()
+            .from(self.from.clone())
+            .to(self.to.clone())
+            .subject(subject)
+            .body(body)?;
+        self.transport.send(email).await?;
+        Ok(())
+    }
+}
+
+/// Email subject for a transition, e.g. `[watcher] FIRING: pod memory > 80%`.
+fn email_subject(rule_name: &str, state: &str) -> String {
+    format!("[watcher] {}: {}", state.to_uppercase(), rule_name)
+}
+
+/// Human-readable email body describing the rule and the observed value.
+fn email_body(rule: &AlertRule, state: &str, value: Option<f64>) -> String {
+    let scope = rule
+        .service
+        .as_deref()
+        .map(|s| format!(" (service {s})"))
+        .unwrap_or_default();
+    let observed = value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "no data".to_string());
+    format!(
+        "Alert: {name}\n\
+         State: {state}\n\
+         Metric: {metric}{scope}\n\
+         Condition: {agg}({metric}) {cmp} {threshold} over {window}s\n\
+         Observed: {observed}\n",
+        name = rule.name,
+        metric = rule.metric,
+        agg = rule.agg,
+        cmp = rule.comparator,
+        threshold = rule.threshold,
+        window = rule.window_secs,
+    )
+}
+
 /// Whitelisted aggregate expression — `agg` comes from the DB but is only ever
 /// written through the validated API, and we map it here rather than interpolate.
 fn agg_expr(agg: &str) -> &'static str {
@@ -54,27 +134,44 @@ fn breached(value: Option<f64>, comparator: &str, threshold: f64) -> bool {
 }
 
 /// Runs forever; ticks immediately, then every `interval_secs`.
-pub async fn run(pool: PgPool, webhook: Option<String>, interval_secs: u64) {
+pub async fn run(
+    pool: PgPool,
+    webhook: Option<String>,
+    email: Option<EmailConfig>,
+    interval_secs: u64,
+) {
     let client = reqwest::Client::new();
+    // Build the mailer once. A bad address/relay disables email (logged) rather
+    // than taking down the alert loop.
+    let mailer = match email.as_ref().map(Mailer::build) {
+        Some(Ok(m)) => Some(m),
+        Some(Err(e)) => {
+            tracing::error!("alert email disabled — invalid SMTP config: {e}");
+            None
+        }
+        None => None,
+    };
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs.max(5)));
     loop {
         interval.tick().await;
-        if let Err(e) = evaluate(&pool, webhook.as_deref(), &client).await {
+        if let Err(e) = evaluate(&pool, webhook.as_deref(), mailer.as_ref(), &client).await {
             tracing::warn!("alert evaluation failed: {e}");
         }
     }
 }
 
 /// A single evaluation pass — opens/resolves events for every enabled rule.
-/// Exposed for tests and one-shot use; `run` calls it on a timer.
+/// Exposed for tests and one-shot use; `run` calls it on a timer. Email is only
+/// wired through `run` (it owns the built mailer), so this path is webhook-only.
 pub async fn evaluate_once(pool: &PgPool, webhook: Option<&str>) -> anyhow::Result<()> {
     let client = reqwest::Client::new();
-    evaluate(pool, webhook, &client).await
+    evaluate(pool, webhook, None, &client).await
 }
 
 async fn evaluate(
     pool: &PgPool,
     webhook: Option<&str>,
+    mailer: Option<&Mailer>,
     client: &reqwest::Client,
 ) -> anyhow::Result<()> {
     let rules = sqlx::query_as::<_, AlertRule>(
@@ -123,7 +220,7 @@ async fn evaluate(
                     rule.threshold,
                     value
                 );
-                notify(client, webhook, &rule, "firing", value).await;
+                notify(client, webhook, mailer, &rule, "firing", value).await;
             }
             (false, Some(id)) => {
                 sqlx::query("UPDATE alert_events SET resolved_at = now() WHERE id = $1")
@@ -131,7 +228,7 @@ async fn evaluate(
                     .execute(pool)
                     .await?;
                 tracing::info!("alert '{}' resolved (value {:?})", rule.name, value);
-                notify(client, webhook, &rule, "resolved", value).await;
+                notify(client, webhook, mailer, &rule, "resolved", value).await;
             }
             _ => {}
         }
@@ -157,40 +254,96 @@ impl opentelemetry::propagation::Injector for HeaderInjector<'_> {
 async fn notify(
     client: &reqwest::Client,
     webhook: Option<&str>,
+    mailer: Option<&Mailer>,
     rule: &AlertRule,
     state: &str,
     value: Option<f64>,
 ) {
-    let Some(url) = webhook else { return };
-    let payload = WebhookPayload {
-        rule: &rule.name,
-        metric: &rule.metric,
-        service: rule.service.as_deref(),
-        state,
-        value,
-        threshold: rule.threshold,
-        comparator: &rule.comparator,
-    };
-    // Propagate this span's context to the receiver.
-    let mut headers = reqwest::header::HeaderMap::new();
-    let cx = tracing::Span::current().context();
-    opentelemetry::global::get_text_map_propagator(|p| {
-        p.inject_context(&cx, &mut HeaderInjector(&mut headers))
-    });
-    if let Err(e) = client
-        .post(url)
-        .headers(headers)
-        .json(&payload)
-        .send()
-        .await
-    {
-        tracing::warn!("alert webhook POST failed: {e}");
+    // Webhook and email are independent sinks — either, both, or neither may be
+    // configured, and a failure in one must not skip the other.
+    if let Some(url) = webhook {
+        let payload = WebhookPayload {
+            rule: &rule.name,
+            metric: &rule.metric,
+            service: rule.service.as_deref(),
+            state,
+            value,
+            threshold: rule.threshold,
+            comparator: &rule.comparator,
+        };
+        // Propagate this span's context to the receiver.
+        let mut headers = reqwest::header::HeaderMap::new();
+        let cx = tracing::Span::current().context();
+        opentelemetry::global::get_text_map_propagator(|p| {
+            p.inject_context(&cx, &mut HeaderInjector(&mut headers))
+        });
+        if let Err(e) = client
+            .post(url)
+            .headers(headers)
+            .json(&payload)
+            .send()
+            .await
+        {
+            tracing::warn!("alert webhook POST failed: {e}");
+        }
+    }
+
+    if let Some(mailer) = mailer {
+        let subject = email_subject(&rule.name, state);
+        let body = email_body(rule, state, value);
+        if let Err(e) = mailer.send(&subject, body).await {
+            tracing::warn!("alert email send failed: {e}");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{agg_expr, breached};
+    use super::{agg_expr, breached, email_body, email_subject, AlertRule};
+
+    fn rule() -> AlertRule {
+        AlertRule {
+            id: 1,
+            name: "pod memory > 80%".into(),
+            metric: "container.memory.usage".into(),
+            service: Some("api".into()),
+            comparator: "gt".into(),
+            threshold: 80.0,
+            agg: "max".into(),
+            window_secs: 300,
+        }
+    }
+
+    #[test]
+    fn email_subject_states() {
+        assert_eq!(
+            email_subject("pod memory > 80%", "firing"),
+            "[watcher] FIRING: pod memory > 80%"
+        );
+        assert_eq!(
+            email_subject("disk full", "resolved"),
+            "[watcher] RESOLVED: disk full"
+        );
+    }
+
+    #[test]
+    fn email_body_includes_condition_and_value() {
+        let b = email_body(&rule(), "firing", Some(87.5));
+        assert!(b.contains("Alert: pod memory > 80%"));
+        assert!(b.contains("State: firing"));
+        assert!(b.contains("max(container.memory.usage) gt 80 over 300s"));
+        assert!(b.contains("(service api)"));
+        assert!(b.contains("Observed: 87.5"));
+    }
+
+    #[test]
+    fn email_body_handles_no_data_and_no_service() {
+        let mut r = rule();
+        r.service = None;
+        let b = email_body(&r, "resolved", None);
+        assert!(b.contains("Observed: no data"));
+        assert!(!b.contains("(service"));
+    }
 
     #[test]
     fn agg_expr_whitelist() {
