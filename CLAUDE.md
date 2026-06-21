@@ -12,8 +12,9 @@ UI — a SigNoz-style experience without ClickHouse, light enough for a Raspberr
   the axum fallback — no separate UI process.
 - **`ui/`** — Vite + React + TypeScript. Traces, logs, metrics (table + time-series
   charts), service map, alerts. Built to `ui/dist`, which the server embeds.
-- **`chart/`** — Helm chart: one server deployment, a Zalando `postgresql` CR, and a
-  Traefik IngressRoute (whole host → server).
+
+The Helm chart lives in the separate **cluster** GitOps repo (`../cluster`,
+`charts/watcher`), deployed by ArgoCD — not in this repo.
 
 ## Key commands
 
@@ -29,10 +30,6 @@ cd ui && npm run build           # = tsc --noEmit && vite build
 # Local dev DB + run
 docker compose up -d             # Postgres on :5432
 cd server && DATABASE_URL=postgres://watcher:watcher@localhost:5432/watcher cargo run
-
-# Chart
-helm lint chart
-helm template watcher chart
 ```
 
 ## Conventions
@@ -51,23 +48,27 @@ helm template watcher chart
 ## CI / images
 
 `.github/workflows/ci.yml`: `cargo fmt/build/test`, UI build (type-check gate),
-`helm lint`, and on `main` a multi-arch (amd64 + arm64) image push to GHCR. One image
+and on `main` a multi-arch (amd64 + arm64) image push to GHCR. One image
 now — the server build (context = repo root, `server/Dockerfile`) builds the UI and
 embeds it:
 - `ghcr.io/thejefflarson/watcher-server`
 
 ## Deploy
 
-The chart provisions a dedicated Postgres via the Zalando **postgres-operator** and
-exposes the UI/OTLP endpoint through **Traefik** — both must exist in the target
-cluster. ARM images are required for Raspberry Pi nodes (CI builds them).
+The chart (in the `../cluster` GitOps repo) provisions a dedicated Postgres via the
+Zalando **postgres-operator**; the UI/OTLP endpoint is exposed through a dedicated,
+Access-gated Cloudflare tunnel. ArgoCD Image Updater pins each `:latest` push by
+digest and rolls it. ARM images are required for Raspberry Pi nodes (CI builds them).
 
 ## Implemented
 
 Traces, logs, metrics (latest-value table **and** time-series charts), OTLP HTTP +
 gRPC, service map, retention, metric downsampling/rollups, threshold alerting
-(rules + events + optional webhook). No app-layer auth — the public read surface is
-gated by Cloudflare Access at the edge and ingest stays in-cluster (ADR 0013).
+(rules + events + email/webhook). Alert rules are **declarative**: a JSON config
+(rendered from the chart's `server.alerts` values, env `WATCHER_ALERTS_CONFIG`) is
+reconciled into the DB on startup and the `/api/alerts` surface is read-only. No
+app-layer auth — the public read surface is gated by Cloudflare Access at the edge
+and ingest stays in-cluster (ADR 0013).
 
 ## Not yet (good first issues)
 

@@ -53,22 +53,18 @@ OTEL_TRACES_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp  your-app
 
 ## Deploy (Kubernetes / Helm)
 
-The chart deploys the server (which serves both the API and the embedded UI) and a
-dedicated Postgres, behind one host.
+The Helm chart lives in a separate GitOps repo and is deployed by ArgoCD (not in
+this repo). It deploys the server (which serves both the API and the embedded UI)
+and a dedicated Postgres behind one host.
 
 **Requirements in-cluster:** the Zalando [postgres-operator](https://github.com/zalando/postgres-operator)
-(provisions the DB) and [Traefik](https://traefik.io/) (the IngressRoute). Nodes must be
-able to pull the multi-arch images (ARM64 for Raspberry Pi — CI builds them).
-
-```sh
-helm upgrade --install watcher ./chart \
-  --namespace watcher --create-namespace \
-  --set hostname=watcher.example.com
-```
+(provisions the DB). Nodes must be able to pull the multi-arch images (ARM64 for
+Raspberry Pi — CI builds them).
 
 The server reads its DB password from the operator-generated credential secret
 (`watcher.watcher-db.credentials.postgresql.acid.zalan.do`) and composes `DATABASE_URL`
-at runtime. See `chart/values.yaml` for the knobs.
+at runtime. Alert rules are declarative — set them in the chart's `server.alerts`
+values and they're reconciled into the DB on deploy.
 
 ## Build the image
 
@@ -80,17 +76,18 @@ docker build -f server/Dockerfile -t ghcr.io/thejefflarson/watcher-server .
 ```
 
 CI (`.github/workflows/ci.yml`) builds and pushes a multi-arch (`amd64` + `arm64`)
-image to GHCR on every push to `main`, alongside `cargo fmt/build/test`, the UI build,
-and `helm lint`.
+image to GHCR on every push to `main`, alongside `cargo fmt/build/test` and the UI
+build.
 
 ## Layout
 
 ```
 server/      Rust ingest + query server, migrations, Dockerfile (builds + embeds the UI)
 ui/          Vite + React + TS UI (built to ui/dist, embedded into the server)
-chart/       Helm chart (server, Zalando Postgres, Traefik IngressRoute)
 docker-compose.yml   local Postgres
 ```
+
+The Helm chart lives in a separate GitOps repo (deployed by ArgoCD).
 
 ## Docs
 

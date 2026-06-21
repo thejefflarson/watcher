@@ -96,6 +96,26 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::connect(&database_url).await?;
     db::migrate(&pool).await?;
 
+    // Alert rules are declarative: WATCHER_ALERTS_CONFIG points at a JSON file
+    // (rendered from the chart's values) that is the source of truth. Reconcile
+    // it into alert_rules on startup; a load/parse error is logged but left
+    // non-fatal so a bad edit can't take down ingest (the prior rules stand).
+    if let Some(path) = std::env::var("WATCHER_ALERTS_CONFIG")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        match alerts::load_rules(&path) {
+            Ok(rules) => {
+                let n = rules.len();
+                match alerts::reconcile(&pool, &rules).await {
+                    Ok(()) => tracing::info!("reconciled {n} alert rule(s) from {path}"),
+                    Err(e) => tracing::error!("alert rule reconcile failed: {e:#}"),
+                }
+            }
+            Err(e) => tracing::error!("alert config load failed: {e:#}"),
+        }
+    }
+
     // No downsample sweep: per-series rollups are maintained incrementally on
     // ingest (see otlp::flush_numbers / flush_histograms).
     tokio::spawn(retention::run(

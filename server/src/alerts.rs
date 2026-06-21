@@ -2,16 +2,22 @@
 //! Each breach opens an `alert_events` row (resolved when the value recovers),
 //! logs the transition, and optionally POSTs a webhook. Storage + log are always
 //! on; the webhook fires only when `WATCHER_ALERT_WEBHOOK` is set.
+//!
+//! Rules are **declarative**: a JSON config file (rendered from the chart's
+//! values) is the source of truth. [`reconcile`] applies it into `alert_rules`
+//! on startup — upsert by name, delete what's no longer declared — so the table
+//! is read-only at the API layer.
 
+use anyhow::Context as _;
 use lettre::message::Mailbox;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::time::Duration;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-/// A rule as stored. Shared by the evaluator and the CRUD API.
+/// A rule as stored. Shared by the evaluator and the read API.
 #[derive(sqlx::FromRow)]
 pub struct AlertRule {
     pub id: i64,
@@ -22,6 +28,112 @@ pub struct AlertRule {
     pub threshold: f64,
     pub agg: String,
     pub window_secs: i32,
+}
+
+fn default_agg() -> String {
+    "avg".to_string()
+}
+fn default_window() -> i32 {
+    300
+}
+fn default_enabled() -> bool {
+    true
+}
+
+/// One declared rule, as it appears in the JSON config file. Field names match
+/// the stored/wire shape 1:1 so the chart's values map straight through.
+#[derive(Deserialize)]
+pub struct RuleConfig {
+    pub name: String,
+    pub metric: String,
+    #[serde(default)]
+    pub service: Option<String>,
+    pub comparator: String,
+    pub threshold: f64,
+    #[serde(default = "default_agg")]
+    pub agg: String,
+    #[serde(default = "default_window")]
+    pub window_secs: i32,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+/// Read declared rules from a JSON file (a list of [`RuleConfig`]). Missing or
+/// malformed config is an error so a bad edit fails loudly rather than silently
+/// dropping rules.
+pub fn load_rules(path: &str) -> anyhow::Result<Vec<RuleConfig>> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading alerts config {path}"))?;
+    serde_json::from_str(&text).with_context(|| format!("parsing alerts config {path}"))
+}
+
+/// Reject a rule whose enum-ish fields fall outside the whitelist the evaluator's
+/// SQL relies on (same checks the old create API ran), so reconcile never writes
+/// a value `agg_expr`/`breached` can't handle.
+fn validate(r: &RuleConfig) -> anyhow::Result<()> {
+    if r.name.trim().is_empty() || r.metric.trim().is_empty() {
+        anyhow::bail!("alert rule '{}': name and metric are required", r.name);
+    }
+    if !matches!(r.comparator.as_str(), "gt" | "lt") {
+        anyhow::bail!("alert rule '{}': comparator must be 'gt' or 'lt'", r.name);
+    }
+    if !matches!(r.agg.as_str(), "avg" | "max" | "min" | "sum" | "last") {
+        anyhow::bail!(
+            "alert rule '{}': agg must be one of avg|max|min|sum|last",
+            r.name
+        );
+    }
+    Ok(())
+}
+
+/// Apply the declared rules into `alert_rules`: validate all (a bad rule aborts
+/// the whole apply, so the table never lands in a partial state), upsert each by
+/// name (preserving its id and event history across restarts), then delete any
+/// stored rule that's no longer declared. Runs in one transaction.
+pub async fn reconcile(pool: &PgPool, rules: &[RuleConfig]) -> anyhow::Result<()> {
+    for r in rules {
+        validate(r)?;
+    }
+
+    let mut tx = pool.begin().await?;
+    for r in rules {
+        let service = r.service.as_deref().filter(|s| !s.is_empty());
+        let window_secs = r.window_secs.clamp(10, 86_400);
+        sqlx::query(
+            "INSERT INTO alert_rules
+               (name, metric, service, comparator, threshold, agg, window_secs, enabled)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (name) DO UPDATE SET
+               metric      = EXCLUDED.metric,
+               service     = EXCLUDED.service,
+               comparator  = EXCLUDED.comparator,
+               threshold   = EXCLUDED.threshold,
+               agg         = EXCLUDED.agg,
+               window_secs = EXCLUDED.window_secs,
+               enabled     = EXCLUDED.enabled",
+        )
+        .bind(&r.name)
+        .bind(&r.metric)
+        .bind(service)
+        .bind(&r.comparator)
+        .bind(r.threshold)
+        .bind(&r.agg)
+        .bind(window_secs)
+        .bind(r.enabled)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // Drop rules no longer declared (their open/closed events cascade). With an
+    // empty config this clears the table — declaring nothing means no alerts.
+    let names: Vec<String> = rules.iter().map(|r| r.name.clone()).collect();
+    sqlx::query("DELETE FROM alert_rules WHERE name <> ALL($1)")
+        .bind(&names)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -299,7 +411,57 @@ async fn notify(
 
 #[cfg(test)]
 mod tests {
-    use super::{agg_expr, breached, email_body, email_subject, AlertRule};
+    use super::{agg_expr, breached, email_body, email_subject, validate, AlertRule, RuleConfig};
+
+    #[test]
+    fn config_parses_with_defaults() {
+        // Only the required fields given; the rest fall back to defaults.
+        let rules: Vec<RuleConfig> = serde_json::from_str(
+            r#"[{"name":"hot","metric":"cpu","comparator":"gt","threshold":1.5}]"#,
+        )
+        .unwrap();
+        assert_eq!(rules.len(), 1);
+        let r = &rules[0];
+        assert_eq!(r.agg, "avg");
+        assert_eq!(r.window_secs, 300);
+        assert!(r.enabled);
+        assert!(r.service.is_none());
+    }
+
+    #[test]
+    fn config_honors_explicit_fields() {
+        let rules: Vec<RuleConfig> = serde_json::from_str(
+            r#"[{"name":"x","metric":"m","service":"api","comparator":"lt",
+                 "threshold":0,"agg":"max","window_secs":60,"enabled":false}]"#,
+        )
+        .unwrap();
+        let r = &rules[0];
+        assert_eq!(r.service.as_deref(), Some("api"));
+        assert_eq!(r.agg, "max");
+        assert_eq!(r.window_secs, 60);
+        assert!(!r.enabled);
+    }
+
+    fn cfg(name: &str, comparator: &str, agg: &str) -> RuleConfig {
+        RuleConfig {
+            name: name.into(),
+            metric: "m".into(),
+            service: None,
+            comparator: comparator.into(),
+            threshold: 1.0,
+            agg: agg.into(),
+            window_secs: 300,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn validate_whitelists_fields() {
+        assert!(validate(&cfg("ok", "gt", "avg")).is_ok());
+        assert!(validate(&cfg("bad-cmp", "eq", "avg")).is_err());
+        assert!(validate(&cfg("bad-agg", "gt", "median")).is_err());
+        assert!(validate(&cfg("", "gt", "avg")).is_err()); // empty name
+    }
 
     fn rule() -> AlertRule {
         AlertRule {
