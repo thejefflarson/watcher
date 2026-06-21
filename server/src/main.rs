@@ -79,6 +79,19 @@ async fn main() -> anyhow::Result<()> {
     let alert_webhook = std::env::var("WATCHER_ALERT_WEBHOOK")
         .ok()
         .filter(|s| !s.is_empty());
+    // Optional SMTP delivery of alert transitions, enabled by setting
+    // WATCHER_ALERT_SMTP_HOST. The other SMTP_* vars fill in the rest.
+    let alert_email = std::env::var("WATCHER_ALERT_SMTP_HOST")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|relay| alerts::EmailConfig {
+            relay,
+            port: env_i32("WATCHER_ALERT_SMTP_PORT", 587) as u16,
+            username: std::env::var("WATCHER_ALERT_SMTP_USERNAME").unwrap_or_default(),
+            password: std::env::var("WATCHER_ALERT_SMTP_PASSWORD").unwrap_or_default(),
+            from: std::env::var("WATCHER_ALERT_SMTP_FROM").unwrap_or_default(),
+            to: std::env::var("WATCHER_ALERT_SMTP_TO").unwrap_or_default(),
+        });
 
     let pool = db::connect(&database_url).await?;
     db::migrate(&pool).await?;
@@ -93,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(alerts::run(
         pool.clone(),
         alert_webhook,
+        alert_email,
         alert_interval_secs,
     ));
 

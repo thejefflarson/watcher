@@ -81,6 +81,12 @@ last rollup bucket, so it stays continuous after pruning.
 | `WATCHER_ROLLUP_BUCKET_SECS` | `300` | downsample bucket width; `0` disables rollups |
 | `WATCHER_ALERT_INTERVAL_SECS` | `30` | how often alert rules are evaluated (min 5) |
 | `WATCHER_ALERT_WEBHOOK` | — | optional URL to POST on alert fire/resolve |
+| `WATCHER_ALERT_SMTP_HOST` | — | SMTP relay host; setting it enables emailing alert fire/resolve (STARTTLS) |
+| `WATCHER_ALERT_SMTP_PORT` | `587` | SMTP relay port |
+| `WATCHER_ALERT_SMTP_USERNAME` | — | SMTP auth username |
+| `WATCHER_ALERT_SMTP_PASSWORD` | — | SMTP auth password |
+| `WATCHER_ALERT_SMTP_FROM` | — | From address (e.g. `alerts@example.com`) |
+| `WATCHER_ALERT_SMTP_TO` | — | To address |
 | `WATCHER_DEFAULT_SERVICE` | — | fallback service name when ingested telemetry has none / `unknown_service` |
 | `WATCHER_SELF_TELEMETRY` | on | export watcher's own `/api` traces via OTLP (`0`/`off` disables) |
 | `OTEL_SERVICE_NAME` | `watcher` | service name for watcher's own telemetry |
