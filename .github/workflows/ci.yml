@@ -51,15 +51,6 @@ jobs:
       - run: npm ci
       - run: npm run build
 
-  chart:
-    runs-on: watcher-runners
-    steps:
-      - uses: actions/checkout@v6
-      # setup-helm installs to the tool cache (no sudo). get-helm-3's sudo install
-      # fails on the ARC runners, which run with no_new_privileges.
-      - uses: azure/setup-helm@v5
-      - run: helm lint chart
-
   # One image now: the server builds the UI and embeds it (rust-embed), so there
   # is no separate watcher-ui image. Build context is the repo root.
   #
@@ -69,7 +60,7 @@ jobs:
   # mounts (BUILDKIT_TLS_DIR) and verify against its servername; without the cert
   # the gRPC handshake is rejected. BuildKit's daemon cache replaces the gha cache.
   image:
-    needs: [server, ui, chart]
+    needs: [server, ui]
     if: github.ref == 'refs/heads/main'
     runs-on: watcher-runners
     permissions:

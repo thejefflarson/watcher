@@ -473,53 +473,26 @@ async fn metric_series_returns_recent_points() {
 
 #[tokio::test]
 #[serial]
-async fn alert_rule_fires_and_crud() {
+async fn alert_rule_fires_and_reconciles() {
     let Some(pool) = pool_or_skip().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     let router = app(pool.clone());
 
-    // Create a rule: fire when avg(cpu.load) over the last hour exceeds 0.5.
-    let body = serde_json::json!({
-        "name": "cpu hot",
-        "metric": "cpu.load",
-        "comparator": "gt",
-        "threshold": 0.5,
-        "agg": "avg",
-        "window_secs": 3600,
-    });
-    let resp = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/alerts")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // Invalid comparator is rejected.
-    let bad = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/alerts")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({"name":"x","metric":"y","comparator":"eq","threshold":1})
-                        .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    // Declare a rule: fire when avg(cpu.load) over the last hour exceeds 0.5.
+    apply_rules(
+        &pool,
+        &[serde_json::json!({
+            "name": "cpu hot",
+            "metric": "cpu.load",
+            "comparator": "gt",
+            "threshold": 0.5,
+            "agg": "avg",
+            "window_secs": 3600,
+        })],
+    )
+    .await;
 
     // Ingest a breaching point, then evaluate: the rule should fire.
     let req = gauge_request("cpu.load", 0.9, now_nanos());
@@ -534,7 +507,6 @@ async fn alert_rule_fires_and_crud() {
     let rules = rules.as_array().expect("array");
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0]["firing"], true);
-    let rule_id = rules[0]["id"].as_i64().unwrap();
 
     // The firing transition is recorded as an open event.
     let (_, events) = get_json(&router, "/api/alerts/events").await;
@@ -543,21 +515,12 @@ async fn alert_rule_fires_and_crud() {
     assert_eq!(events[0]["value"], 0.9);
     assert!(events[0]["resolved_at"].is_null());
 
-    // Delete the rule; the list goes empty.
-    let del = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri(format!("/api/alerts/{rule_id}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+    // Reconciling an empty config prunes the rule (its events cascade) — the
+    // declarative replacement for the old delete API.
+    apply_rules(&pool, &[]).await;
     let (_, rules) = get_json(&router, "/api/alerts").await;
     assert_eq!(rules.as_array().unwrap().len(), 0);
+    assert_eq!(count(&pool, "alert_events").await, 0);
 }
 
 #[tokio::test]
@@ -1320,20 +1283,15 @@ async fn retention_prunes_raw_metrics_before_rollups() {
 
 // --- Alerts ----------------------------------------------------------------
 
-async fn create_rule(router: &axum::Router, body: serde_json::Value) -> StatusCode {
-    router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/alerts")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap()
-        .status()
+/// Apply declared rules through the real reconcile path. Rules are declarative
+/// now (no create API), so the whole declared set goes in one call — reconcile
+/// upserts these and prunes anything else.
+async fn apply_rules(pool: &sqlx::PgPool, rules: &[serde_json::Value]) {
+    let cfgs: Vec<alerts::RuleConfig> = rules
+        .iter()
+        .map(|v| serde_json::from_value(v.clone()).expect("rule config"))
+        .collect();
+    alerts::reconcile(pool, &cfgs).await.expect("reconcile");
 }
 
 #[tokio::test]
@@ -1343,14 +1301,11 @@ async fn alert_fires_then_resolves() {
         return;
     };
     let router = app(pool.clone());
-    assert_eq!(
-        create_rule(
-            &router,
-            serde_json::json!({"name":"hot","metric":"t","comparator":"gt","threshold":50,"window_secs":3600})
-        )
-        .await,
-        StatusCode::OK
-    );
+    apply_rules(
+        &pool,
+        &[serde_json::json!({"name":"hot","metric":"t","comparator":"gt","threshold":50,"window_secs":3600})],
+    )
+    .await;
 
     insert_metric_at(&pool, "t", None, 90.0, 1.0).await;
     alerts::evaluate_once(&pool, None).await.unwrap();
@@ -1380,16 +1335,14 @@ async fn alert_lt_and_max_agg() {
     };
     let router = app(pool.clone());
 
-    // lt rule fires when the value drops below the floor.
-    create_rule(
-        &router,
-        serde_json::json!({"name":"cold","metric":"temp","comparator":"lt","threshold":0,"window_secs":3600}),
-    )
-    .await;
-    // max-agg rule: avg would be 55 (< 80) but max is 100 (> 80) → fires.
-    create_rule(
-        &router,
-        serde_json::json!({"name":"spike","metric":"q","comparator":"gt","threshold":80,"agg":"max","window_secs":3600}),
+    apply_rules(
+        &pool,
+        &[
+            // lt rule fires when the value drops below the floor.
+            serde_json::json!({"name":"cold","metric":"temp","comparator":"lt","threshold":0,"window_secs":3600}),
+            // max-agg rule: avg would be 55 (< 80) but max is 100 (> 80) → fires.
+            serde_json::json!({"name":"spike","metric":"q","comparator":"gt","threshold":80,"agg":"max","window_secs":3600}),
+        ],
     )
     .await;
 
@@ -1428,10 +1381,9 @@ async fn alert_does_not_fire_twice() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let router = app(pool.clone());
-    create_rule(
-        &router,
-        serde_json::json!({"name":"x","metric":"t","comparator":"gt","threshold":1,"window_secs":3600}),
+    apply_rules(
+        &pool,
+        &[serde_json::json!({"name":"x","metric":"t","comparator":"gt","threshold":1,"window_secs":3600})],
     )
     .await;
     insert_metric_at(&pool, "t", None, 9.0, 1.0).await;
@@ -1467,27 +1419,65 @@ async fn alert_webhook_delivers_payload() {
 
 #[tokio::test]
 #[serial]
-async fn alert_rejects_bad_agg() {
+async fn alert_reconcile_rejects_invalid_rules() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let router = app(pool);
-    assert_eq!(
-        create_rule(
-            &router,
-            serde_json::json!({"name":"x","metric":"t","comparator":"gt","threshold":1,"agg":"median"})
-        )
-        .await,
-        StatusCode::BAD_REQUEST
-    );
-    assert_eq!(
-        create_rule(
-            &router,
-            serde_json::json!({"name":"","metric":"t","comparator":"gt","threshold":1})
-        )
-        .await,
-        StatusCode::BAD_REQUEST
-    );
+
+    // A bad agg, a bad comparator, and an empty name each abort the whole apply
+    // — and because validation runs before any write, a rejected batch leaves the
+    // table untouched (no partial state).
+    let bad_agg = serde_json::from_value::<alerts::RuleConfig>(
+        serde_json::json!({"name":"x","metric":"t","comparator":"gt","threshold":1,"agg":"median"}),
+    )
+    .unwrap();
+    assert!(alerts::reconcile(&pool, std::slice::from_ref(&bad_agg))
+        .await
+        .is_err());
+
+    let empty_name = serde_json::from_value::<alerts::RuleConfig>(
+        serde_json::json!({"name":"","metric":"t","comparator":"gt","threshold":1}),
+    )
+    .unwrap();
+    assert!(alerts::reconcile(&pool, std::slice::from_ref(&empty_name))
+        .await
+        .is_err());
+
+    assert_eq!(count(&pool, "alert_rules").await, 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn alert_reconcile_upserts_in_place() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let router = app(pool.clone());
+
+    // Declare a rule and fire it, opening an event.
+    apply_rules(
+        &pool,
+        &[serde_json::json!({"name":"hot","metric":"t","comparator":"gt","threshold":50,"window_secs":3600})],
+    )
+    .await;
+    insert_metric_at(&pool, "t", None, 90.0, 1.0).await;
+    alerts::evaluate_once(&pool, None).await.unwrap();
+    let (_, rules) = get_json(&router, "/api/alerts").await;
+    let id_before = rules[0]["id"].as_i64().unwrap();
+    assert_eq!(count(&pool, "alert_events").await, 1);
+
+    // Re-declare the same rule with a new threshold: it's upserted by name, so
+    // the id (and its open event) survive rather than being dropped + recreated.
+    apply_rules(
+        &pool,
+        &[serde_json::json!({"name":"hot","metric":"t","comparator":"gt","threshold":75,"window_secs":3600})],
+    )
+    .await;
+    let (_, rules) = get_json(&router, "/api/alerts").await;
+    assert_eq!(rules.as_array().unwrap().len(), 1);
+    assert_eq!(rules[0]["id"].as_i64().unwrap(), id_before);
+    assert_eq!(rules[0]["threshold"], 75.0);
+    assert_eq!(count(&pool, "alert_events").await, 1); // event preserved
 }
 
 #[tokio::test]

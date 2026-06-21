@@ -5,7 +5,6 @@
 ```
 server/   Rust ingest + query server (axum + sqlx)
 ui/       Vite + React + TS UI
-chart/    Helm chart (server, ui, Zalando Postgres, Traefik IngressRoute)
 docs/     architecture.md + adr/ (decision records)
 ```
 
@@ -24,7 +23,6 @@ Send it data by pointing any OTLP exporter at `http://localhost:4318`.
 - **server**: `cargo fmt` · `cargo check` · `cargo test` (tests need a Postgres on
   `DATABASE_URL`; they skip cleanly without one, but CI runs them for real).
 - **ui**: `npm run build` (runs `tsc --noEmit && vite build`).
-- **chart**: `helm lint chart`.
 
 CI runs all of the above plus a multi-arch image build on `main`. Treat compiler
 warnings as errors.

@@ -9,7 +9,7 @@ use axum::{
     body::Body,
     http::{header, Request, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{get, post},
     Router,
 };
 use rust_embed::RustEmbed;
@@ -134,9 +134,10 @@ pub fn app(pool: PgPool) -> Router {
         .route("/api/metrics/hist_facet", get(api::metric_hist_facet))
         .route("/api/servicemap", get(api::service_map))
         .route("/api/services", get(api::service_red))
-        .route("/api/alerts", get(api::list_alerts).post(api::create_alert))
+        // Rules are declarative (reconciled from config at startup), so this is
+        // read-only — no create/delete routes.
+        .route("/api/alerts", get(api::list_alerts))
         .route("/api/alerts/events", get(api::list_alert_events))
-        .route("/api/alerts/{id}", delete(api::delete_alert))
         // Span each query-API request (INFO so it's recorded) for watcher's own
         // self-telemetry. Deliberately NOT on /v1, so exporting traces to self
         // can't create a feedback loop.

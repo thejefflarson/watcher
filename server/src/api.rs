@@ -937,10 +937,6 @@ pub async fn service_map(State(pool): State<PgPool>) -> Result<Json<ServiceMap>,
 // Alerts
 // ---------------------------------------------------------------------------
 
-fn bad_request(msg: impl Into<String>) -> ApiError {
-    (StatusCode::BAD_REQUEST, msg.into())
-}
-
 #[derive(Serialize, sqlx::FromRow)]
 pub struct AlertRuleView {
     id: i64,
@@ -974,69 +970,8 @@ pub async fn list_alerts(State(pool): State<PgPool>) -> Result<Json<Vec<AlertRul
     Ok(Json(rows))
 }
 
-#[derive(Deserialize)]
-pub struct NewAlertRule {
-    name: String,
-    metric: String,
-    service: Option<String>,
-    comparator: String,
-    threshold: f64,
-    agg: Option<String>,
-    window_secs: Option<i32>,
-}
-
-/// POST /api/alerts — create a rule. Validates the enum-ish fields so the
-/// evaluator's whitelisted SQL never sees anything unexpected.
-pub async fn create_alert(
-    State(pool): State<PgPool>,
-    Json(body): Json<NewAlertRule>,
-) -> Result<Json<i64>, ApiError> {
-    if body.name.trim().is_empty() || body.metric.trim().is_empty() {
-        return Err(bad_request("name and metric are required"));
-    }
-    if !matches!(body.comparator.as_str(), "gt" | "lt") {
-        return Err(bad_request("comparator must be 'gt' or 'lt'"));
-    }
-    let agg = body.agg.unwrap_or_else(|| "avg".to_string());
-    if !matches!(agg.as_str(), "avg" | "max" | "min" | "sum" | "last") {
-        return Err(bad_request("agg must be one of avg|max|min|sum|last"));
-    }
-    let window_secs = body.window_secs.unwrap_or(300).clamp(10, 86_400);
-    let service = body.service.filter(|s| !s.is_empty());
-
-    let id: i64 = sqlx::query_scalar(
-        "INSERT INTO alert_rules (name, metric, service, comparator, threshold, agg, window_secs)
-         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id",
-    )
-    .bind(body.name)
-    .bind(body.metric)
-    .bind(service)
-    .bind(body.comparator)
-    .bind(body.threshold)
-    .bind(agg)
-    .bind(window_secs)
-    .fetch_one(&pool)
-    .instrument(tracing::info_span!("db.query"))
-    .await
-    .map_err(internal)?;
-    Ok(Json(id))
-}
-
-/// DELETE /api/alerts/{id} — remove a rule (its events cascade).
-pub async fn delete_alert(
-    State(pool): State<PgPool>,
-    Path(id): Path<i64>,
-) -> Result<StatusCode, ApiError> {
-    let res = sqlx::query("DELETE FROM alert_rules WHERE id = $1")
-        .bind(id)
-        .execute(&pool)
-        .await
-        .map_err(internal)?;
-    if res.rows_affected() == 0 {
-        return Err((StatusCode::NOT_FOUND, "no such rule".into()));
-    }
-    Ok(StatusCode::NO_CONTENT)
-}
+// Rules are declarative (reconciled from config on startup — see alerts.rs), so
+// there is no create/delete API; `/api/alerts` is read-only.
 
 #[derive(Deserialize)]
 pub struct EventQuery {

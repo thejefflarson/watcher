@@ -65,18 +65,6 @@ async function get<T>(path: string): Promise<T> {
   return (await res.json()) as T;
 }
 
-async function send<T>(method: string, path: string, body?: unknown): Promise<T | null> {
-  const res = await fetch(`${BASE}${path}`, {
-    method,
-    headers: body !== undefined ? { "content-type": "application/json" } : undefined,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) throw new Error(`${res.status} ${(await res.text()) || res.statusText}`);
-  // 204 No Content (DELETE) has no body to parse.
-  if (res.status === 204) return null;
-  return (await res.json()) as T;
-}
-
 function qs(params: Record<string, string | number | boolean | undefined>): string {
   const q = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
@@ -226,16 +214,6 @@ export interface AlertRule {
   firing: boolean;
 }
 
-export interface NewAlertRule {
-  name: string;
-  metric: string;
-  service?: string;
-  comparator: Comparator;
-  threshold: number;
-  agg?: Agg;
-  window_secs?: number;
-}
-
 export interface AlertEvent {
   id: number;
   rule_id: number;
@@ -246,8 +224,8 @@ export interface AlertEvent {
   resolved_at: string | null;
 }
 
+// Rules are declarative (managed in the chart values, reconciled on deploy), so
+// the UI only reads them — no create/delete.
 export const listAlerts = () => get<AlertRule[]>(`/api/alerts`);
-export const createAlert = (r: NewAlertRule) => send<number>("POST", `/api/alerts`, r);
-export const deleteAlert = (id: number) => send<null>("DELETE", `/api/alerts/${id}`);
 export const listAlertEvents = (limit = 100) =>
   get<AlertEvent[]>(`/api/alerts/events?${qs({ limit })}`);
