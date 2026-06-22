@@ -10,31 +10,48 @@ permissions:
 
 jobs:
   server:
-    # Stays on GitHub-hosted: the watcher-runners (ARC, no local Docker — image
-    # builds offload to remote BuildKit) can't run the postgres service container.
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: watcher
-          POSTGRES_PASSWORD: watcher
-          POSTGRES_DB: watcher
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U watcher"
-          --health-interval 5s --health-timeout 3s --health-retries 10
+    # Self-hosted watcher-runners (meshed) so the cargo build uses the shared
+    # in-cluster sccache redis. The runners now carry a postgres sidecar (cluster
+    # repo: charts/actions/runners/values-watcher.yaml) reachable at localhost:5432,
+    # so the ARC-can't-run-a-service-container reason for staying hosted is gone.
+    runs-on: watcher-runners
     env:
       DATABASE_URL: postgres://watcher:watcher@localhost:5432/watcher
+      # sccache → shared in-cluster redis (cluster repo: charts/sccache). Reachable
+      # only through Linkerd mTLS (the watcher runner identity is admitted); it
+      # carries no credentials, so it lives here rather than a secret.
+      # CARGO_INCREMENTAL=0 — sccache can't cache incremental artefacts.
+      RUSTC_WRAPPER: sccache
+      SCCACHE_REDIS: redis://sccache-redis.dev.svc.cluster.local:6379
+      CARGO_INCREMENTAL: "0"
     defaults:
       run:
         working-directory: server
     steps:
       - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - name: Install sccache
+        run: cargo binstall --no-confirm sccache
+      # The postgres sidecar boots in parallel with the runner container; block until
+      # it accepts TCP before building/testing. bash /dev/tcp avoids needing a client.
+      - name: Wait for postgres sidecar
+        run: |
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/5432) >/dev/null 2>&1 && { echo "postgres up after ${i}s"; exit 0; }
+            sleep 1
+          done
+          echo "postgres sidecar never came up" >&2; exit 1
       - run: cargo fmt --check
       - run: cargo build --locked
-      - run: cargo test --locked   # runs the ingest->query integration test against the service DB
+      - run: cargo test --locked   # ingest->query integration test against the sidecar DB
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
 
   ui:
     runs-on: watcher-runners
