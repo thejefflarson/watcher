@@ -37,7 +37,7 @@ FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build /app/target/release/watcher-server /usr/local/bin/watcher-server
+COPY --from=build /app/watcher-server /usr/local/bin/watcher-server
 ENV BIND_ADDR=0.0.0.0:4318
 EXPOSE 4318
 USER 65534:65534
