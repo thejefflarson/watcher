@@ -23,7 +23,15 @@ COPY server/build.rs ./build.rs
 COPY server/migrations ./migrations
 COPY server/src ./src
 COPY --from=ui /ui/dist /ui/dist
-RUN cargo build --release --locked
+# buildkit cache mounts: persist the cargo registry/git + the target dir across
+# builds (buildkit runs as a persistent per-node DaemonSet in CI, so the cache
+# survives). The target mount is EPHEMERAL — it's gone after this RUN — so copy
+# the binary out to a non-cached path for the final stage to COPY.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --release --locked \
+ && cp /app/target/release/watcher-server /app/watcher-server
 
 FROM debian:bookworm-slim
 RUN apt-get update \
