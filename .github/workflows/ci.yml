@@ -78,7 +78,10 @@ jobs:
   # in-cluster BuildKit — no QEMU, since the cluster is ARM-only. BuildKit enforces
   # mTLS, so we point the remote driver at the client cert the runner already
   # mounts (BUILDKIT_TLS_DIR) and verify against its servername; without the cert
-  # the gRPC handshake is rejected. BuildKit's daemon cache replaces the gha cache.
+  # the gRPC handshake is rejected. The build also pushes a layer cache to GHA
+  # (cache-from/to type=gha): paired with cargo-chef in the Dockerfile, the dep
+  # compile becomes a portable layer any node can pull — unlike the per-node
+  # BuildKit daemon cache, which a cold node can't reach.
   image:
     needs: [server, ui]
     if: github.ref == 'refs/heads/main'
@@ -124,6 +127,13 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Portable layer cache on GitHub's Actions Cache (~10GB/repo, free). With
+          # cargo-chef the dep-compile layer cache-hits here until Cargo.lock moves,
+          # so a cold node skips it. mode=max also caches intermediate (build-stage)
+          # layers, which is what carries the cook layer — at the cost of a larger
+          # WAN transfer (see JEF-87 / measure in JEF-82).
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
       - uses: sigstore/cosign-installer@v3
       - name: Sign the image (keyless)
         # Sign by immutable digest, not tag. Keyless: GitHub's OIDC token is
