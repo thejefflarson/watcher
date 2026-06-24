@@ -571,7 +571,7 @@ pub async fn metric_facet(
         .collect();
 
     // Most-active series first; cap and report the remainder.
-    series.sort_by(|a, b| b.points.len().cmp(&a.points.len()));
+    series.sort_by_key(|b| std::cmp::Reverse(b.points.len()));
     let truncated = series.len().saturating_sub(FACET_MAX_SERIES) as i64;
     series.truncate(FACET_MAX_SERIES);
 
@@ -821,7 +821,7 @@ pub async fn metric_hist_facet(
             dist,
         })
         .collect();
-    series.sort_by(|a, b| b.points.len().cmp(&a.points.len()));
+    series.sort_by_key(|b| std::cmp::Reverse(b.points.len()));
     let truncated = series.len().saturating_sub(FACET_MAX_SERIES) as i64;
     series.truncate(FACET_MAX_SERIES);
 
