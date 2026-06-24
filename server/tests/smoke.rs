@@ -151,6 +151,7 @@ fn one_number(
 }
 
 /// One histogram point with the given bounds/counts, optionally `pod`-tagged.
+#[allow(clippy::too_many_arguments)] // test helper — a struct would only add noise
 fn one_histogram(
     name: &str,
     service: &str,

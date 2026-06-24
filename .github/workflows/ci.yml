@@ -31,7 +31,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: server
@@ -50,7 +50,11 @@ jobs:
           done
           echo "postgres sidecar never came up" >&2; exit 1
       - run: cargo fmt --check
-      - run: cargo build --locked
+      # clippy replaces a standalone `cargo build`: it's check-speed (no codegen) and
+      # gates the compile too, while `cargo test` below does the actual codegen. Only
+      # the workspace crate runs through clippy-driver; deps still compile via sccache.
+      # -D warnings matches the repo's warnings-as-errors policy.
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked   # ingest->query integration test against the sidecar DB
       - name: sccache stats
         if: always()
