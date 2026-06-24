@@ -35,6 +35,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: server
+          # Stable key shared across branches/PRs (not the per-branch default), so a
+          # PR's first run restores main's warm target/ instead of compiling cold.
+          shared-key: watcher-server
       - name: Install sccache
         # --force: rust-cache restores cargo's "already installed" metadata on a warm
         # cache, but not the binary, so a plain binstall skips and sccache is absent
