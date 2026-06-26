@@ -44,14 +44,47 @@ pub async fn prune_once(pool: &PgPool, days: i32, raw_hours: i32) -> anyhow::Res
     }
     // Raw points: short hours-window cap (rollups hold the history).
     if raw_hours > 0 {
-        let r = sqlx::query("DELETE FROM metrics WHERE time < now() - make_interval(hours => $1)")
-            .bind(raw_hours)
-            .execute(pool)
-            .await?;
-        if r.rows_affected() > 0 {
-            tracing::info!("retention: pruned {} raw metric rows", r.rows_affected());
-            total += r.rows_affected();
+        let pruned = prune_raw_metrics(pool, raw_hours, RAW_PRUNE_BATCH).await?;
+        if pruned > 0 {
+            tracing::info!("retention: pruned {pruned} raw metric rows");
+            total += pruned;
         }
     }
     Ok(total)
+}
+
+/// Rows deleted per raw-metrics batch. Bounded so a large backlog drains across
+/// many small statements instead of one huge DELETE.
+const RAW_PRUNE_BATCH: i64 = 50_000;
+
+/// Delete raw metric points older than `raw_hours` in batches of `batch` rows.
+///
+/// The raw `metrics` table is the highest-volume table, and a single
+/// `DELETE ... WHERE time < cutoff` over a large backlog can exceed the
+/// connection's `statement_timeout` and roll back — every sweep — leaving raw
+/// metrics to grow unbounded (this is exactly how the table once reached 35 GB).
+/// Batching by `ctid` keeps each statement small and lets a backlog drain over
+/// successive iterations; in steady state the first batch is already partial and
+/// the loop exits after one pass. Returns the total rows deleted.
+pub async fn prune_raw_metrics(pool: &PgPool, raw_hours: i32, batch: i64) -> anyhow::Result<u64> {
+    let mut pruned = 0u64;
+    loop {
+        let r = sqlx::query(
+            "DELETE FROM metrics WHERE ctid IN (
+                 SELECT ctid FROM metrics
+                 WHERE time < now() - make_interval(hours => $1)
+                 LIMIT $2)",
+        )
+        .bind(raw_hours)
+        .bind(batch)
+        .execute(pool)
+        .await?;
+        let n = r.rows_affected();
+        pruned += n;
+        // A short batch means no rows older than the cutoff remain.
+        if (n as i64) < batch {
+            break;
+        }
+    }
+    Ok(pruned)
 }

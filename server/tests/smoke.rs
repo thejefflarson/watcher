@@ -1282,6 +1282,28 @@ async fn retention_prunes_raw_metrics_before_rollups() {
     assert_eq!(count(&pool, "metric_series_rollups").await, 1);
 }
 
+/// A backlog larger than one batch must fully drain. `batch = 1` forces the loop
+/// to iterate per row, so this fails if the prune stops after a single statement.
+#[tokio::test]
+#[serial]
+async fn retention_raw_metrics_drains_in_batches() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let hour = 3_600.0;
+    // Three points older than the 6h window, one inside it.
+    for _ in 0..3 {
+        insert_metric_at(&pool, "m", None, 1.0, 10.0 * hour).await;
+    }
+    insert_metric_at(&pool, "m", None, 1.0, 1.0 * hour).await;
+
+    let pruned = watcher_server::retention::prune_raw_metrics(&pool, 6, 1)
+        .await
+        .unwrap();
+    assert_eq!(pruned, 3);
+    assert_eq!(count(&pool, "metrics").await, 1);
+}
+
 // --- Alerts ----------------------------------------------------------------
 
 /// Apply declared rules through the real reconcile path. Rules are declarative
