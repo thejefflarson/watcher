@@ -10,6 +10,18 @@ interface Row {
 
 const SPAN_KINDS = ["unspecified", "internal", "server", "client", "producer", "consumer"];
 
+// Epoch microseconds from an RFC3339 timestamp. JS `Date` resolves only to ms,
+// so we add the sub-ms digits (our span timestamps carry microsecond precision).
+// The waterfall must derive a bar's offset AND width from this same function:
+// using ms-truncated offsets with sub-ms widths desyncs a bar's start from its
+// end and makes parent bars fail to enclose their children on short traces.
+function epochMicros(iso: string): number {
+  const ms = Date.parse(iso);
+  const frac = /\.(\d+)/.exec(iso);
+  const subMs = frac ? Number(frac[1].padEnd(6, "0").slice(0, 6)) % 1000 : 0;
+  return ms * 1000 + subMs;
+}
+
 // Detail panel for a selected span: identity, status, timing, and attributes.
 function SpanDetail({ span, onClose }: { span: SpanRow; onClose: () => void }) {
   const attrs = Object.entries(span.attributes ?? {});
@@ -119,8 +131,8 @@ export default function TraceWaterfall({
   if (spans.length === 0) return <p className="muted">Loading trace…</p>;
 
   const rows = buildOrder(spans);
-  const t0 = Math.min(...spans.map((s) => Date.parse(s.start_time)));
-  const t1 = Math.max(...spans.map((s) => Date.parse(s.end_time)));
+  const t0 = Math.min(...spans.map((s) => epochMicros(s.start_time)));
+  const t1 = Math.max(...spans.map((s) => epochMicros(s.end_time)));
   const total = Math.max(t1 - t0, 1);
 
   return (
@@ -137,8 +149,12 @@ export default function TraceWaterfall({
       </h2>
       <div className="bars">
         {rows.map(({ span, depth }) => {
-          const left = ((Date.parse(span.start_time) - t0) / total) * 100;
-          const width = Math.max((span.duration_ms / total) * 100, 0.4);
+          const start = epochMicros(span.start_time);
+          // Width from end−start (same basis as `left`), not duration_ms, so the
+          // bar's right edge always maps to the span's true end → parents enclose
+          // children. duration_ms is still shown as the numeric label below.
+          const left = ((start - t0) / total) * 100;
+          const width = Math.max(((epochMicros(span.end_time) - start) / total) * 100, 0.4);
           const err = span.status_code === 2;
           const sel = span.span_id === selected;
           return (
