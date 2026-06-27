@@ -572,7 +572,14 @@ async fn flush_histograms(pool: &PgPool, rows: Vec<HistRow>) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn ts(nanos: u64) -> DateTime<Utc> {
-    DateTime::from_timestamp_nanos(nanos as i64)
+    // OTLP carries u64 nanoseconds since the epoch, but from_timestamp_nanos takes
+    // an i64. Values past i64::MAX (year ~2262) are implausible or hostile — a bare
+    // `as i64` cast would wrap them to a far-past time that the retention sweep then
+    // silently prunes. Fall back to receive time rather than store a garbage stamp.
+    match i64::try_from(nanos) {
+        Ok(n) => DateTime::from_timestamp_nanos(n),
+        Err(_) => Utc::now(),
+    }
 }
 
 /// Rollup bucket width in seconds (`WATCHER_ROLLUP_BUCKET_SECS`, default 300),
@@ -641,15 +648,12 @@ fn default_service() -> &'static Option<String> {
     })
 }
 
-fn attrs_to_json(attrs: &[KeyValue]) -> serde_json::Value {
-    let mut map = serde_json::Map::new();
-    for kv in attrs {
-        if let Some(v) = &kv.value {
-            map.insert(kv.key.clone(), any_value_to_json(v));
-        }
-    }
-    serde_json::Value::Object(map)
-}
+/// Cap on OTLP attribute nesting. A sender (hostile or buggy) can nest
+/// ArrayValue/KvlistValue arbitrarily deep; the conversion recurses once per
+/// level, so without a bound a single small message could overflow the stack and
+/// crash the (unauthenticated, in-cluster) ingest path. Past the cap the
+/// over-nested subtree is dropped to Null — 32 is far beyond any real attribute.
+const MAX_ATTR_DEPTH: usize = 32;
 
 /// Resource attributes (k8s.pod.name / node / container, …) overlaid with a data
 /// point's own attributes — so stored metrics keep their dimensions. The point's
@@ -658,13 +662,27 @@ fn merged_attrs(resource: &[KeyValue], point: &[KeyValue]) -> serde_json::Value 
     let mut map = serde_json::Map::new();
     for kv in resource.iter().chain(point.iter()) {
         if let Some(v) = &kv.value {
-            map.insert(kv.key.clone(), any_value_to_json(v));
+            map.insert(kv.key.clone(), any_value_to_json_at(v, 0));
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
+fn kvlist_to_json(attrs: &[KeyValue], depth: usize) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for kv in attrs {
+        if let Some(v) = &kv.value {
+            map.insert(kv.key.clone(), any_value_to_json_at(v, depth));
         }
     }
     serde_json::Value::Object(map)
 }
 
 fn any_value_to_json(v: &AnyValue) -> serde_json::Value {
+    any_value_to_json_at(v, 0)
+}
+
+fn any_value_to_json_at(v: &AnyValue, depth: usize) -> serde_json::Value {
     use any_value::Value as V;
     match &v.value {
         Some(V::StringValue(s)) => json!(s),
@@ -672,10 +690,17 @@ fn any_value_to_json(v: &AnyValue) -> serde_json::Value {
         Some(V::IntValue(i)) => json!(i),
         Some(V::DoubleValue(d)) => json!(d),
         Some(V::BytesValue(b)) => json!(hex::encode(b)),
-        Some(V::ArrayValue(a)) => {
-            serde_json::Value::Array(a.values.iter().map(any_value_to_json).collect())
+        // Stop recursing past the depth cap: drop the over-nested container.
+        Some(V::ArrayValue(_) | V::KvlistValue(_)) if depth >= MAX_ATTR_DEPTH => {
+            serde_json::Value::Null
         }
-        Some(V::KvlistValue(kv)) => attrs_to_json(&kv.values),
+        Some(V::ArrayValue(a)) => serde_json::Value::Array(
+            a.values
+                .iter()
+                .map(|x| any_value_to_json_at(x, depth + 1))
+                .collect(),
+        ),
+        Some(V::KvlistValue(kv)) => kvlist_to_json(&kv.values, depth + 1),
         None => serde_json::Value::Null,
     }
 }
@@ -704,6 +729,34 @@ mod tests {
         let t = ts(1_500_000_000);
         assert_eq!(t.timestamp(), 1);
         assert_eq!(t.timestamp_subsec_nanos(), 500_000_000);
+    }
+
+    #[test]
+    fn ts_clamps_implausible_nanos() {
+        // u64::MAX nanos wraps to a 1969 timestamp via a bare `as i64`; the guard
+        // falls back to receive time (well past 2020) instead of a far-past stamp.
+        assert!(ts(u64::MAX).timestamp() > 1_600_000_000);
+    }
+
+    #[test]
+    fn attrs_to_json_caps_deep_nesting() {
+        // Nest ArrayValue far past MAX_ATTR_DEPTH. Conversion must not overflow the
+        // stack, and the over-nested subtree is dropped to Null at the cap.
+        let mut v = sval("leaf");
+        for _ in 0..1000 {
+            v = AnyValue {
+                value: Some(V::ArrayValue(ArrayValue { values: vec![v] })),
+            };
+        }
+        let json = any_value_to_json(&v); // does not panic / overflow
+        let (mut cur, mut depth) = (&json, 0);
+        while let serde_json::Value::Array(arr) = cur {
+            assert_eq!(arr.len(), 1);
+            cur = &arr[0];
+            depth += 1;
+        }
+        assert!(cur.is_null(), "deep nesting should truncate to Null");
+        assert_eq!(depth, MAX_ATTR_DEPTH);
     }
 
     #[test]
@@ -807,7 +860,7 @@ mod tests {
                 }),
             },
         ];
-        let json = attrs_to_json(&attrs);
+        let json = kvlist_to_json(&attrs, 0);
         assert_eq!(json["s"], "x");
         assert_eq!(json["b"], true);
         assert_eq!(json["i"], 42);
