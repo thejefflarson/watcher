@@ -11,7 +11,7 @@ use watcher_server::{alerts, app, db, grpc, retention};
 /// itself (`http://localhost:4318`) unless `OTEL_EXPORTER_OTLP_ENDPOINT` says
 /// otherwise; opt out with `WATCHER_SELF_TELEMETRY=0`. Only `/api` requests are
 /// spanned (not `/v1`), so exporting to self can't loop.
-fn init_telemetry() -> Option<opentelemetry_sdk::trace::TracerProvider> {
+fn init_telemetry() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
     let off = std::env::var("WATCHER_SELF_TELEMETRY")
         .map(|v| matches!(v.as_str(), "0" | "false" | "off"))
         .unwrap_or(false);
@@ -34,11 +34,15 @@ fn init_telemetry() -> Option<opentelemetry_sdk::trace::TracerProvider> {
         .with_endpoint(format!("{}/v1/traces", endpoint.trim_end_matches('/')))
         .build()
         .ok()?;
-    let provider = opentelemetry_sdk::trace::TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-        .with_resource(opentelemetry_sdk::Resource::new(vec![
-            opentelemetry::KeyValue::new("service.name", service),
-        ]))
+    // 0.32 API: SdkTracerProvider, a runtime-free batch exporter (its own thread),
+    // and Resource via the builder (Resource::new is no longer public).
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(
+            opentelemetry_sdk::Resource::builder()
+                .with_attribute(opentelemetry::KeyValue::new("service.name", service))
+                .build(),
+        )
         .build();
     Some(provider)
 }
