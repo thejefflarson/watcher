@@ -28,7 +28,7 @@ jobs:
       run:
         working-directory: server
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -69,7 +69,7 @@ jobs:
       run:
         working-directory: ui
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
           node-version: 22
@@ -98,7 +98,7 @@ jobs:
       packages: write
       id-token: write # keyless cosign signing (OIDC token -> Sigstore Fulcio)
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Connect to BuildKit (mTLS)
         run: |
           for i in 1 2 3 4 5; do
