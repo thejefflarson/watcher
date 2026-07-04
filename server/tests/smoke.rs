@@ -637,7 +637,7 @@ async fn insert_rollup_at(pool: &sqlx::PgPool, name: &str, secs_ago: f64) {
 }
 
 async fn count(pool: &sqlx::PgPool, table: &str) -> i64 {
-    sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
         .fetch_one(pool)
         .await
         .unwrap()
