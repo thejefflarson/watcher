@@ -8,7 +8,7 @@ description = "Postgres-native OTLP traces + logs ingest and query backend"
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 tower-http = { version = "0.7", features = ["cors", "trace"] }
-sqlx = { version = "0.8", default-features = false, features = [
+sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",
     "postgres",
@@ -17,9 +17,9 @@ sqlx = { version = "0.8", default-features = false, features = [
     "json",
     "migrate",
 ] }
-prost = "0.13"
+prost = "0.14"
 tonic = "0.14"
-opentelemetry-proto = { version = "0.27", default-features = false, features = [
+opentelemetry-proto = { version = "0.32", default-features = false, features = [
     "gen-tonic",
     "trace",
     "logs",
@@ -40,10 +40,10 @@ reqwest = { version = "0.12", default-features = false, features = [
     "json",
 ] }
 flate2 = "1.1.9"
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", default-features = false, features = ["http-proto", "reqwest-client", "trace"] }
-tracing-opentelemetry = "0.28"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-client", "trace"] }
+tracing-opentelemetry = "0.33"
 lettre = { version = "0.11.22", default-features = false, features = ["builder", "smtp-transport", "hostname", "tokio1-rustls-tls"] }
 
 [dev-dependencies]

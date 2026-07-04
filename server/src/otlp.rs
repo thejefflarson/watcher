@@ -686,6 +686,10 @@ fn any_value_to_json_at(v: &AnyValue, depth: usize) -> serde_json::Value {
     use any_value::Value as V;
     match &v.value {
         Some(V::StringValue(s)) => json!(s),
+        // OTLP 0.32 added a string-table reference (index into a shared string
+        // table). We don't thread that table into this converter, and standard
+        // SDKs/collectors send inline StringValue, so drop the ref to Null.
+        Some(V::StringValueStrindex(_)) => serde_json::Value::Null,
         Some(V::BoolValue(b)) => json!(b),
         Some(V::IntValue(i)) => json!(i),
         Some(V::DoubleValue(d)) => json!(d),
@@ -765,10 +769,12 @@ mod tests {
             KeyValue {
                 key: "host".into(),
                 value: Some(sval("box")),
+                ..Default::default()
             },
             KeyValue {
                 key: "service.name".into(),
                 value: Some(sval("checkout")),
+                ..Default::default()
             },
         ];
         assert_eq!(service_name(&attrs).as_deref(), Some("checkout"));
@@ -782,10 +788,12 @@ mod tests {
             KeyValue {
                 key: "service.name".into(),
                 value: Some(sval("unknown_service:node")),
+                ..Default::default()
             },
             KeyValue {
                 key: "k8s.deployment.name".into(),
                 value: Some(sval("checkout")),
+                ..Default::default()
             },
         ];
         assert_eq!(service_name(&attrs).as_deref(), Some("checkout"));
@@ -794,6 +802,7 @@ mod tests {
         let bare = vec![KeyValue {
             key: "service.name".into(),
             value: Some(sval("unknown_service")),
+            ..Default::default()
         }];
         assert_eq!(service_name(&bare), None);
     }
@@ -805,6 +814,7 @@ mod tests {
             value: Some(AnyValue {
                 value: Some(V::IntValue(7)),
             }),
+            ..Default::default()
         }];
         assert_eq!(service_name(&attrs), None);
     }
@@ -815,30 +825,35 @@ mod tests {
             KeyValue {
                 key: "s".into(),
                 value: Some(sval("x")),
+                ..Default::default()
             },
             KeyValue {
                 key: "b".into(),
                 value: Some(AnyValue {
                     value: Some(V::BoolValue(true)),
                 }),
+                ..Default::default()
             },
             KeyValue {
                 key: "i".into(),
                 value: Some(AnyValue {
                     value: Some(V::IntValue(42)),
                 }),
+                ..Default::default()
             },
             KeyValue {
                 key: "d".into(),
                 value: Some(AnyValue {
                     value: Some(V::DoubleValue(1.5)),
                 }),
+                ..Default::default()
             },
             KeyValue {
                 key: "by".into(),
                 value: Some(AnyValue {
                     value: Some(V::BytesValue(vec![0xde, 0xad])),
                 }),
+                ..Default::default()
             },
             KeyValue {
                 key: "arr".into(),
@@ -847,6 +862,7 @@ mod tests {
                         values: vec![sval("a"), sval("b")],
                     })),
                 }),
+                ..Default::default()
             },
             KeyValue {
                 key: "kv".into(),
@@ -855,9 +871,11 @@ mod tests {
                         values: vec![KeyValue {
                             key: "nested".into(),
                             value: Some(sval("y")),
+                            ..Default::default()
                         }],
                     })),
                 }),
+                ..Default::default()
             },
         ];
         let json = kvlist_to_json(&attrs, 0);
