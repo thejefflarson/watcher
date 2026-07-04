@@ -45,7 +45,9 @@ fn otel_request_span(req: &Request<Body>) -> tracing::Span {
     let parent = opentelemetry::global::get_text_map_propagator(|p| {
         p.extract(&HeaderExtractor(req.headers()))
     });
-    span.set_parent(parent);
+    // set_parent returns a Result in tracing-opentelemetry 0.33; a failed
+    // parent link on our own self-telemetry span is non-fatal, so ignore it.
+    let _ = span.set_parent(parent);
     span
 }
 

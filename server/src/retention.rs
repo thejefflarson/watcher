@@ -36,7 +36,12 @@ pub async fn prune_once(pool: &PgPool, days: i32, raw_hours: i32) -> anyhow::Res
         ("metric_series_rollups", "bucket"),
     ] {
         let sql = format!("DELETE FROM {table} WHERE {col} < now() - make_interval(days => $1)");
-        let r = sqlx::query(&sql).bind(days).execute(pool).await?;
+        // AssertSqlSafe: sqlx 0.9 requires dynamic SQL be audited; table/col come
+        // only from the hardcoded list above, so there's no injection surface.
+        let r = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(days)
+            .execute(pool)
+            .await?;
         if r.rows_affected() > 0 {
             tracing::info!("retention: pruned {} rows from {table}", r.rows_affected());
             total += r.rows_affected();

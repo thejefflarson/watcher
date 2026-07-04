@@ -1,20 +1,22 @@
-# Dependabot version updates. Added to hold the opentelemetry crates as a set:
-# opentelemetry / opentelemetry_sdk / opentelemetry-otlp / opentelemetry-proto and
-# tracing-opentelemetry must move together (their APIs are coupled). A lone bump —
-# e.g. dependabot raising only opentelemetry_sdk 0.27 -> 0.32 (#67, #71) — leaves an
-# incompatible split that fails to compile, and the auto-merge workflow lands it
-# regardless because the CI checks aren't required. Ignore the whole set here until
-# someone does the coordinated migration (bump all of them + update the SDK init in
-# main.rs and the proto types in otlp.rs in one PR), then drop these ignores.
+# Dependabot version updates. The OTLP stack is coupled — the opentelemetry
+# crates (opentelemetry / _sdk / -otlp / -proto), tracing-opentelemetry, and the
+# gRPC codegen runtime (tonic + prost that opentelemetry-proto's generated
+# services build against) must move together, or you get an incompatible split
+# that fails to compile. Group them so dependabot proposes the whole set in one PR
+# (which the required CI checks then gate) instead of piecemeal bumps.
 version: 2
 updates:
   - package-ecosystem: cargo
     directory: /server
     schedule:
       interval: weekly
-    ignore:
-      - dependency-name: "opentelemetry*"
-      - dependency-name: "tracing-opentelemetry"
+    groups:
+      otlp-stack:
+        patterns:
+          - "opentelemetry*"
+          - "tracing-opentelemetry"
+          - "tonic"
+          - "prost"
   - package-ecosystem: npm
     directory: /ui
     schedule:

@@ -301,7 +301,10 @@ async fn evaluate(
                AND time >= now() - make_interval(secs => $3)",
             agg_expr(&rule.agg)
         );
-        let value: Option<f64> = sqlx::query_scalar(&sql)
+        // AssertSqlSafe: sqlx 0.9 requires dynamic SQL to be audited. Only the
+        // enum-whitelisted agg_expr() is interpolated (metric/service/window are
+        // bound), so this is injection-safe.
+        let value: Option<f64> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
             .bind(&rule.metric)
             .bind(&rule.service)
             .bind(rule.window_secs as f64)
