@@ -7,7 +7,7 @@ description = "Postgres-native OTLP traces + logs ingest and query backend"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",
