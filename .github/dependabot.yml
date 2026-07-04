@@ -1,11 +1,13 @@
-# Dependabot version updates. Added to hold the opentelemetry crates as a set:
-# opentelemetry / opentelemetry_sdk / opentelemetry-otlp / opentelemetry-proto and
-# tracing-opentelemetry must move together (their APIs are coupled). A lone bump —
-# e.g. dependabot raising only opentelemetry_sdk 0.27 -> 0.32 (#67, #71) — leaves an
-# incompatible split that fails to compile, and the auto-merge workflow lands it
-# regardless because the CI checks aren't required. Ignore the whole set here until
-# someone does the coordinated migration (bump all of them + update the SDK init in
-# main.rs and the proto types in otlp.rs in one PR), then drop these ignores.
+# Dependabot version updates. Held here: the OTLP stack must move as a set.
+# The opentelemetry crates (opentelemetry / _sdk / -otlp / -proto) +
+# tracing-opentelemetry share coupled APIs; tonic + prost are the gRPC codegen
+# runtime that opentelemetry-proto's generated services (TraceServiceServer, …)
+# are built against, so their versions must match opentelemetry-proto's. A lone
+# bump — opentelemetry_sdk 0.27->0.32 (#67/#71) or tonic 0.12->0.14 — leaves an
+# incompatible split that fails to compile. Ignore the whole stack until someone
+# does the coordinated migration in one PR (bump all of them + update the SDK init
+# in main.rs, the proto types in otlp.rs, and the gRPC server in grpc.rs), then
+# drop these ignores.
 version: 2
 updates:
   - package-ecosystem: cargo
@@ -15,6 +17,8 @@ updates:
     ignore:
       - dependency-name: "opentelemetry*"
       - dependency-name: "tracing-opentelemetry"
+      - dependency-name: "tonic"
+      - dependency-name: "prost"
   - package-ecosystem: npm
     directory: /ui
     schedule:
