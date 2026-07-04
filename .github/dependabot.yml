@@ -1,0 +1,25 @@
+# Dependabot version updates. Added to hold the opentelemetry crates as a set:
+# opentelemetry / opentelemetry_sdk / opentelemetry-otlp / opentelemetry-proto and
+# tracing-opentelemetry must move together (their APIs are coupled). A lone bump —
+# e.g. dependabot raising only opentelemetry_sdk 0.27 -> 0.32 (#67, #71) — leaves an
+# incompatible split that fails to compile, and the auto-merge workflow lands it
+# regardless because the CI checks aren't required. Ignore the whole set here until
+# someone does the coordinated migration (bump all of them + update the SDK init in
+# main.rs and the proto types in otlp.rs in one PR), then drop these ignores.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /server
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: "opentelemetry*"
+      - dependency-name: "tracing-opentelemetry"
+  - package-ecosystem: npm
+    directory: /ui
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
