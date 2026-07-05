@@ -155,8 +155,8 @@ jobs:
           # WAN transfer (see JEF-87 / measure in JEF-82).
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          provenance: false
-          sbom: false
+          provenance: true
+          sbom: true
       - uses: sigstore/cosign-installer@v3
       - name: Sign the image (keyless)
         # Sign by immutable digest, not tag. Keyless: GitHub's OIDC token is
