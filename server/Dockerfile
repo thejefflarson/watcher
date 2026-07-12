@@ -13,44 +13,45 @@ RUN npm ci
 COPY ui/ ./
 RUN VITE_API_BASE="" npm run build
 
-# Stage 2 — build the server with cargo-chef. The slow dependency compile is
-# split into its own layer (`cook`) keyed on the dependency recipe, so it
-# cache-hits on GHA's layer cache (cache-from/to type=gha in CI) until Cargo.lock
-# changes. Unlike the per-node BuildKit cache mounts, the GHA layer cache is
-# PORTABLE across nodes, so a cold runner reuses the dep compile instead of
-# redoing it. Migrations are embedded via sqlx::migrate! and the UI via
-# rust-embed, so the runtime image needs only the binary + CA certs.
-FROM rust:1-bookworm AS chef
-RUN cargo install cargo-chef --locked
+# Stage 2 — build the server. Dependency-recompile dedup is sccache against the
+# shared in-cluster Redis (sccache-redis.dev), not cargo-chef: sccache keys each
+# rustc invocation and pulls hits from Redis, so a cold node reuses compiles built
+# on any other node — portable like GHA's layer cache, but content-addressed.
+# cargo-chef was REMOVED because it can't coexist with sccache: sccache hashes
+# every `--extern` input (cargo always passes `.rmeta` metadata externs), and
+# chef's `cook` leaves the shared target dir in a state where those extern `.rmeta`
+# files don't survive into the final `cargo build`, so sccache fatals ("Failed to
+# open file for hashing: …/lib*.rmeta: No such file or directory") and aborts
+# (JEF-389, confirmed real and backend-independent). Collapsed to one build stage:
+# COPY source, one `cargo build`. Migrations are embedded via sqlx::migrate! and
+# the UI via rust-embed, so the runtime image needs only the binary + CA certs.
+FROM rust:1-bookworm AS build
 WORKDIR /app
-
-FROM chef AS planner
-COPY server/Cargo.toml server/Cargo.lock ./
-COPY server/build.rs ./build.rs
-COPY server/src ./src
-# Distill the dependency graph into recipe.json — changes only when deps change,
-# so the cook layer below stays cached across ordinary source edits.
-RUN cargo chef prepare --recipe-path recipe.json
-
-FROM chef AS build
-COPY --from=planner /app/recipe.json recipe.json
-# Compile ONLY dependencies. The output (populated target dir) is baked into this
-# layer — deliberately NOT a target cache mount — so GHA's layer cache carries it
-# across nodes. registry/git stay cache mounts: a pure LAN-local speedup for the
-# crate download with no effect on the portable layer.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    cargo chef cook --release --recipe-path recipe.json
-# Now the source. A source-only change invalidates from here on, but the deps are
-# already compiled in target (from the cook layer), so only our crate recompiles.
+# sccache v0.16.0 (arch-aware; -gnu because the rust base is bookworm/glibc, not
+# musl). RUSTC_WRAPPER routes every rustc through sccache; CARGO_INCREMENTAL=0 is
+# mandatory (incremental artifacts defeat sccache's cache keys).
+RUN set -eux; ver=0.16.0; \
+    case "$(uname -m)" in x86_64) a=x86_64 ;; aarch64) a=aarch64 ;; *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;; esac; \
+    wget -qO- "https://github.com/mozilla/sccache/releases/download/v${ver}/sccache-v${ver}-${a}-unknown-linux-gnu.tar.gz" \
+      | tar -xz -C /usr/local/bin --strip-components=1 "sccache-v${ver}-${a}-unknown-linux-gnu/sccache"
+ENV RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0 \
+    SCCACHE_REDIS=redis://sccache-redis.dev.svc.cluster.local:6379
 COPY server/Cargo.toml server/Cargo.lock ./
 COPY server/build.rs ./build.rs
 COPY server/migrations ./migrations
 COPY server/src ./src
 COPY --from=ui /ui/dist /ui/dist
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    cargo build --release --locked
+# sccache is a HARD GATE — no local fallback; if it can't reach Redis the build
+# fails. SCCACHE_SERVER_PORT is randomised per build because BuildKit sandboxes
+# share a network namespace, so concurrent builds would collide on sccache's fixed
+# default port 4226 ("Address in use").
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    set -e; \
+    export SCCACHE_SERVER_PORT=$(awk 'BEGIN{srand(); print int(20000+rand()*40000)}'); \
+    timeout 10 sccache --start-server; \
+    cargo build --release --locked; \
+    sccache --show-stats
 
 FROM debian:bookworm-slim
 RUN apt-get update \
