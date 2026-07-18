@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { getServiceMap, type ServiceMapData } from "../api";
+import { rowKeyActivate } from "../a11y";
+import { firstRunHint } from "../empty";
 import { useControls } from "../timerange";
 
 // Simple circular layout — nodes on a ring, edges as arrowed lines.
@@ -28,7 +30,9 @@ export default function ServiceMap() {
   if (error) return <p className="error">Failed to load: {error}</p>;
   if (!data) return <p className="muted">Loading…</p>;
   if (data.nodes.length === 0)
-    return <p className="muted">No services yet — send some traces.</p>;
+    return <p className="muted">{firstRunHint("traces", "services")}</p>;
+
+  const totalCalls = data.edges.reduce((n, e) => n + e.calls, 0);
 
   const W = 720;
   const H = 520;
@@ -44,7 +48,12 @@ export default function ServiceMap() {
 
   return (
     <div className="servicemap">
-      <svg width={W} height={H} role="img" aria-label="service map">
+      <svg
+        width={W}
+        height={H}
+        role="img"
+        aria-label={`Service map — ${data.nodes.length} services, ${data.edges.length} call paths, ${totalCalls} calls`}
+      >
         <defs>
           <marker
             id="arrow"
@@ -83,11 +92,16 @@ export default function ServiceMap() {
         })}
         {data.nodes.map((n) => {
           const p = pos.get(n)!;
+          const open = () => navigate(`/traces?service=${encodeURIComponent(n)}`);
           return (
             <g
               key={n}
               className="map-node"
-              onClick={() => navigate(`/traces?service=${encodeURIComponent(n)}`)}
+              role="button"
+              tabIndex={0}
+              aria-label={`View traces for ${n}`}
+              onClick={open}
+              onKeyDown={rowKeyActivate(open)}
             >
               <title>{`View traces for ${n}`}</title>
               <circle cx={p.x} cy={p.y} r={4} fill="#111" />

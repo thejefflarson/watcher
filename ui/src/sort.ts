@@ -31,5 +31,11 @@ export function useSort<T>(rows: T[], initial: keyof T, initialDir: "asc" | "des
 
   const indicator = (k: keyof T) => (k === key ? (dir === "asc" ? " ▲" : " ▼") : "");
 
-  return { sorted, onSort, indicator };
+  // Reflect the sort state to assistive tech on the active column header.
+  const ariaSort = (k: keyof T): "ascending" | "descending" | "none" =>
+    k === key ? (dir === "asc" ? "ascending" : "descending") : "none";
+
+  return { sorted, onSort, indicator, ariaSort };
 }
+
+export type Sort<T> = ReturnType<typeof useSort<T>>;

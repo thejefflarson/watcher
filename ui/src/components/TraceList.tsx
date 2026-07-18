@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { listTraces, type TraceSummary } from "../api";
 import { useControls, rangeParams } from "../timerange";
-import { focusLabel } from "../focus";
 import { useSort } from "../sort";
+import { firstRunHint } from "../empty";
+import SortHeader from "./SortHeader";
 
 export function fmtDuration(ms: number): string {
   if (ms < 1) return `${(ms * 1000).toFixed(0)}µs`;
@@ -10,7 +12,7 @@ export function fmtDuration(ms: number): string {
   return `${(ms / 1000).toFixed(2)}s`;
 }
 
-export default function TraceList({ onSelect }: { onSelect: (traceId: string) => void }) {
+export default function TraceList({ to }: { to: (traceId: string) => string }) {
   const [traces, setTraces] = useState<TraceSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
@@ -49,7 +51,10 @@ export default function TraceList({ onSelect }: { onSelect: (traceId: string) =>
     };
   }, [service, name, attr, errorsOnly, minDuration, rangeKey, tick]);
 
-  const { sorted, onSort, indicator } = useSort(traces, "start_time");
+  const sort = useSort(traces, "start_time");
+  const { sorted } = sort;
+  // First-run (no data, no filters) reads differently from a filtered miss.
+  const filtered = Boolean(name || attr || errorsOnly || minDuration || service);
 
   const filters = (
     <div className="filters">
@@ -89,24 +94,28 @@ export default function TraceList({ onSelect }: { onSelect: (traceId: string) =>
       {error && <p className="error">Failed to load: {error}</p>}
       {!loaded && !error && <p className="muted">Loading traces…</p>}
       {loaded && traces.length === 0 && !error && (
-        <p className="muted">No traces{focusLabel(service, rangeKey)}.</p>
+        <p className="muted">
+          {filtered ? "No traces match these filters." : firstRunHint("traces")}
+        </p>
       )}
       {traces.length > 0 && (
         <table>
           <thead>
             <tr>
-              <th className="sortable" onClick={() => onSort("service")}>Service{indicator("service")}</th>
-              <th className="sortable" onClick={() => onSort("root_name")}>Root span{indicator("root_name")}</th>
-              <th className="sortable" onClick={() => onSort("start_time")}>Started{indicator("start_time")}</th>
-              <th className="num sortable" onClick={() => onSort("duration_ms")}>Duration{indicator("duration_ms")}</th>
-              <th className="num sortable" onClick={() => onSort("span_count")}>Spans{indicator("span_count")}</th>
-              <th className="num sortable" onClick={() => onSort("error_count")}>Errors{indicator("error_count")}</th>
+              <SortHeader sort={sort} field="service" label="Service" />
+              <SortHeader sort={sort} field="root_name" label="Root span" />
+              <SortHeader sort={sort} field="start_time" label="Started" />
+              <SortHeader sort={sort} field="duration_ms" label="Duration" num />
+              <SortHeader sort={sort} field="span_count" label="Spans" num />
+              <SortHeader sort={sort} field="error_count" label="Errors" num />
             </tr>
           </thead>
           <tbody>
             {sorted.map((t) => (
-              <tr key={t.trace_id} className="clickable" onClick={() => onSelect(t.trace_id)}>
-                <td>{t.service ?? "—"}</td>
+              <tr key={t.trace_id} className="clickable">
+                <td>
+                  <Link to={to(t.trace_id)}>{t.service ?? "—"}</Link>
+                </td>
                 <td>{t.root_name ?? "—"}</td>
                 <td>{new Date(t.start_time).toLocaleString()}</td>
                 <td className="num">{fmtDuration(t.duration_ms)}</td>

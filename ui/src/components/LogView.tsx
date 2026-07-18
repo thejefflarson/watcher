@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { listLogs, type LogRow } from "../api";
-import { focusLabel } from "../focus";
+import { firstRunHint } from "../empty";
 import { useControls, rangeParams } from "../timerange";
 
 function sevClass(n: number | null): string {
@@ -81,7 +81,9 @@ export default function LogView() {
     ? "No logs recorded for this span."
     : traceFilter
       ? "No logs for this trace."
-      : `No logs${focusLabel(service, rangeKey)}.`;
+      : q || attr || service
+        ? "No logs match these filters."
+        : firstRunHint("logs");
 
   return (
     <div className="logs">
@@ -148,14 +150,11 @@ export default function LogView() {
               const open = expanded.has(l.id);
               return (
                 <Fragment key={l.id}>
-                  <tr className="clickable" onClick={() => toggle(l.id)}>
+                  <tr className="clickable">
                     <td className="mono">
                       <button
                         className="expander"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          toggle(l.id);
-                        }}
+                        onClick={() => toggle(l.id)}
                         title="Attributes"
                         aria-expanded={open}
                       >
@@ -171,12 +170,7 @@ export default function LogView() {
                     <td>{l.service ?? "—"}</td>
                     <td className="mono">
                       {l.trace_id ? (
-                        <Link
-                          className="xlink"
-                          to={`/traces/${l.trace_id}`}
-                          title={l.trace_id}
-                          onClick={(e) => e.stopPropagation()}
-                        >
+                        <Link className="xlink" to={`/traces/${l.trace_id}`} title={l.trace_id}>
                           {l.trace_id.slice(0, 8)}
                         </Link>
                       ) : (

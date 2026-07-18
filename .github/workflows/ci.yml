@@ -76,6 +76,10 @@ jobs:
           cache: npm
           cache-dependency-path: ui/package-lock.json
       - run: npm ci
+      # Accessibility floor (JEF-431): eslint-plugin-jsx-a11y gates keyboard-
+      # operable rows, labeled charts, and no silent-live tables from regressing.
+      - run: npm run lint
+      - run: npm test
       - run: npm run build
 
   # One image now: the server builds the UI and embeds it (rust-embed), so there

@@ -40,11 +40,13 @@ function Chart({
   unit,
   threshold,
   firingFrom,
+  desc,
 }: {
   series: Series[];
   unit?: string | null;
   threshold?: number | null;
   firingFrom?: number | null;
+  desc: string;
 }) {
   const w = 720;
   const h = 240;
@@ -89,9 +91,13 @@ function Chart({
       minute: "2-digit",
     });
 
+  // A one-line summary of what the chart shows, for screen readers — the shape
+  // is decorative, the range is the datum: "payments p95 latency, 6h, 12–340 ms".
+  const ariaLabel = `${desc}, ${formatValue(geom.lo, unit)}–${formatValue(geom.hi, unit)}`;
+
   return (
     <div>
-      <svg className="chart" width={w} height={h} role="img">
+      <svg className="chart" width={w} height={h} role="img" aria-label={ariaLabel}>
         <line x1={pad.l} y1={pad.t} x2={pad.l} y2={h - pad.b} stroke="var(--rule)" />
         <line x1={pad.l} y1={h - pad.b} x2={w - pad.r} y2={h - pad.b} stroke="var(--rule)" />
         <text x={pad.l - 6} y={pad.t + 4} textAnchor="end" className="tick">
@@ -164,7 +170,7 @@ function Chart({
 
 // Heatmap of a histogram over time: x = time bucket, y = value bucket, ink
 // density = observation count (log-scaled so a few outliers stay visible).
-function Heatmap({ data }: { data: HistResponse }) {
+function Heatmap({ data, desc }: { data: HistResponse; desc: string }) {
   const { bounds, buckets, unit } = data;
   const rows = bounds.length + 1; // +Inf overflow row on top
   const w = 720;
@@ -187,7 +193,7 @@ function Heatmap({ data }: { data: HistResponse }) {
     new Date(s).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 
   return (
-    <svg className="chart" width={w} height={h} role="img">
+    <svg className="chart" width={w} height={h} role="img" aria-label={`${desc} density heatmap`}>
       {/* y ticks: a few bucket bounds */}
       {Array.from({ length: rows }).map((_, r) => {
         const y = pad.t + (rows - 1 - r) * cellH;
@@ -236,12 +242,14 @@ function FacetView({
   unit,
   threshold,
   firingFrom,
+  rangeLabel,
 }: {
   name: string;
   hours: number;
   unit?: string | null;
   threshold?: number | null;
   firingFrom?: number | null;
+  rangeLabel: string;
 }) {
   const [data, setData] = useState<{
     series: Series[];
@@ -287,6 +295,7 @@ function FacetView({
         unit={data.rated ? `${unit ?? ""}/s` : unit}
         threshold={threshold}
         firingFrom={firingFrom}
+        desc={`${name} ${data.rated ? "per-second rate" : "value"}, ${rangeLabel}`}
       />
     </div>
   );
@@ -298,11 +307,13 @@ function HistogramView({
   hours,
   threshold,
   firingFrom,
+  rangeLabel,
 }: {
   name: string;
   hours: number;
   threshold?: number | null;
   firingFrom?: number | null;
+  rangeLabel: string;
 }) {
   const [data, setData] = useState<HistResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -338,9 +349,10 @@ function HistogramView({
         unit={data.unit}
         threshold={threshold}
         firingFrom={firingFrom}
+        desc={`${name} percentiles (p50/p95/p99), ${rangeLabel}`}
       />
       <p className="muted small heatmap-label">density heatmap</p>
-      <Heatmap data={data} />
+      <Heatmap data={data} desc={`${name}, ${rangeLabel}`} />
     </div>
   );
 }
@@ -368,6 +380,7 @@ export default function MetricChart({
   const firingRaw = params.get("firing_from");
   const firingFrom =
     firingRaw && !Number.isNaN(Date.parse(firingRaw)) ? Date.parse(firingRaw) : null;
+  const rangeLabel = RANGES.find((r) => r.hours === hours)?.label ?? `${hours}h`;
 
   return (
     <div className="metric-chart">
@@ -395,6 +408,7 @@ export default function MetricChart({
           hours={hours}
           threshold={threshold}
           firingFrom={firingFrom}
+          rangeLabel={rangeLabel}
         />
       ) : (
         <FacetView
@@ -403,6 +417,7 @@ export default function MetricChart({
           unit={unit}
           threshold={threshold}
           firingFrom={firingFrom}
+          rangeLabel={rangeLabel}
         />
       )}
     </div>

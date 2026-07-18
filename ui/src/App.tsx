@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   NavLink,
   Navigate,
@@ -54,14 +54,10 @@ function useFiringCount(): number {
 // Route wrappers translate component callbacks into URL navigation, so the
 // view (selected trace, drilled-in metric) lives in the address bar.
 function TracesRoute() {
-  const navigate = useNavigate();
   const { service } = useControls();
   // Keep the focus in the URL through the drill-in so the header + tabs still show it.
-  return (
-    <TraceList
-      onSelect={(id) => navigate(`/traces/${id}${serviceSearch(service)}`)}
-    />
-  );
+  // A real <Link> per row (primary cell) makes rows keyboard-operable + open-in-new-tab.
+  return <TraceList to={(id) => `/traces/${id}${serviceSearch(service)}`} />;
 }
 
 function TraceRoute() {
@@ -77,16 +73,15 @@ function TraceRoute() {
 }
 
 function MetricsRoute() {
-  const navigate = useNavigate();
   return (
     <MetricList
-      onSelect={(m) => {
+      to={(m) => {
         const qs = new URLSearchParams();
         if (m.service) qs.set("service", m.service);
         if (m.unit) qs.set("unit", m.unit);
         if (m.kind) qs.set("kind", m.kind);
         const s = qs.toString();
-        navigate(`/metrics/${encodeURIComponent(m.name)}${s ? `?${s}` : ""}`);
+        return `/metrics/${encodeURIComponent(m.name)}${s ? `?${s}` : ""}`;
       }}
     />
   );
@@ -143,6 +138,32 @@ function ServiceFocus() {
   );
 }
 
+// The single polite live region for the whole app: a muted timestamp by the ↻
+// that announces refreshes ("Updated 14:03") and focus changes ("Showing
+// payments"). Tables must NOT be live regions — that would spam every row on a
+// poll; this one line carries the news instead.
+function RefreshStatus() {
+  const { tick, service } = useControls();
+  const [msg, setMsg] = useState("");
+  const prevService = useRef(service);
+
+  useEffect(() => {
+    if (service !== prevService.current) {
+      prevService.current = service;
+      setMsg(service ? `Showing ${service}` : "Showing all services");
+    } else {
+      const now = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      setMsg(`Updated ${now}`);
+    }
+  }, [tick, service]);
+
+  return (
+    <span className="refresh-status muted small" role="status" aria-live="polite">
+      {msg}
+    </span>
+  );
+}
+
 function Controls() {
   const { rangeKey, setRangeKey, intervalKey, setIntervalKey, refresh } = useControls();
   return (
@@ -173,6 +194,7 @@ function Controls() {
       <button className="refresh" onClick={refresh} title="Refresh now">
         ↻
       </button>
+      <RefreshStatus />
     </div>
   );
 }
