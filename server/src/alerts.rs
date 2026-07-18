@@ -28,6 +28,13 @@ pub struct AlertRule {
     pub threshold: f64,
     pub agg: String,
     pub window_secs: i32,
+    /// JSONB the series MUST contain (`attributes @> match_attrs`); NULL = no filter.
+    pub match_attrs: Option<serde_json::Value>,
+    /// JSONB the series must NOT contain (`NOT attributes @> exclude_attrs`); NULL = no filter.
+    pub exclude_attrs: Option<serde_json::Value>,
+    /// Evaluate a per-second rate rather than the raw level. NULL = auto (on for
+    /// monotonic sums), resolved at eval time; Some(_) = explicit override.
+    pub rate: Option<bool>,
 }
 
 fn default_agg() -> String {
@@ -56,6 +63,28 @@ pub struct RuleConfig {
     pub window_secs: i32,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Attribute key=value pairs the series MUST have. Empty/absent = no filter.
+    #[serde(default, rename = "match")]
+    pub match_attrs: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Attribute key=value pairs the series must NOT have. Empty/absent = no filter.
+    #[serde(default)]
+    pub exclude: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Difference a cumulative counter into a per-second rate before aggregating.
+    /// Absent = auto (on for monotonic sums); explicit true/false overrides.
+    #[serde(default)]
+    pub rate: Option<bool>,
+}
+
+/// A non-empty JSONB attribute predicate, or None. Mirrors the empty-string
+/// handling for `service`: an empty object means "no filter", not "match nothing",
+/// so it's normalized to NULL rather than written as `{}` (which `@>` treats as
+/// always-true and would make an `exclude` suppress every series).
+fn attr_predicate(
+    map: &Option<serde_json::Map<String, serde_json::Value>>,
+) -> Option<serde_json::Value> {
+    map.as_ref()
+        .filter(|m| !m.is_empty())
+        .map(|m| serde_json::Value::Object(m.clone()))
 }
 
 /// Read declared rules from a JSON file (a list of [`RuleConfig`]). Missing or
@@ -99,18 +128,24 @@ pub async fn reconcile(pool: &PgPool, rules: &[RuleConfig]) -> anyhow::Result<()
     for r in rules {
         let service = r.service.as_deref().filter(|s| !s.is_empty());
         let window_secs = r.window_secs.clamp(10, 86_400);
+        let match_attrs = attr_predicate(&r.match_attrs);
+        let exclude_attrs = attr_predicate(&r.exclude);
         sqlx::query(
             "INSERT INTO alert_rules
-               (name, metric, service, comparator, threshold, agg, window_secs, enabled)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               (name, metric, service, comparator, threshold, agg, window_secs, enabled,
+                match_attrs, exclude_attrs, rate)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
              ON CONFLICT (name) DO UPDATE SET
-               metric      = EXCLUDED.metric,
-               service     = EXCLUDED.service,
-               comparator  = EXCLUDED.comparator,
-               threshold   = EXCLUDED.threshold,
-               agg         = EXCLUDED.agg,
-               window_secs = EXCLUDED.window_secs,
-               enabled     = EXCLUDED.enabled",
+               metric        = EXCLUDED.metric,
+               service       = EXCLUDED.service,
+               comparator    = EXCLUDED.comparator,
+               threshold     = EXCLUDED.threshold,
+               agg           = EXCLUDED.agg,
+               window_secs   = EXCLUDED.window_secs,
+               enabled       = EXCLUDED.enabled,
+               match_attrs   = EXCLUDED.match_attrs,
+               exclude_attrs = EXCLUDED.exclude_attrs,
+               rate          = EXCLUDED.rate",
         )
         .bind(&r.name)
         .bind(&r.metric)
@@ -120,6 +155,9 @@ pub async fn reconcile(pool: &PgPool, rules: &[RuleConfig]) -> anyhow::Result<()
         .bind(&r.agg)
         .bind(window_secs)
         .bind(r.enabled)
+        .bind(&match_attrs)
+        .bind(&exclude_attrs)
+        .bind(r.rate)
         .execute(&mut *tx)
         .await?;
     }
@@ -236,6 +274,69 @@ fn agg_expr(agg: &str) -> &'static str {
     }
 }
 
+/// Build the value-source-plus-aggregate for one evaluation pass. Parameters are
+/// `$1` metric, `$2` service, `$3` window_secs, `$4` match_attrs, `$5` exclude_attrs
+/// — every scalar/JSONB operand is bound; only the enum-whitelisted `agg_expr` is
+/// interpolated, so the result is injection-safe (asserted at the call site).
+///
+/// When `rate` is set the cumulative counter level is differenced per series into
+/// a per-second rate *before* aggregating, reset-safe like `/api/metrics/facet`:
+/// a level that drops (counter reset) yields 0 for that interval, never a spike.
+fn eval_sql(agg: &str, rate: bool) -> String {
+    // Residual JSONB predicates ride on top of the (name, time) index narrowing;
+    // a NULL operand disables its clause so pre-JEF-426 rules are unaffected.
+    let filtered = "SELECT time, service, attributes, value
+             FROM metrics
+             WHERE name = $1
+               AND ($2::text IS NULL OR service = $2)
+               AND ($4::jsonb IS NULL OR attributes @> $4)
+               AND ($5::jsonb IS NULL OR NOT (attributes @> $5))
+               AND value IS NOT NULL
+               AND time >= now() - make_interval(secs => $3)";
+    if rate {
+        format!(
+            "WITH pts AS ({filtered}),
+             rated AS (
+                 SELECT time,
+                        -- reset (level drops) or non-positive dt → 0, not a spike.
+                        CASE WHEN dt > 0 AND dv >= 0 THEN dv / dt ELSE 0 END AS value
+                 FROM (
+                     SELECT time,
+                            value - lag(value) OVER w                     AS dv,
+                            extract(epoch FROM time - lag(time) OVER w)   AS dt
+                     FROM pts
+                     WINDOW w AS (PARTITION BY service, attributes ORDER BY time)
+                 ) d
+                 WHERE dt IS NOT NULL   -- each series' first point has no predecessor
+             )
+             SELECT {} FROM rated",
+            agg_expr(agg)
+        )
+    } else {
+        format!("WITH pts AS ({filtered}) SELECT {} FROM pts", agg_expr(agg))
+    }
+}
+
+/// Resolve whether to rate-difference this rule: an explicit `rate` wins; otherwise
+/// auto-detect — a monotonic Sum (counter) is rated, everything else is not. Kind
+/// and monotonicity are constant per metric name, so the latest stored point decides.
+async fn resolve_rate(pool: &PgPool, rule: &AlertRule) -> anyhow::Result<bool> {
+    if let Some(explicit) = rule.rate {
+        return Ok(explicit);
+    }
+    let monotonic: Option<bool> = sqlx::query_scalar(
+        "SELECT kind = 'sum' AND coalesce(is_monotonic, false)
+         FROM metrics
+         WHERE name = $1 AND value IS NOT NULL
+         ORDER BY time DESC
+         LIMIT 1",
+    )
+    .bind(&rule.metric)
+    .fetch_optional(pool)
+    .await?;
+    Ok(monotonic.unwrap_or(false))
+}
+
 /// Whether `value` breaches the rule. No data in the window (`None`) never fires.
 fn breached(value: Option<f64>, comparator: &str, threshold: f64) -> bool {
     match (value, comparator) {
@@ -287,27 +388,25 @@ async fn evaluate(
     client: &reqwest::Client,
 ) -> anyhow::Result<()> {
     let rules = sqlx::query_as::<_, AlertRule>(
-        "SELECT id, name, metric, service, comparator, threshold, agg, window_secs
+        "SELECT id, name, metric, service, comparator, threshold, agg, window_secs,
+                match_attrs, exclude_attrs, rate
          FROM alert_rules WHERE enabled = TRUE",
     )
     .fetch_all(pool)
     .await?;
 
     for rule in rules {
-        let sql = format!(
-            "SELECT {} FROM metrics
-             WHERE name = $1 AND ($2::text IS NULL OR service = $2)
-               AND value IS NOT NULL
-               AND time >= now() - make_interval(secs => $3)",
-            agg_expr(&rule.agg)
-        );
+        let rate = resolve_rate(pool, &rule).await?;
+        let sql = eval_sql(&rule.agg, rate);
         // AssertSqlSafe: sqlx 0.9 requires dynamic SQL to be audited. Only the
-        // enum-whitelisted agg_expr() is interpolated (metric/service/window are
-        // bound), so this is injection-safe.
+        // enum-whitelisted agg_expr() is interpolated; metric/service/window and
+        // the match/exclude JSONB predicates are all bound, so it's injection-safe.
         let value: Option<f64> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
             .bind(&rule.metric)
             .bind(&rule.service)
             .bind(rule.window_secs as f64)
+            .bind(&rule.match_attrs)
+            .bind(&rule.exclude_attrs)
             .fetch_one(pool)
             .await?;
 
@@ -414,7 +513,9 @@ async fn notify(
 
 #[cfg(test)]
 mod tests {
-    use super::{agg_expr, breached, email_body, email_subject, validate, AlertRule, RuleConfig};
+    use super::{
+        agg_expr, breached, email_body, email_subject, eval_sql, validate, AlertRule, RuleConfig,
+    };
 
     #[test]
     fn config_parses_with_defaults() {
@@ -455,6 +556,9 @@ mod tests {
             agg: agg.into(),
             window_secs: 300,
             enabled: true,
+            match_attrs: None,
+            exclude: None,
+            rate: None,
         }
     }
 
@@ -476,6 +580,9 @@ mod tests {
             threshold: 80.0,
             agg: "max".into(),
             window_secs: 300,
+            match_attrs: None,
+            exclude_attrs: None,
+            rate: None,
         }
     }
 
@@ -541,5 +648,66 @@ mod tests {
         assert!(!breached(None, "lt", 5.0));
         // Unknown comparator never fires.
         assert!(!breached(Some(10.0), "eq", 5.0));
+    }
+
+    #[test]
+    fn config_parses_match_exclude_rate() {
+        let rules: Vec<RuleConfig> = serde_json::from_str(
+            r#"[{"name":"r","metric":"m","comparator":"gt","threshold":1,
+                 "match":{"owner":"Deployment"},"exclude":{"owner":"Job"},"rate":true}]"#,
+        )
+        .unwrap();
+        let r = &rules[0];
+        assert_eq!(r.match_attrs.as_ref().unwrap()["owner"], "Deployment");
+        assert_eq!(r.exclude.as_ref().unwrap()["owner"], "Job");
+        assert_eq!(r.rate, Some(true));
+    }
+
+    #[test]
+    fn config_defaults_new_fields_to_none() {
+        // A pre-JEF-426 rule (none of the new keys) parses with them all absent.
+        let r = &serde_json::from_str::<Vec<RuleConfig>>(
+            r#"[{"name":"r","metric":"m","comparator":"gt","threshold":1}]"#,
+        )
+        .unwrap()[0];
+        assert!(r.match_attrs.is_none());
+        assert!(r.exclude.is_none());
+        assert!(r.rate.is_none());
+    }
+
+    #[test]
+    fn attr_predicate_normalizes_empty_to_none() {
+        use super::attr_predicate;
+        // Absent and empty both mean "no filter" — never a `{}` that `@>` treats as
+        // always-true (which would make an `exclude` suppress every series).
+        assert!(attr_predicate(&None).is_none());
+        assert!(attr_predicate(&Some(serde_json::Map::new())).is_none());
+        let mut m = serde_json::Map::new();
+        m.insert("pod".into(), "a".into());
+        assert_eq!(attr_predicate(&Some(m)).unwrap()["pod"], "a");
+    }
+
+    #[test]
+    fn eval_sql_plain_binds_predicates_and_window() {
+        let sql = eval_sql("avg", false);
+        // match/exclude ride as bound JSONB operands, guarded so a NULL disables them.
+        assert!(sql.contains("$4::jsonb IS NULL OR attributes @> $4"));
+        assert!(sql.contains("$5::jsonb IS NULL OR NOT (attributes @> $5)"));
+        assert!(sql.contains("make_interval(secs => $3)"));
+        assert!(sql.contains("avg(value)"));
+        // No rate machinery in the plain path.
+        assert!(!sql.contains("lag(value)"));
+    }
+
+    #[test]
+    fn eval_sql_rate_differences_reset_safe() {
+        let sql = eval_sql("max", true);
+        // Per-series differencing ordered by time, per-second, reset → 0 not a spike.
+        assert!(sql.contains("value - lag(value) OVER w"));
+        assert!(sql.contains("PARTITION BY service, attributes ORDER BY time"));
+        assert!(sql.contains("CASE WHEN dt > 0 AND dv >= 0 THEN dv / dt ELSE 0 END"));
+        // The predicate filters still apply before differencing.
+        assert!(sql.contains("attributes @> $4"));
+        assert!(sql.contains("max(value)"));
     }
 }
