@@ -21,6 +21,7 @@ use prost::Message;
 use serde_json::json;
 use sqlx::PgPool;
 use std::io::Read;
+use std::sync::atomic::Ordering;
 
 // ---------------------------------------------------------------------------
 // HTTP entrypoints
@@ -74,10 +75,13 @@ pub async fn ingest_traces(
             let n = store_traces(&pool, req).await;
             (StatusCode::OK, format!("ingested {n} spans"))
         }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            format!("protobuf decode error: {e}"),
-        ),
+        Err(e) => {
+            crate::selfmon::DROP_DECODE.fetch_add(1, Ordering::Relaxed);
+            (
+                StatusCode::BAD_REQUEST,
+                format!("protobuf decode error: {e}"),
+            )
+        }
     }
 }
 
@@ -98,10 +102,13 @@ pub async fn ingest_logs(
             let n = store_logs(&pool, req).await;
             (StatusCode::OK, format!("ingested {n} logs"))
         }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            format!("protobuf decode error: {e}"),
-        ),
+        Err(e) => {
+            crate::selfmon::DROP_DECODE.fetch_add(1, Ordering::Relaxed);
+            (
+                StatusCode::BAD_REQUEST,
+                format!("protobuf decode error: {e}"),
+            )
+        }
     }
 }
 
@@ -120,10 +127,13 @@ pub async fn ingest_metrics(
             let n = store_metrics(&pool, req).await;
             (StatusCode::OK, format!("ingested {n} metric points"))
         }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            format!("protobuf decode error: {e}"),
-        ),
+        Err(e) => {
+            crate::selfmon::DROP_DECODE.fetch_add(1, Ordering::Relaxed);
+            (
+                StatusCode::BAD_REQUEST,
+                format!("protobuf decode error: {e}"),
+            )
+        }
     }
 }
 
@@ -140,11 +150,15 @@ pub async fn store_traces(pool: &PgPool, req: ExportTraceServiceRequest) -> u64 
             for span in &ss.spans {
                 match insert_span(pool, service.as_deref(), rattrs, span).await {
                     Ok(()) => count += 1,
-                    Err(e) => tracing::warn!("insert span failed: {e}"),
+                    Err(e) => {
+                        tracing::warn!("insert span failed: {e}");
+                        crate::selfmon::DROP_INSERT.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
     }
+    crate::selfmon::SPANS_INGESTED.fetch_add(count, Ordering::Relaxed);
     count
 }
 
@@ -159,11 +173,15 @@ pub async fn store_logs(pool: &PgPool, req: ExportLogsServiceRequest) -> u64 {
             for rec in &sl.log_records {
                 match insert_log(pool, service.as_deref(), rattrs, rec).await {
                     Ok(()) => count += 1,
-                    Err(e) => tracing::warn!("insert log failed: {e}"),
+                    Err(e) => {
+                        tracing::warn!("insert log failed: {e}");
+                        crate::selfmon::DROP_INSERT.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
     }
+    crate::selfmon::LOGS_INGESTED.fetch_add(count, Ordering::Relaxed);
     count
 }
 
@@ -195,11 +213,14 @@ pub async fn store_metrics(pool: &PgPool, req: ExportMetricsServiceRequest) -> u
         tracing::warn!(
             "metrics request hit the {MAX_POINTS_PER_REQUEST}-point cap; extra points dropped"
         );
+        crate::selfmon::DROP_CAP.fetch_add(1, Ordering::Relaxed);
     }
     // The two flushes hit disjoint rollup rows (different kinds), so run them
     // concurrently rather than one after the other.
     let (n, h) = tokio::join!(flush_numbers(pool, nums), flush_histograms(pool, hists));
-    n + h
+    let stored = n + h;
+    crate::selfmon::METRIC_POINTS_INGESTED.fetch_add(stored, Ordering::Relaxed);
+    stored
 }
 
 // ---------------------------------------------------------------------------
@@ -480,6 +501,7 @@ async fn flush_numbers(pool: &PgPool, rows: Vec<NumRow>) -> u64 {
         Ok(_) => n as u64,
         Err(e) => {
             tracing::warn!("batch insert metrics failed: {e}");
+            crate::selfmon::DROP_INSERT.fetch_add(n as u64, Ordering::Relaxed);
             0
         }
     }
@@ -562,6 +584,7 @@ async fn flush_histograms(pool: &PgPool, rows: Vec<HistRow>) -> u64 {
         Ok(_) => n as u64,
         Err(e) => {
             tracing::warn!("batch insert histograms failed: {e}");
+            crate::selfmon::DROP_INSERT.fetch_add(n as u64, Ordering::Relaxed);
             0
         }
     }

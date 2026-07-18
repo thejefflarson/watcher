@@ -3,6 +3,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
+    response::IntoResponse,
     Json,
 };
 use chrono::{DateTime, Utc};
@@ -14,6 +15,26 @@ type ApiError = (StatusCode, String);
 
 fn internal(e: impl std::fmt::Display) -> ApiError {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+}
+
+/// GET /healthz — deep readiness probe: 200 only when the DB is reachable AND
+/// retention isn't stalled past the configured age; otherwise 503. This gates
+/// *readiness* (traffic), not liveness — a stalled retention or a DB outage
+/// should stop new traffic and page, not kill the process (JEF-425).
+pub async fn healthz(State(pool): State<PgPool>) -> impl IntoResponse {
+    let h = crate::selfmon::health(&pool).await;
+    let status = if h.healthy() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let body = Json(serde_json::json!({
+        "status": if h.healthy() { "ok" } else { "unhealthy" },
+        "db": h.db_ok,
+        "retention_stalled": h.retention_stalled,
+        "retention_last_success_age_secs": h.retention_last_success_age_secs,
+    }));
+    (status, body)
 }
 
 #[derive(Deserialize)]

@@ -4,7 +4,7 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
-use watcher_server::{alerts, app, db, grpc, retention};
+use watcher_server::{alerts, app, db, grpc, retention, selfmon};
 
 /// Self-instrumentation: export watcher's own traces over OTLP, tagged
 /// `service.name=watcher` by default, so it shows up in its own UI. Exports to
@@ -12,10 +12,7 @@ use watcher_server::{alerts, app, db, grpc, retention};
 /// otherwise; opt out with `WATCHER_SELF_TELEMETRY=0`. Only `/api` requests are
 /// spanned (not `/v1`), so exporting to self can't loop.
 fn init_telemetry() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
-    let off = std::env::var("WATCHER_SELF_TELEMETRY")
-        .map(|v| matches!(v.as_str(), "0" | "false" | "off"))
-        .unwrap_or(false);
-    if off {
+    if !selfmon::enabled() {
         return None;
     }
     // W3C trace-context propagation, so incoming `traceparent` headers are
@@ -49,6 +46,9 @@ fn init_telemetry() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Capture boot time up front so retention-stall detection measures uptime
+    // from here, not from the first /healthz hit.
+    selfmon::mark_started();
     let telemetry = init_telemetry();
     let otel_layer = telemetry
         .as_ref()
@@ -133,6 +133,11 @@ async fn main() -> anyhow::Result<()> {
         alert_email,
         alert_interval_secs,
     ));
+    // Self-monitoring: emit watcher's own ops gauges/counters over the same OTLP
+    // metrics path it ingests, so its health rides its own UI and is alertable.
+    if selfmon::enabled() {
+        tokio::spawn(selfmon::run(pool.clone()));
+    }
 
     let http = {
         let pool = pool.clone();

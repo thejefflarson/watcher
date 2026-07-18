@@ -4,6 +4,7 @@ pub mod db;
 pub mod grpc;
 pub mod otlp;
 pub mod retention;
+pub mod selfmon;
 
 use axum::{
     body::Body,
@@ -146,15 +147,11 @@ pub fn app(pool: PgPool) -> Router {
         .layer(tower_http::trace::TraceLayer::new_for_http().make_span_with(otel_request_span));
 
     Router::new()
-        .route("/healthz", get(healthz))
+        .route("/healthz", get(api::healthz))
         .merge(ingest)
         .merge(api)
         // Anything not an API/ingest/health route is the embedded UI (SPA).
         .fallback(ui_handler)
         .layer(CorsLayer::permissive())
         .with_state(pool)
-}
-
-async fn healthz() -> &'static str {
-    "ok"
 }
