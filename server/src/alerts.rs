@@ -35,6 +35,9 @@ pub struct AlertRule {
     /// Evaluate a per-second rate rather than the raw level. NULL = auto (on for
     /// monotonic sums), resolved at eval time; Some(_) = explicit override.
     pub rate: Option<bool>,
+    /// Require the breach to hold continuously for this many seconds before the
+    /// rule fires (`for: 5m`). NULL/0 = fire on the first breach.
+    pub for_secs: Option<i32>,
 }
 
 fn default_agg() -> String {
@@ -73,7 +76,16 @@ pub struct RuleConfig {
     /// Absent = auto (on for monotonic sums); explicit true/false overrides.
     #[serde(default)]
     pub rate: Option<bool>,
+    /// Require the condition to hold continuously for this many seconds before the
+    /// rule fires (`for: 5m`). Absent/0 = fire on the first breach.
+    #[serde(default)]
+    pub for_secs: Option<i32>,
 }
+
+/// Upper bound on `for_secs`. A rule's dwell window must sit well under the raw-
+/// metric retention floor (6h default, ADR 0007) so a full window of points is
+/// still queryable when the rule matures; 3h is half that, comfortably clear.
+const MAX_FOR_SECS: i32 = 10_800;
 
 /// A non-empty JSONB attribute predicate, or None. Mirrors the empty-string
 /// handling for `service`: an empty object means "no filter", not "match nothing",
@@ -112,6 +124,15 @@ fn validate(r: &RuleConfig) -> anyhow::Result<()> {
             r.name
         );
     }
+    if let Some(f) = r.for_secs {
+        if !(1..=MAX_FOR_SECS).contains(&f) {
+            anyhow::bail!(
+                "alert rule '{}': for_secs must be between 1 and {MAX_FOR_SECS} \
+                 (a dwell window well under raw-metric retention)",
+                r.name
+            );
+        }
+    }
     Ok(())
 }
 
@@ -133,8 +154,8 @@ pub async fn reconcile(pool: &PgPool, rules: &[RuleConfig]) -> anyhow::Result<()
         sqlx::query(
             "INSERT INTO alert_rules
                (name, metric, service, comparator, threshold, agg, window_secs, enabled,
-                match_attrs, exclude_attrs, rate)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                match_attrs, exclude_attrs, rate, for_secs)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
              ON CONFLICT (name) DO UPDATE SET
                metric        = EXCLUDED.metric,
                service       = EXCLUDED.service,
@@ -145,7 +166,8 @@ pub async fn reconcile(pool: &PgPool, rules: &[RuleConfig]) -> anyhow::Result<()
                enabled       = EXCLUDED.enabled,
                match_attrs   = EXCLUDED.match_attrs,
                exclude_attrs = EXCLUDED.exclude_attrs,
-               rate          = EXCLUDED.rate",
+               rate          = EXCLUDED.rate,
+               for_secs      = EXCLUDED.for_secs",
         )
         .bind(&r.name)
         .bind(&r.metric)
@@ -158,6 +180,7 @@ pub async fn reconcile(pool: &PgPool, rules: &[RuleConfig]) -> anyhow::Result<()
         .bind(&match_attrs)
         .bind(&exclude_attrs)
         .bind(r.rate)
+        .bind(r.for_secs)
         .execute(&mut *tx)
         .await?;
     }
@@ -389,7 +412,7 @@ async fn evaluate(
 ) -> anyhow::Result<()> {
     let rules = sqlx::query_as::<_, AlertRule>(
         "SELECT id, name, metric, service, comparator, threshold, agg, window_secs,
-                match_attrs, exclude_attrs, rate
+                match_attrs, exclude_attrs, rate, for_secs
          FROM alert_rules WHERE enabled = TRUE",
     )
     .fetch_all(pool)
@@ -411,40 +434,81 @@ async fn evaluate(
             .await?;
 
         let breached = breached(value, &rule.comparator, rule.threshold);
+        // NULL/0 for_secs = fire on first breach; otherwise the breach must hold
+        // continuously for this long (a "pending" event) before the rule pages.
+        let for_secs = rule.for_secs.unwrap_or(0).max(0);
 
-        let open: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM alert_events WHERE rule_id = $1 AND resolved_at IS NULL",
+        // The single open (unresolved) event for this rule, if any, with whether it
+        // has already activated (fired) and whether it has now dwelled past for_secs.
+        // Reuses the partial unique index — at most one open row exists per rule.
+        let open: Option<(i64, bool, bool)> = sqlx::query_as(
+            "SELECT id,
+                    active_at IS NOT NULL,
+                    now() - fired_at >= make_interval(secs => $2)
+             FROM alert_events WHERE rule_id = $1 AND resolved_at IS NULL",
         )
         .bind(rule.id)
+        .bind(for_secs as f64)
         .fetch_optional(pool)
         .await?;
 
         match (breached, open) {
+            // First breach: open an event. With no dwell window it activates (fires)
+            // immediately; with a `for` window it stays pending until it matures.
             (true, None) => {
-                sqlx::query("INSERT INTO alert_events (rule_id, value) VALUES ($1, $2)")
-                    .bind(rule.id)
+                let active = for_secs == 0;
+                sqlx::query(
+                    "INSERT INTO alert_events (rule_id, value, active_at)
+                     VALUES ($1, $2, CASE WHEN $3 THEN now() ELSE NULL END)",
+                )
+                .bind(rule.id)
+                .bind(value)
+                .bind(active)
+                .execute(pool)
+                .await?;
+                if active {
+                    fire(client, webhook, mailer, &rule, value).await;
+                }
+            }
+            // Still breaching with an open event. A pending event that has now held
+            // for the full window activates and fires; an already-firing event is
+            // left untouched (no re-notify), and a still-pending one keeps waiting.
+            (true, Some((id, active, matured))) => {
+                if !active && matured {
+                    sqlx::query(
+                        "UPDATE alert_events SET active_at = now(), value = $2 WHERE id = $1",
+                    )
+                    .bind(id)
                     .bind(value)
                     .execute(pool)
                     .await?;
-                tracing::warn!(
-                    "alert '{}' firing: {} {} {} (value {:?})",
-                    rule.name,
-                    rule.metric,
-                    rule.comparator,
-                    rule.threshold,
-                    value
-                );
-                notify(client, webhook, mailer, &rule, "firing", value).await;
+                    fire(client, webhook, mailer, &rule, value).await;
+                }
             }
-            (false, Some(id)) => {
-                sqlx::query("UPDATE alert_events SET resolved_at = now() WHERE id = $1")
-                    .bind(id)
-                    .execute(pool)
-                    .await?;
-                tracing::info!("alert '{}' resolved (value {:?})", rule.name, value);
-                notify(client, webhook, mailer, &rule, "resolved", value).await;
+            // Recovered. A firing event resolves and notifies as before; a pending
+            // event that never matured is dropped silently (nothing ever fired), so
+            // a flap that clears before its window pages no one.
+            (false, Some((id, active, _))) => {
+                if active {
+                    sqlx::query("UPDATE alert_events SET resolved_at = now() WHERE id = $1")
+                        .bind(id)
+                        .execute(pool)
+                        .await?;
+                    tracing::info!("alert '{}' resolved (value {:?})", rule.name, value);
+                    notify(client, webhook, mailer, &rule, "resolved", value).await;
+                } else {
+                    sqlx::query("DELETE FROM alert_events WHERE id = $1")
+                        .bind(id)
+                        .execute(pool)
+                        .await?;
+                    tracing::debug!(
+                        "alert '{}' pending breach cleared before firing (value {:?})",
+                        rule.name,
+                        value
+                    );
+                }
             }
-            _ => {}
+            (false, None) => {}
         }
     }
     Ok(())
@@ -462,6 +526,26 @@ impl opentelemetry::propagation::Injector for HeaderInjector<'_> {
             self.0.insert(name, val);
         }
     }
+}
+
+/// Log and notify a firing transition. Shared by the immediate (no-`for`) and the
+/// matured (`for`-window) activation paths so both emit an identical page.
+async fn fire(
+    client: &reqwest::Client,
+    webhook: Option<&str>,
+    mailer: Option<&Mailer>,
+    rule: &AlertRule,
+    value: Option<f64>,
+) {
+    tracing::warn!(
+        "alert '{}' firing: {} {} {} (value {:?})",
+        rule.name,
+        rule.metric,
+        rule.comparator,
+        rule.threshold,
+        value
+    );
+    notify(client, webhook, mailer, rule, "firing", value).await;
 }
 
 #[tracing::instrument(name = "alert.notify", skip_all, fields(rule = %rule.name, state))]
@@ -515,6 +599,7 @@ async fn notify(
 mod tests {
     use super::{
         agg_expr, breached, email_body, email_subject, eval_sql, validate, AlertRule, RuleConfig,
+        MAX_FOR_SECS,
     };
 
     #[test]
@@ -559,6 +644,7 @@ mod tests {
             match_attrs: None,
             exclude: None,
             rate: None,
+            for_secs: None,
         }
     }
 
@@ -568,6 +654,32 @@ mod tests {
         assert!(validate(&cfg("bad-cmp", "eq", "avg")).is_err());
         assert!(validate(&cfg("bad-agg", "gt", "median")).is_err());
         assert!(validate(&cfg("", "gt", "avg")).is_err()); // empty name
+    }
+
+    #[test]
+    fn validate_for_secs_range() {
+        let mut r = cfg("dwell", "gt", "avg");
+        r.for_secs = None;
+        assert!(validate(&r).is_ok()); // absent = single-breach, always fine
+        r.for_secs = Some(300);
+        assert!(validate(&r).is_ok());
+        r.for_secs = Some(0);
+        assert!(validate(&r).is_err()); // 0 is not a valid dwell — use absence instead
+        r.for_secs = Some(-1);
+        assert!(validate(&r).is_err());
+        r.for_secs = Some(MAX_FOR_SECS);
+        assert!(validate(&r).is_ok()); // the ceiling itself is allowed
+        r.for_secs = Some(MAX_FOR_SECS + 1);
+        assert!(validate(&r).is_err()); // must stay well under raw retention
+    }
+
+    #[test]
+    fn config_parses_for_secs() {
+        let r = &serde_json::from_str::<Vec<RuleConfig>>(
+            r#"[{"name":"r","metric":"m","comparator":"gt","threshold":1,"for_secs":300}]"#,
+        )
+        .unwrap()[0];
+        assert_eq!(r.for_secs, Some(300));
     }
 
     fn rule() -> AlertRule {
@@ -583,6 +695,7 @@ mod tests {
             match_attrs: None,
             exclude_attrs: None,
             rate: None,
+            for_secs: None,
         }
     }
 
@@ -673,6 +786,7 @@ mod tests {
         assert!(r.match_attrs.is_none());
         assert!(r.exclude.is_none());
         assert!(r.rate.is_none());
+        assert!(r.for_secs.is_none());
     }
 
     #[test]
