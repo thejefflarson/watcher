@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   getMetricFacet,
   getMetricHistogram,
@@ -32,7 +33,19 @@ interface Series {
 }
 
 // A small multi-line chart drawn by hand — hairline axes, ink for the lines.
-function Chart({ series, unit }: { series: Series[]; unit?: string | null }) {
+// `threshold` (an alert rule's bound) is drawn as a dashed reference line and
+// `firingFrom` (ms) shades the still-open firing window when deep-linked here.
+function Chart({
+  series,
+  unit,
+  threshold,
+  firingFrom,
+}: {
+  series: Series[];
+  unit?: string | null;
+  threshold?: number | null;
+  firingFrom?: number | null;
+}) {
   const w = 720;
   const h = 240;
   const pad = { l: 56, r: 12, t: 12, b: 24 };
@@ -41,8 +54,10 @@ function Chart({ series, unit }: { series: Series[]; unit?: string | null }) {
     const all = series.flatMap((s) => s.points).filter((p) => p.v !== null);
     if (all.length < 2) return null;
     const vals = all.map((p) => p.v as number);
-    const lo = Math.min(...vals, 0);
-    const hi = Math.max(...vals);
+    const hasThreshold = threshold != null && Number.isFinite(threshold);
+    // Fold the threshold into the value range so the reference line is on-canvas.
+    const lo = Math.min(...vals, 0, hasThreshold ? threshold : Infinity);
+    const hi = Math.max(...vals, hasThreshold ? threshold : -Infinity);
     const span = hi - lo || 1;
     const times = all.map((p) => new Date(p.t).getTime());
     const t0 = Math.min(...times);
@@ -57,8 +72,12 @@ function Chart({ series, unit }: { series: Series[]; unit?: string | null }) {
         .map((p) => `${x(new Date(p.t).getTime()).toFixed(1)},${y(p.v as number).toFixed(1)}`)
         .join(" "),
     }));
-    return { lo, hi, t0, t1, lines };
-  }, [series]);
+    const thresholdY = hasThreshold ? y(threshold) : null;
+    // Clamp the firing-window start to the plotted range (it may predate it).
+    const firingX =
+      firingFrom != null ? Math.max(pad.l, Math.min(x(firingFrom), w - pad.r)) : null;
+    return { lo, hi, t0, t1, lines, thresholdY, firingX };
+  }, [series, threshold, firingFrom]);
 
   if (!geom) return <p className="muted">Not enough data to plot.</p>;
 
@@ -87,6 +106,38 @@ function Chart({ series, unit }: { series: Series[]; unit?: string | null }) {
         <text x={w - pad.r} y={h - 6} textAnchor="end" className="tick">
           {fmtTime(geom.t1)}
         </text>
+        {geom.firingX != null && (
+          <rect
+            x={geom.firingX}
+            y={pad.t}
+            width={Math.max(0, w - pad.r - geom.firingX)}
+            height={h - pad.t - pad.b}
+            fill="var(--error)"
+            opacity={0.07}
+          />
+        )}
+        {geom.thresholdY != null && threshold != null && (
+          <g>
+            <line
+              x1={pad.l}
+              y1={geom.thresholdY}
+              x2={w - pad.r}
+              y2={geom.thresholdY}
+              stroke="var(--error)"
+              strokeWidth="1"
+              strokeDasharray="4 3"
+            />
+            <text
+              x={w - pad.r}
+              y={geom.thresholdY - 3}
+              textAnchor="end"
+              className="tick"
+              fill="var(--error)"
+            >
+              threshold {formatValue(threshold, unit)}
+            </text>
+          </g>
+        )}
         {geom.lines.map((l, i) => (
           <polyline
             key={l.label}
@@ -179,7 +230,19 @@ function Heatmap({ data }: { data: HistResponse }) {
 const MAX_LINES = 12;
 
 // Gauge/sum: one line per series. Sums (counters) arrive as per-second rates.
-function FacetView({ name, hours, unit }: { name: string; hours: number; unit?: string | null }) {
+function FacetView({
+  name,
+  hours,
+  unit,
+  threshold,
+  firingFrom,
+}: {
+  name: string;
+  hours: number;
+  unit?: string | null;
+  threshold?: number | null;
+  firingFrom?: number | null;
+}) {
   const [data, setData] = useState<{
     series: Series[];
     rated: boolean;
@@ -219,13 +282,28 @@ function FacetView({ name, hours, unit }: { name: string; hours: number; unit?: 
         {data.series.length > 1 ? ` · ${data.series.length} series` : ""}
         {data.truncated > 0 ? ` · +${data.truncated} more not shown` : ""}
       </p>
-      <Chart series={data.series} unit={data.rated ? `${unit ?? ""}/s` : unit} />
+      <Chart
+        series={data.series}
+        unit={data.rated ? `${unit ?? ""}/s` : unit}
+        threshold={threshold}
+        firingFrom={firingFrom}
+      />
     </div>
   );
 }
 
 // Histogram: heatmap of the distribution plus interpolated p50/p95/p99 lines.
-function HistogramView({ name, hours }: { name: string; hours: number }) {
+function HistogramView({
+  name,
+  hours,
+  threshold,
+  firingFrom,
+}: {
+  name: string;
+  hours: number;
+  threshold?: number | null;
+  firingFrom?: number | null;
+}) {
   const [data, setData] = useState<HistResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -255,7 +333,12 @@ function HistogramView({ name, hours }: { name: string; hours: number }) {
   return (
     <div>
       <p className="muted small">histogram — distribution &amp; percentiles</p>
-      <Chart series={pctSeries} unit={data.unit} />
+      <Chart
+        series={pctSeries}
+        unit={data.unit}
+        threshold={threshold}
+        firingFrom={firingFrom}
+      />
       <p className="muted small heatmap-label">density heatmap</p>
       <Heatmap data={data} />
     </div>
@@ -276,6 +359,15 @@ export default function MetricChart({
   onBack: () => void;
 }) {
   const [hours, setHours] = useState(6);
+  // Alert deep-link overlay — read straight from the URL so the /metrics route in
+  // App.tsx stays unchanged. Absent for ordinary metric navigation.
+  const [params] = useSearchParams();
+  const thresholdRaw = params.get("threshold");
+  const threshold =
+    thresholdRaw && Number.isFinite(Number(thresholdRaw)) ? Number(thresholdRaw) : null;
+  const firingRaw = params.get("firing_from");
+  const firingFrom =
+    firingRaw && !Number.isNaN(Date.parse(firingRaw)) ? Date.parse(firingRaw) : null;
 
   return (
     <div className="metric-chart">
@@ -298,9 +390,20 @@ export default function MetricChart({
         ))}
       </div>
       {kind === "histogram" ? (
-        <HistogramView name={name} hours={hours} />
+        <HistogramView
+          name={name}
+          hours={hours}
+          threshold={threshold}
+          firingFrom={firingFrom}
+        />
       ) : (
-        <FacetView name={name} hours={hours} unit={unit} />
+        <FacetView
+          name={name}
+          hours={hours}
+          unit={unit}
+          threshold={threshold}
+          firingFrom={firingFrom}
+        />
       )}
     </div>
   );

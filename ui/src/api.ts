@@ -213,6 +213,10 @@ export interface AlertRule {
   enabled: boolean;
   created_at: string;
   firing: boolean;
+  // The watched metric's kind/unit, joined server-side so a rule can deep-link to
+  // the right chart type (histogram vs. line). Null if the metric has no points yet.
+  kind: string | null;
+  unit: string | null;
 }
 
 export interface AlertEvent {
@@ -223,6 +227,8 @@ export interface AlertEvent {
   value: number | null;
   fired_at: string;
   resolved_at: string | null;
+  kind: string | null;
+  unit: string | null;
 }
 
 // Rules are declarative (managed in the chart values, reconciled on deploy), so

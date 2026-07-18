@@ -523,3 +523,43 @@ button.range.active {
   font-size: 0.9rem;
   padding: 0.2rem 0;
 }
+
+/* JEF-430 — alerts view: firing badge, clickable rules, breach strip. */
+
+/* Nav firing count: colored text (not a pill), per ADR 0009. */
+.firing-count {
+  color: var(--error);
+  font-variant-numeric: tabular-nums;
+}
+
+/* State column: disabled rules read muted italic; firing/ok reuse .sev-error/.muted. */
+.alerts td.disabled {
+  color: var(--muted);
+  font-style: italic;
+}
+
+/* Rules deep-link to their metric chart; hint it without boxes. */
+.alerts tr.rule-row {
+  cursor: pointer;
+}
+.alerts tr.rule-row:hover {
+  background: var(--hover);
+}
+
+/* Per-rule breach small-multiple: red ticks on a hairline baseline. */
+.breach-strip {
+  display: block;
+}
+
+/* Screen-reader-only text (e.g. "2 firing" behind the nav badge). */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
