@@ -16,7 +16,7 @@ import MetricChart from "./components/MetricChart";
 import ServiceMap from "./components/ServiceMap";
 import Services from "./components/Services";
 import Alerts from "./components/Alerts";
-import { listServices } from "./api";
+import { listAlerts, listServices } from "./api";
 import { useControls, rangeParams, RANGES, INTERVALS } from "./timerange";
 
 const TABS: { to: string; label: string }[] = [
@@ -32,6 +32,23 @@ const TABS: { to: string; label: string }[] = [
 // drill-in/back navigations so it survives without re-typing.
 function serviceSearch(service: string): string {
   return service ? `?service=${encodeURIComponent(service)}` : "";
+}
+
+// Count of currently-firing rules for the nav badge (disabled rules don't fire).
+// Refetched on every poll tick so the badge tracks the live alert state.
+function useFiringCount(): number {
+  const { tick } = useControls();
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    let active = true;
+    listAlerts()
+      .then((rs) => active && setCount(rs.filter((r) => r.firing && r.enabled).length))
+      .catch(() => active && setCount(0));
+    return () => {
+      active = false;
+    };
+  }, [tick]);
+  return count;
 }
 
 // Route wrappers translate component callbacks into URL navigation, so the
@@ -163,6 +180,7 @@ function Controls() {
 export default function App() {
   const { service } = useControls();
   const search = serviceSearch(service);
+  const firing = useFiringCount();
   return (
     <div className="app">
       <header>
@@ -176,6 +194,15 @@ export default function App() {
               className={({ isActive }) => (isActive ? "active" : "")}
             >
               {t.label}
+              {t.to === "/alerts" && firing > 0 && (
+                <>
+                  {" "}
+                  <span className="firing-count" aria-hidden="true">
+                    {firing}
+                  </span>
+                  <span className="visually-hidden">{firing} firing</span>
+                </>
+              )}
             </NavLink>
           ))}
         </nav>

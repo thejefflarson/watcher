@@ -510,13 +510,18 @@ async fn alert_rule_fires_and_reconciles() {
     let rules = rules.as_array().expect("array");
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0]["firing"], true);
+    // The watched metric's kind/unit are joined in so the UI can deep-link to the
+    // right chart type (gauge here — a line chart, not the histogram view).
+    assert_eq!(rules[0]["kind"], "gauge");
 
-    // The firing transition is recorded as an open event.
+    // The firing transition is recorded as an open event, carrying the same
+    // metric metadata so its history strip can deep-link too.
     let (_, events) = get_json(&router, "/api/alerts/events").await;
     let events = events.as_array().expect("array");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["value"], 0.9);
     assert!(events[0]["resolved_at"].is_null());
+    assert_eq!(events[0]["kind"], "gauge");
 
     // Reconciling an empty config prunes the rule (its events cascade) — the
     // declarative replacement for the old delete API.

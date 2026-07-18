@@ -976,20 +976,39 @@ pub struct AlertRuleView {
     created_at: DateTime<Utc>,
     /// True when the rule has an unresolved (open) event.
     firing: bool,
+    /// The watched metric's kind (gauge | sum | histogram) and unit, joined so the
+    /// UI can deep-link to the right chart type — a histogram alert must open the
+    /// histogram view, not a line chart. Null if the metric has no points yet.
+    kind: Option<String>,
+    unit: Option<String>,
 }
+
+// The `m.kind, m.unit` columns come from the LATERAL join below: the most-recent
+// kind/unit for the rule's metric (both constant per metric name), read from raw or
+// rollup since raw may be pruned past retention. The UI uses them to deep-link to
+// the correct chart type. Correlated on the `r`-aliased alert_rules row.
 
 /// GET /api/alerts — all rules with their current firing state.
 pub async fn list_alerts(State(pool): State<PgPool>) -> Result<Json<Vec<AlertRuleView>>, ApiError> {
     let rows = sqlx::query_as::<_, AlertRuleView>(
         "SELECT r.id, r.name, r.metric, r.service, r.comparator, r.threshold, r.agg,
                 r.window_secs, r.enabled, r.created_at,
-                (e.id IS NOT NULL) AS firing
+                (e.id IS NOT NULL) AS firing, m.kind, m.unit
          FROM alert_rules r
          -- Only an *activated* open event counts as firing: a pending event (a
          -- breach still dwelling toward its `for` window) has active_at NULL and
          -- must not surface as firing until it matures. See alerts.rs / ADR 0015.
          LEFT JOIN alert_events e
                 ON e.rule_id = r.id AND e.resolved_at IS NULL AND e.active_at IS NOT NULL
+         LEFT JOIN LATERAL (
+             SELECT kind, unit FROM (
+                 (SELECT kind, unit, time AS t FROM metrics
+                  WHERE name = r.metric ORDER BY time DESC LIMIT 1)
+                 UNION ALL
+                 (SELECT kind, unit, bucket AS t FROM metric_series_rollups
+                  WHERE name = r.metric ORDER BY bucket DESC LIMIT 1)
+             ) z ORDER BY t DESC LIMIT 1
+         ) m ON true
          ORDER BY r.created_at DESC",
     )
     .fetch_all(&pool)
@@ -1016,6 +1035,10 @@ pub struct AlertEventView {
     value: Option<f64>,
     fired_at: DateTime<Utc>,
     resolved_at: Option<DateTime<Utc>>,
+    /// Watched metric's kind/unit — same join as the rules view, so a deep-link
+    /// from an event history strip lands on the correct chart type.
+    kind: Option<String>,
+    unit: Option<String>,
 }
 
 /// GET /api/alerts/events — recent firing/resolved transitions, newest first.
@@ -1025,9 +1048,20 @@ pub async fn list_alert_events(
 ) -> Result<Json<Vec<AlertEventView>>, ApiError> {
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
     let rows = sqlx::query_as::<_, AlertEventView>(
-        "SELECT e.id, e.rule_id, r.name AS rule_name, r.metric, e.value, e.fired_at, e.resolved_at
+        // Same metric-metadata LATERAL join as list_alerts (see note there).
+        "SELECT e.id, e.rule_id, r.name AS rule_name, r.metric, e.value, e.fired_at,
+                e.resolved_at, m.kind, m.unit
          FROM alert_events e
          JOIN alert_rules r ON r.id = e.rule_id
+         LEFT JOIN LATERAL (
+             SELECT kind, unit FROM (
+                 (SELECT kind, unit, time AS t FROM metrics
+                  WHERE name = r.metric ORDER BY time DESC LIMIT 1)
+                 UNION ALL
+                 (SELECT kind, unit, bucket AS t FROM metric_series_rollups
+                  WHERE name = r.metric ORDER BY bucket DESC LIMIT 1)
+             ) z ORDER BY t DESC LIMIT 1
+         ) m ON true
          -- A pending (not-yet-activated) event is not a transition; only surface
          -- events that actually fired so the feed stays an honest firing/resolved log.
          WHERE e.active_at IS NOT NULL
