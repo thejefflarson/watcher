@@ -207,6 +207,16 @@ tr.clickable:hover td {
   padding: 0.2rem 0.5rem;
 }
 
+/* Expanded log row: attribute kv table + cross-signal drill links. */
+.log-detail {
+  padding: 0.4rem 0.5rem 0.6rem 1.6rem;
+}
+.log-detail-links {
+  display: flex;
+  gap: 1rem;
+  margin-bottom: 0.4rem;
+}
+
 .error {
   color: var(--error);
 }

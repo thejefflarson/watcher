@@ -9,6 +9,7 @@ import {
 } from "../api";
 import { formatValue } from "../format";
 import { facetLabels } from "../metricLabels";
+import { focusLabel } from "../focus";
 import { useControls, rangeParams } from "../timerange";
 import Sparkline, { Bars } from "./Sparkline";
 
@@ -174,9 +175,9 @@ export default function MetricList({
   const [metrics, setMetrics] = useState<MetricSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
-  const [service, setService] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const { rangeKey, tick } = useControls();
+  // Service focus is global (header select, mirrored to `?service=`).
+  const { rangeKey, service, tick } = useControls();
 
   useEffect(() => {
     let active = true;
@@ -208,17 +209,10 @@ export default function MetricList({
 
   return (
     <div>
-      <div className="filters">
-        <input
-          placeholder="service"
-          value={service}
-          onChange={(e) => setService(e.target.value)}
-        />
-      </div>
       {!loaded ? (
         <p className="muted">Loading…</p>
       ) : metrics.length === 0 ? (
-        <p className="muted">No metrics yet.</p>
+        <p className="muted">No metrics{focusLabel(service, rangeKey)}.</p>
       ) : (
         <table>
           <thead>

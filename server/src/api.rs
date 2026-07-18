@@ -169,6 +169,8 @@ pub struct LogQuery {
     limit: Option<i64>,
     service: Option<String>,
     trace_id: Option<String>,
+    /// Narrow to a single span's logs (used by the trace waterfall drill-down).
+    span_id: Option<String>,
     q: Option<String>,
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
@@ -209,15 +211,17 @@ pub async fn list_logs(
          FROM logs
          WHERE ($1::text IS NULL OR service = $1)
            AND ($2::text IS NULL OR trace_id = $2)
-           AND ($3::text IS NULL OR body ILIKE '%' || $3 || '%')
-           AND ($4::timestamptz IS NULL OR time >= $4)
-           AND ($5::timestamptz IS NULL OR time <= $5)
-           AND ($6::jsonb IS NULL OR attributes @> $6)
+           AND ($3::text IS NULL OR span_id = $3)
+           AND ($4::text IS NULL OR body ILIKE '%' || $4 || '%')
+           AND ($5::timestamptz IS NULL OR time >= $5)
+           AND ($6::timestamptz IS NULL OR time <= $6)
+           AND ($7::jsonb IS NULL OR attributes @> $7)
          ORDER BY time DESC
-         LIMIT $7",
+         LIMIT $8",
     )
     .bind(q.service)
     .bind(q.trace_id)
+    .bind(q.span_id)
     .bind(q.q)
     .bind(q.from)
     .bind(q.to)

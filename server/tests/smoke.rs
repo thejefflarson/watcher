@@ -903,6 +903,37 @@ async fn logs_filter_by_service_and_trace() {
     assert_eq!(corr[0]["trace_id"], "corr");
 }
 
+#[tokio::test]
+#[serial]
+async fn logs_filter_by_span() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // Two spans in the same trace, each with one log; a third log with no span.
+    sqlx::query(
+        "INSERT INTO logs (time, service, trace_id, span_id, body) VALUES
+            (now(),'api','corr','span-a','a'),
+            (now(),'api','corr','span-b','b'),
+            (now(),'api','corr',NULL,'c')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let router = app(pool);
+
+    // span_id narrows to that one span's logs.
+    let (status, only_a) = get_json(&router, "/api/logs?trace_id=corr&span_id=span-a").await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = only_a.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["body"], "a");
+    assert_eq!(arr[0]["span_id"], "span-a");
+
+    // Without span_id the whole trace's logs come back.
+    let (_, all) = get_json(&router, "/api/logs?trace_id=corr").await;
+    assert_eq!(all.as_array().unwrap().len(), 3);
+}
+
 // --- Metrics ---------------------------------------------------------------
 
 #[tokio::test]
