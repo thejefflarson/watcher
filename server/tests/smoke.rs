@@ -21,7 +21,7 @@ use prost::Message;
 use serial_test::serial;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
-use watcher_server::{alerts, app, db};
+use watcher_server::{alerts, app, db, selfmon};
 
 fn now_nanos() -> u64 {
     SystemTime::now()
@@ -564,6 +564,94 @@ async fn ui_fallback_does_not_shadow_api() {
             "SPA shell must be served no-cache"
         );
     }
+}
+
+// --- Self-monitoring + deep /healthz (JEF-425) -----------------------------
+
+#[tokio::test]
+#[serial]
+async fn healthz_is_ready_when_db_up_and_retention_fresh() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let router = app(pool);
+
+    // A reachable DB and a non-stalled retention state → ready (200) with the
+    // diagnostic body the readiness probe reports.
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["db"], true);
+    assert_eq!(body["retention_stalled"], false);
+}
+
+#[tokio::test]
+#[serial]
+async fn self_telemetry_emits_watcher_ops_metrics() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // Seed a little data so table/db-size and rollup-lag gauges have something to
+    // report, then run one self-telemetry snapshot through the real store path.
+    ingest(
+        &app(pool.clone()),
+        gauge_request("cpu.load", 0.5, now_nanos()),
+    )
+    .await;
+    selfmon::emit_once(&pool).await.expect("emit");
+
+    // The watcher_* series land in watcher's own metrics table, so they show up in
+    // the metrics UI (same-origin /api/metrics) tagged service.name=watcher.
+    let router = app(pool);
+    let (status, metrics) = get_json(&router, "/api/metrics?service=watcher").await;
+    assert_eq!(status, StatusCode::OK);
+    let names: Vec<String> = metrics
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap().to_string())
+        .collect();
+    for expected in [
+        "watcher.db.size_bytes",
+        "watcher.db.table_bytes",
+        "watcher.rollup.lag_seconds",
+        "watcher.retention.last_success_age_seconds",
+        "watcher.ingest.metric_points_total",
+    ] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "expected {expected} in {names:?}"
+        );
+    }
+
+    // db.size_bytes is a positive gauge value.
+    let db_size = metrics
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "watcher.db.size_bytes")
+        .unwrap();
+    assert!(db_size["last_value"].as_f64().unwrap() > 0.0);
+
+    // table_bytes is one metric faceted per telemetry table (a table= attribute),
+    // so its series_count reflects the several tables tracked.
+    let tbl = metrics
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "watcher.db.table_bytes")
+        .unwrap();
+    assert!(tbl["series_count"].as_i64().unwrap() >= 2);
 }
 
 // ===========================================================================

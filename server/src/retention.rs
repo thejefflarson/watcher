@@ -55,6 +55,10 @@ pub async fn prune_once(pool: &PgPool, days: i32, raw_hours: i32) -> anyhow::Res
             total += pruned;
         }
     }
+    // Record the successful sweep so self-telemetry can surface its recency and
+    // /healthz can flag a stall (a silent retention stall is exactly what let the
+    // metrics table grow to tens of GB un-paged — JEF-425).
+    crate::selfmon::record_retention_success(total);
     Ok(total)
 }
 
