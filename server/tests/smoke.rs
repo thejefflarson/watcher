@@ -18,6 +18,7 @@ use opentelemetry_proto::tonic::{
     trace::v1::{ResourceSpans, ScopeSpans, Span},
 };
 use prost::Message;
+use serde_json::json;
 use serial_test::serial;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
@@ -1502,6 +1503,274 @@ async fn alert_reconcile_upserts_in_place() {
     assert_eq!(rules[0]["id"].as_i64().unwrap(), id_before);
     assert_eq!(rules[0]["threshold"], 75.0);
     assert_eq!(count(&pool, "alert_events").await, 1); // event preserved
+}
+
+/// Insert one metric point with a JSONB attribute set (and optional counter
+/// monotonicity), so alert-rule match/exclude/rate paths can be exercised directly.
+async fn insert_metric_attr(
+    pool: &sqlx::PgPool,
+    name: &str,
+    attrs: serde_json::Value,
+    kind: &str,
+    is_monotonic: Option<bool>,
+    value: f64,
+    secs_ago: f64,
+) {
+    sqlx::query(
+        "INSERT INTO metrics (time, service, name, kind, value, unit, attributes, is_monotonic)
+         VALUES (now() - make_interval(secs => $1), 'api', $2, $3, $4, '1', $5, $6)",
+    )
+    .bind(secs_ago)
+    .bind(name)
+    .bind(kind)
+    .bind(value)
+    .bind(attrs)
+    .bind(is_monotonic)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Look up a rule's current firing state from the read API by name.
+fn firing(rules: &serde_json::Value, name: &str) -> bool {
+    rules
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == name)
+        .unwrap_or_else(|| panic!("rule {name} not found"))["firing"]
+        .as_bool()
+        .unwrap()
+}
+
+#[tokio::test]
+#[serial]
+async fn alert_match_scopes_to_matching_series() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let router = app(pool.clone());
+
+    // Two series of the same metric: only the primary is quiet, the replica is hot.
+    insert_metric_attr(
+        &pool,
+        "cpu",
+        json!({"role":"primary"}),
+        "gauge",
+        None,
+        10.0,
+        5.0,
+    )
+    .await;
+    insert_metric_attr(
+        &pool,
+        "cpu",
+        json!({"role":"replica"}),
+        "gauge",
+        None,
+        90.0,
+        5.0,
+    )
+    .await;
+
+    apply_rules(
+        &pool,
+        &[
+            // Scoped to the primary series: max is 10 (< 80) → does NOT fire.
+            json!({"name":"scoped","metric":"cpu","comparator":"gt","threshold":80,
+                   "agg":"max","window_secs":3600,"match":{"role":"primary"}}),
+            // Unscoped control: max over both series is 90 (> 80) → fires.
+            json!({"name":"broad","metric":"cpu","comparator":"gt","threshold":80,
+                   "agg":"max","window_secs":3600}),
+        ],
+    )
+    .await;
+    alerts::evaluate_once(&pool, None).await.unwrap();
+
+    let (_, rules) = get_json(&router, "/api/alerts").await;
+    assert!(
+        !firing(&rules, "scoped"),
+        "match must narrow to the primary series"
+    );
+    assert!(
+        firing(&rules, "broad"),
+        "unscoped rule still fires on the replica"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn alert_exclude_suppresses_series() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let router = app(pool.clone());
+
+    // A ready Deployment pod and an unready Job pod. "container not ready" is lt 1.
+    insert_metric_attr(
+        &pool,
+        "ready",
+        json!({"owner":"Deployment"}),
+        "gauge",
+        None,
+        1.0,
+        5.0,
+    )
+    .await;
+    insert_metric_attr(
+        &pool,
+        "ready",
+        json!({"owner":"Job"}),
+        "gauge",
+        None,
+        0.0,
+        5.0,
+    )
+    .await;
+
+    apply_rules(
+        &pool,
+        &[
+            // Excluding Job leaves only the Deployment(1) → min 1, not < 1 → no fire.
+            json!({"name":"exset","metric":"ready","comparator":"lt","threshold":1,
+                   "agg":"min","window_secs":3600,"exclude":{"owner":"Job"}}),
+            // Without the exclude, the Job(0) drags min to 0 → false page fires.
+            json!({"name":"noexc","metric":"ready","comparator":"lt","threshold":1,
+                   "agg":"min","window_secs":3600}),
+        ],
+    )
+    .await;
+    alerts::evaluate_once(&pool, None).await.unwrap();
+
+    let (_, rules) = get_json(&router, "/api/alerts").await;
+    assert!(
+        !firing(&rules, "exset"),
+        "exclude must suppress the Job series"
+    );
+    assert!(
+        firing(&rules, "noexc"),
+        "without exclude the Job series still fires"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn alert_rate_fires_on_per_second_rate() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let router = app(pool.clone());
+
+    // A monotonic counter climbing 300 over 10s on one series → 30/s.
+    let attrs = json!({"pod":"a"});
+    insert_metric_attr(&pool, "reqs", attrs.clone(), "sum", Some(true), 100.0, 20.0).await;
+    insert_metric_attr(&pool, "reqs", attrs.clone(), "sum", Some(true), 400.0, 10.0).await;
+
+    apply_rules(
+        &pool,
+        &[
+            // rate auto-on (monotonic sum): per-second rate is 30 (> 20) → fires.
+            json!({"name":"rated","metric":"reqs","comparator":"gt","threshold":20,
+                   "agg":"max","window_secs":3600}),
+            // Explicit rate:false reads the raw cumulative level: max 400 (> 20).
+            json!({"name":"raw","metric":"reqs","comparator":"gt","threshold":20,
+                   "agg":"max","window_secs":3600,"rate":false}),
+        ],
+    )
+    .await;
+    alerts::evaluate_once(&pool, None).await.unwrap();
+
+    let (_, rules) = get_json(&router, "/api/alerts").await;
+    assert!(
+        firing(&rules, "rated"),
+        "counter rate 30/s fires the gt-20 rule"
+    );
+    assert!(firing(&rules, "raw"), "raw-level control also fires");
+
+    // The stored event values distinguish the rate from the raw cumulative level.
+    let (_, events) = get_json(&router, "/api/alerts/events").await;
+    let val = |name: &str| -> f64 {
+        events
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["rule_name"] == name)
+            .unwrap()["value"]
+            .as_f64()
+            .unwrap()
+    };
+    // The differencing divides by the actual elapsed seconds between inserts (a few
+    // ms over the nominal 10s), so the rate lands just under 30 — a wide band keeps
+    // this asserting "rate, not raw level" without being timing-flaky.
+    assert!(
+        (val("rated") - 30.0).abs() < 1.0,
+        "rate ≈ 30/s, got {}",
+        val("rated")
+    );
+    assert!(
+        (val("raw") - 400.0).abs() < 1e-6,
+        "raw level 400, got {}",
+        val("raw")
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn alert_rate_reset_yields_zero_not_spike() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let router = app(pool.clone());
+
+    // A counter that resets (process restart): level drops from 1_000_000 to 10.
+    // The only interval is the reset, so the reset-safe rate is 0 — never a spike.
+    let attrs = json!({"pod":"x"});
+    insert_metric_attr(
+        &pool,
+        "creset",
+        attrs.clone(),
+        "sum",
+        Some(true),
+        1_000_000.0,
+        20.0,
+    )
+    .await;
+    insert_metric_attr(
+        &pool,
+        "creset",
+        attrs.clone(),
+        "sum",
+        Some(true),
+        10.0,
+        10.0,
+    )
+    .await;
+
+    apply_rules(
+        &pool,
+        &[
+            // gt -1 with max agg: fires iff the rate is a real number ≥ 0. A correct
+            // reset guard yields exactly 0 (fires, value 0); a naive (cur-prev)/dt
+            // would be a large negative and NOT fire → this asserts the guard.
+            json!({"name":"reset","metric":"creset","comparator":"gt","threshold":-1,
+                   "agg":"max","window_secs":3600,"rate":true}),
+        ],
+    )
+    .await;
+    alerts::evaluate_once(&pool, None).await.unwrap();
+
+    let (_, rules) = get_json(&router, "/api/alerts").await;
+    assert!(
+        firing(&rules, "reset"),
+        "reset interval yields 0 (≥ -1), so the rule fires"
+    );
+
+    let (_, events) = get_json(&router, "/api/alerts/events").await;
+    let value = events[0]["value"].as_f64().unwrap();
+    assert_eq!(
+        value, 0.0,
+        "a reset must produce a 0 rate, not a spike (got {value})"
+    );
 }
 
 #[tokio::test]
