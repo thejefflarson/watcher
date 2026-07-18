@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   getMetricFacet,
   getMetricHistFacet,
@@ -9,7 +10,7 @@ import {
 } from "../api";
 import { formatValue } from "../format";
 import { facetLabels } from "../metricLabels";
-import { focusLabel } from "../focus";
+import { firstRunHint } from "../empty";
 import { useControls, rangeParams } from "../timerange";
 import Sparkline, { Bars } from "./Sparkline";
 
@@ -168,9 +169,9 @@ function ExpandedMetric({ m }: { m: MetricSummary }) {
 }
 
 export default function MetricList({
-  onSelect,
+  to,
 }: {
-  onSelect: (m: MetricSummary) => void;
+  to: (m: MetricSummary) => string;
 }) {
   const [metrics, setMetrics] = useState<MetricSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -212,7 +213,9 @@ export default function MetricList({
       {!loaded ? (
         <p className="muted">Loading…</p>
       ) : metrics.length === 0 ? (
-        <p className="muted">No metrics{focusLabel(service, rangeKey)}.</p>
+        <p className="muted">
+          {service ? "No metrics match this filter." : firstRunHint("metrics")}
+        </p>
       ) : (
         <table>
           <thead>
@@ -229,21 +232,21 @@ export default function MetricList({
               const open = expanded.has(m.name);
               return (
                 <Fragment key={m.name}>
-                  <tr className="clickable" onClick={() => onSelect(m)} title="View time series">
+                  <tr className="clickable">
                     <td className="mono">
                       {multi && (
                         <button
                           className="expander"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            toggle(m.name);
-                          }}
+                          onClick={() => toggle(m.name)}
                           title="Expand series"
+                          aria-expanded={open}
                         >
                           {open ? "▾" : "▸"}
                         </button>
                       )}
-                      {m.name}
+                      <Link to={to(m)} title="View time series">
+                        {m.name}
+                      </Link>
                     </td>
                     <td className="muted">{m.kind ?? "—"}</td>
                     <td>

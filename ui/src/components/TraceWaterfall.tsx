@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { getTrace, type SpanRow } from "../api";
+import { rowKeyActivate } from "../a11y";
 import { fmtDuration } from "./TraceList";
 
 interface Row {
@@ -181,11 +182,17 @@ export default function TraceWaterfall({
           const width = Math.max(((epochMicros(span.end_time) - start) / total) * 100, 0.4);
           const err = span.status_code === 2;
           const sel = span.span_id === selected;
+          const toggle = () => setSelected(sel ? null : span.span_id);
           return (
             <div
-              className={"bar-row clickable" + (sel ? " selected" : "")}
+              className={"bar-row" + (sel ? " selected" : "")}
               key={span.span_id}
-              onClick={() => setSelected(sel ? null : span.span_id)}
+              role="button"
+              tabIndex={0}
+              aria-pressed={sel}
+              aria-label={`${span.name}, ${fmtDuration(span.duration_ms)}${err ? ", error" : ""}`}
+              onClick={toggle}
+              onKeyDown={rowKeyActivate(toggle)}
             >
               <div className="bar-label" style={{ paddingLeft: depth * 14 }} title={span.name}>
                 {span.name}
