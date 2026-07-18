@@ -93,6 +93,7 @@ export const listLogs = (
     service?: string;
     q?: string;
     trace_id?: string;
+    span_id?: string;
     limit?: number;
     from?: string;
     to?: string;

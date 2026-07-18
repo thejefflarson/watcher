@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { getTrace, type SpanRow } from "../api";
 import { fmtDuration } from "./TraceList";
 
@@ -30,6 +30,22 @@ function SpanDetail({ span, onClose }: { span: SpanRow; onClose: () => void }) {
     <div className="span-detail">
       <div className="span-detail-head">
         <strong className="mono">{span.name}</strong>
+        {/* Cross-signal drill: this span's logs (trace_id + span_id), or the
+            whole service's logs (which also sets the global service focus). */}
+        <Link
+          className="xlink"
+          to={`/logs?trace_id=${span.trace_id}&span_id=${span.span_id}`}
+        >
+          logs for this span ↗
+        </Link>
+        {span.service && (
+          <Link
+            className="xlink"
+            to={`/logs?service=${encodeURIComponent(span.service)}`}
+          >
+            logs for this service ↗
+          </Link>
+        )}
         <button className="xlink" onClick={onClose}>
           close
         </button>
@@ -110,10 +126,13 @@ export default function TraceWaterfall({
   const [spans, setSpans] = useState<SpanRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  const [params] = useSearchParams();
+  // `?span=` opens straight to a span's detail — the "span in trace ↗" drill
+  // from a log row lands here.
+  const spanParam = params.get("span");
 
   useEffect(() => {
     let active = true;
-    setSelected(null);
     getTrace(traceId)
       .then((s) => {
         if (active) {
@@ -126,6 +145,11 @@ export default function TraceWaterfall({
       active = false;
     };
   }, [traceId]);
+
+  // Sync the selected span from the URL (trace change clears it unless `?span=`).
+  useEffect(() => {
+    setSelected(spanParam ?? null);
+  }, [traceId, spanParam]);
 
   if (error) return <p className="error">Failed to load trace: {error}</p>;
   if (spans.length === 0) return <p className="muted">Loading trace…</p>;

@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
+import { useSearchParams } from "react-router-dom";
 
 // Relative ranges. `ms: 0` means unbounded ("all").
 export const RANGES: { key: string; label: string; ms: number }[] = [
@@ -24,6 +25,11 @@ interface Controls {
   setRangeKey: (k: string) => void;
   intervalKey: string;
   setIntervalKey: (k: string) => void;
+  /// Global service focus, mirrored to the `?service=` query param so it survives
+  /// tab switches (the nav links carry it) and reloads, and so drill-downs that
+  /// navigate to `?service=X` set it. Every tab reads this instead of its own box.
+  service: string;
+  setService: (s: string) => void;
   /// Bumped on every poll tick and manual refresh; views include it in their
   /// fetch deps so they reload.
   tick: number;
@@ -38,6 +44,15 @@ export function TimeRangeProvider({ children }: { children: ReactNode }) {
   const [tick, setTick] = useState(0);
   const refresh = () => setTick((t) => t + 1);
 
+  const [searchParams, setSearchParams] = useSearchParams();
+  const service = searchParams.get("service") ?? "";
+  const setService = (s: string) => {
+    const next = new URLSearchParams(searchParams);
+    if (s) next.set("service", s);
+    else next.delete("service");
+    setSearchParams(next, { replace: true });
+  };
+
   useEffect(() => {
     const secs = INTERVALS.find((i) => i.key === intervalKey)?.secs ?? 0;
     if (secs <= 0) return;
@@ -47,7 +62,16 @@ export function TimeRangeProvider({ children }: { children: ReactNode }) {
 
   return (
     <Ctx.Provider
-      value={{ rangeKey, setRangeKey, intervalKey, setIntervalKey, tick, refresh }}
+      value={{
+        rangeKey,
+        setRangeKey,
+        intervalKey,
+        setIntervalKey,
+        service,
+        setService,
+        tick,
+        refresh,
+      }}
     >
       {children}
     </Ctx.Provider>

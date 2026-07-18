@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import {
   NavLink,
   Navigate,
@@ -15,7 +16,8 @@ import MetricChart from "./components/MetricChart";
 import ServiceMap from "./components/ServiceMap";
 import Services from "./components/Services";
 import Alerts from "./components/Alerts";
-import { useControls, RANGES, INTERVALS } from "./timerange";
+import { listServices } from "./api";
+import { useControls, rangeParams, RANGES, INTERVALS } from "./timerange";
 
 const TABS: { to: string; label: string }[] = [
   { to: "/traces", label: "Traces" },
@@ -26,17 +28,35 @@ const TABS: { to: string; label: string }[] = [
   { to: "/alerts", label: "Alerts" },
 ];
 
+// The global service focus lives in `?service=`; carry it across tab switches and
+// drill-in/back navigations so it survives without re-typing.
+function serviceSearch(service: string): string {
+  return service ? `?service=${encodeURIComponent(service)}` : "";
+}
+
 // Route wrappers translate component callbacks into URL navigation, so the
 // view (selected trace, drilled-in metric) lives in the address bar.
 function TracesRoute() {
   const navigate = useNavigate();
-  return <TraceList onSelect={(id) => navigate(`/traces/${id}`)} />;
+  const { service } = useControls();
+  // Keep the focus in the URL through the drill-in so the header + tabs still show it.
+  return (
+    <TraceList
+      onSelect={(id) => navigate(`/traces/${id}${serviceSearch(service)}`)}
+    />
+  );
 }
 
 function TraceRoute() {
   const { traceId } = useParams();
   const navigate = useNavigate();
-  return <TraceWaterfall traceId={traceId!} onBack={() => navigate("/traces")} />;
+  const { service } = useControls();
+  return (
+    <TraceWaterfall
+      traceId={traceId!}
+      onBack={() => navigate(`/traces${serviceSearch(service)}`)}
+    />
+  );
 }
 
 function MetricsRoute() {
@@ -65,8 +85,44 @@ function MetricRoute() {
       service={params.get("service")}
       unit={params.get("unit")}
       kind={params.get("kind")}
-      onBack={() => navigate("/metrics")}
+      onBack={() => navigate(`/metrics${serviceSearch(params.get("service") ?? "")}`)}
     />
+  );
+}
+
+// Global service focus — a header <select> before the range control. Populated
+// from the services with data in range; keeps a drilled-in service selectable
+// even when it's outside the current window's list (TraceList's old trick).
+function ServiceFocus() {
+  const { service, setService, rangeKey, tick } = useControls();
+  const [services, setServices] = useState<string[]>([]);
+
+  useEffect(() => {
+    let active = true;
+    listServices(rangeParams(rangeKey))
+      .then((rows) => active && setServices(rows.map((r) => r.service).sort()))
+      .catch(() => active && setServices([]));
+    return () => {
+      active = false;
+    };
+  }, [rangeKey, tick]);
+
+  const options =
+    services.includes(service) || !service ? services : [service, ...services];
+
+  return (
+    <select
+      value={service}
+      onChange={(e) => setService(e.target.value)}
+      title="Service focus (scopes every tab)"
+    >
+      <option value="">all services</option>
+      {options.map((s) => (
+        <option key={s} value={s}>
+          {s}
+        </option>
+      ))}
+    </select>
   );
 }
 
@@ -74,6 +130,7 @@ function Controls() {
   const { rangeKey, setRangeKey, intervalKey, setIntervalKey, refresh } = useControls();
   return (
     <div className="controls">
+      <ServiceFocus />
       <select
         value={rangeKey}
         onChange={(e) => setRangeKey(e.target.value)}
@@ -104,6 +161,8 @@ function Controls() {
 }
 
 export default function App() {
+  const { service } = useControls();
+  const search = serviceSearch(service);
   return (
     <div className="app">
       <header>
@@ -112,7 +171,8 @@ export default function App() {
           {TABS.map((t) => (
             <NavLink
               key={t.to}
-              to={t.to}
+              // Carry the service focus across tabs so it isn't dropped on switch.
+              to={{ pathname: t.to, search }}
               className={({ isActive }) => (isActive ? "active" : "")}
             >
               {t.label}
