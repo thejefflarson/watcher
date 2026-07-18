@@ -1536,6 +1536,132 @@ async fn alert_does_not_fire_twice() {
     assert_eq!(count(&pool, "alert_events").await, 1); // one open event only
 }
 
+/// Age the (single) open event for a rule backwards so its dwell window has
+/// elapsed without waiting real time — the evaluator keys maturity off fired_at.
+async fn age_open_event(pool: &sqlx::PgPool, secs: f64) {
+    sqlx::query(
+        "UPDATE alert_events SET fired_at = now() - make_interval(secs => $1)
+         WHERE resolved_at IS NULL",
+    )
+    .bind(secs)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn alert_for_secs_requires_sustained_breach() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let router = app(pool.clone());
+    apply_rules(
+        &pool,
+        &[
+            serde_json::json!({"name":"dwell","metric":"t","comparator":"gt",
+                             "threshold":50,"window_secs":3600,"for_secs":300}),
+        ],
+    )
+    .await;
+
+    // First breach: a pending event opens but the rule does NOT fire yet.
+    insert_metric_at(&pool, "t", None, 90.0, 1.0).await;
+    alerts::evaluate_once(&pool, None).await.unwrap();
+    let (_, rules) = get_json(&router, "/api/alerts").await;
+    assert_eq!(rules[0]["firing"], false, "pending breach must not fire");
+    assert_eq!(count(&pool, "alert_events").await, 1); // pending row exists
+    let (_, events) = get_json(&router, "/api/alerts/events").await;
+    assert!(
+        events.as_array().unwrap().is_empty(),
+        "a pending event is not a transition"
+    );
+
+    // Still breaching a second tick before the window elapses: still pending.
+    alerts::evaluate_once(&pool, None).await.unwrap();
+    let (_, rules) = get_json(&router, "/api/alerts").await;
+    assert_eq!(rules[0]["firing"], false);
+
+    // The breach has now held past for_secs → it activates and fires.
+    age_open_event(&pool, 301.0).await;
+    alerts::evaluate_once(&pool, None).await.unwrap();
+    let (_, rules) = get_json(&router, "/api/alerts").await;
+    assert_eq!(rules[0]["firing"], true, "matured breach must fire");
+    assert_eq!(count(&pool, "alert_events").await, 1); // reused the same event
+    let (_, events) = get_json(&router, "/api/alerts/events").await;
+    assert_eq!(events.as_array().unwrap().len(), 1); // now a real transition
+
+    // Resolve semantics are unchanged: recovery closes the firing event.
+    sqlx::query("DELETE FROM metrics WHERE name = 't'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    insert_metric_at(&pool, "t", None, 5.0, 1.0).await;
+    alerts::evaluate_once(&pool, None).await.unwrap();
+    let (_, rules) = get_json(&router, "/api/alerts").await;
+    assert_eq!(rules[0]["firing"], false);
+    let (_, events) = get_json(&router, "/api/alerts/events").await;
+    assert!(!events[0]["resolved_at"].is_null());
+}
+
+#[tokio::test]
+#[serial]
+async fn alert_for_secs_flap_never_fires() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let router = app(pool.clone());
+    apply_rules(
+        &pool,
+        &[
+            serde_json::json!({"name":"flap","metric":"t","comparator":"gt",
+                             "threshold":50,"window_secs":3600,"for_secs":300}),
+        ],
+    )
+    .await;
+
+    // Breach opens a pending event (no fire).
+    insert_metric_at(&pool, "t", None, 90.0, 1.0).await;
+    alerts::evaluate_once(&pool, None).await.unwrap();
+    assert_eq!(count(&pool, "alert_events").await, 1);
+    let (_, rules) = get_json(&router, "/api/alerts").await;
+    assert_eq!(rules[0]["firing"], false);
+
+    // The breach clears well before the 5-min window: the pending event is dropped
+    // silently — no firing, no resolved transition, nothing paged.
+    sqlx::query("DELETE FROM metrics WHERE name = 't'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    insert_metric_at(&pool, "t", None, 5.0, 1.0).await;
+    alerts::evaluate_once(&pool, None).await.unwrap();
+    assert_eq!(
+        count(&pool, "alert_events").await,
+        0,
+        "pending event dropped"
+    );
+    let (_, rules) = get_json(&router, "/api/alerts").await;
+    assert_eq!(rules[0]["firing"], false);
+    let (_, events) = get_json(&router, "/api/alerts/events").await;
+    assert!(events.as_array().unwrap().is_empty());
+
+    // A fresh breach after the flap starts a brand-new dwell (and still won't fire
+    // until it too holds long enough) — proving the flap left no residual state.
+    sqlx::query("DELETE FROM metrics WHERE name = 't'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    insert_metric_at(&pool, "t", None, 95.0, 1.0).await;
+    alerts::evaluate_once(&pool, None).await.unwrap();
+    assert_eq!(count(&pool, "alert_events").await, 1);
+    let (_, rules) = get_json(&router, "/api/alerts").await;
+    assert_eq!(rules[0]["firing"], false);
+    age_open_event(&pool, 400.0).await;
+    alerts::evaluate_once(&pool, None).await.unwrap();
+    let (_, rules) = get_json(&router, "/api/alerts").await;
+    assert_eq!(rules[0]["firing"], true);
+}
+
 #[tokio::test]
 #[serial]
 async fn alert_webhook_delivers_payload() {

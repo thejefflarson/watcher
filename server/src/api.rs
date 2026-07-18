@@ -985,7 +985,11 @@ pub async fn list_alerts(State(pool): State<PgPool>) -> Result<Json<Vec<AlertRul
                 r.window_secs, r.enabled, r.created_at,
                 (e.id IS NOT NULL) AS firing
          FROM alert_rules r
-         LEFT JOIN alert_events e ON e.rule_id = r.id AND e.resolved_at IS NULL
+         -- Only an *activated* open event counts as firing: a pending event (a
+         -- breach still dwelling toward its `for` window) has active_at NULL and
+         -- must not surface as firing until it matures. See alerts.rs / ADR 0015.
+         LEFT JOIN alert_events e
+                ON e.rule_id = r.id AND e.resolved_at IS NULL AND e.active_at IS NOT NULL
          ORDER BY r.created_at DESC",
     )
     .fetch_all(&pool)
@@ -1024,6 +1028,9 @@ pub async fn list_alert_events(
         "SELECT e.id, e.rule_id, r.name AS rule_name, r.metric, e.value, e.fired_at, e.resolved_at
          FROM alert_events e
          JOIN alert_rules r ON r.id = e.rule_id
+         -- A pending (not-yet-activated) event is not a transition; only surface
+         -- events that actually fired so the feed stays an honest firing/resolved log.
+         WHERE e.active_at IS NOT NULL
          ORDER BY e.fired_at DESC
          LIMIT $1",
     )
