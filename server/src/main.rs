@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 
 use opentelemetry::trace::TracerProvider as _;
@@ -58,7 +59,15 @@ async fn main() -> anyhow::Result<()> {
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("info,watcher_server=debug,sqlx=warn")),
         )
-        .with(tracing_subscriber::fmt::layer())
+        // Only colorize when stdout is a real terminal. Under Kubernetes (and any
+        // piped/redirected stdout) the fmt layer's default ANSI-on would otherwise
+        // litter the pod logs with raw `\x1b[..m` escape sequences. `NO_COLOR`
+        // (https://no-color.org) force-disables it regardless.
+        .with(
+            tracing_subscriber::fmt::layer().with_ansi(
+                std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+            ),
+        )
         .with(otel_layer)
         .init();
 
