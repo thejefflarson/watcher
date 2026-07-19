@@ -52,7 +52,11 @@ export default function Services() {
           return (
             <tr key={r.service} className="clickable">
               <td>
-                <Link to={`/traces?service=${encodeURIComponent(r.service)}`} title="View traces">
+                <Link
+                  className="rowlink"
+                  to={`/traces?service=${encodeURIComponent(r.service)}`}
+                  title="View traces"
+                >
                   {r.service}
                 </Link>
               </td>

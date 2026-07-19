@@ -23,6 +23,15 @@ body {
   line-height: 1.45;
 }
 
+/* Links are ink, never web-blue — color stays reserved for data (ADR 0009).
+   Author origin beats the UA sheet, so this also kills the :visited color with
+   no separate :visited rule (which would otherwise out-specify .xlink's muted). */
+a {
+  color: var(--text);
+  text-decoration: none;
+  cursor: pointer;
+}
+
 .app {
   max-width: 1100px;
   margin: 0 auto;
@@ -150,6 +159,19 @@ tr.clickable {
 
 tr.clickable:hover td {
   background: var(--hover);
+}
+
+/* Primary-cell navigation link (row identity: service / trace / metric name).
+   Bold ink marks the identity column; the enclosing tr.clickable supplies the
+   pointer cursor + row hover-highlight, so no persistent underline is needed.
+   Underline-on-hover is the unambiguous link cue (WCAG 1.4.1: weight + underline
+   + focus ring, never color alone). */
+.rowlink {
+  font-weight: 700;
+}
+
+.rowlink:hover {
+  text-decoration: underline;
 }
 
 .mono {
