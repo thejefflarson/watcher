@@ -114,7 +114,9 @@ export default function TraceList({ to }: { to: (traceId: string) => string }) {
             {sorted.map((t) => (
               <tr key={t.trace_id} className="clickable">
                 <td>
-                  <Link to={to(t.trace_id)}>{t.service ?? "—"}</Link>
+                  <Link className="rowlink" to={to(t.trace_id)}>
+                    {t.service ?? "—"}
+                  </Link>
                 </td>
                 <td>{t.root_name ?? "—"}</td>
                 <td>{new Date(t.start_time).toLocaleString()}</td>

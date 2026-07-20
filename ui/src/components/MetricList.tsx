@@ -244,7 +244,7 @@ export default function MetricList({
                           {open ? "▾" : "▸"}
                         </button>
                       )}
-                      <Link to={to(m)} title="View time series">
+                      <Link className="rowlink" to={to(m)} title="View time series">
                         {m.name}
                       </Link>
                     </td>
