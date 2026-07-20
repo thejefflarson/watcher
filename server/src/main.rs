@@ -5,7 +5,7 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
-use watcher_server::{alerts, app, db, grpc, retention, selfmon};
+use watcher_server::{alerts, app, db, grpc, retention, selflog, selfmon};
 
 /// Self-instrumentation: export watcher's own traces over OTLP, tagged
 /// `service.name=watcher` by default, so it shows up in its own UI. Exports to
@@ -54,6 +54,16 @@ async fn main() -> anyhow::Result<()> {
     let otel_layer = telemetry
         .as_ref()
         .map(|p| tracing_opentelemetry::layer().with_tracer(p.tracer("watcher-server")));
+    // Self-log capture (JEF-452): a layer that mirrors watcher's own events into its
+    // own `logs` table. Built here, before the pool exists, so startup events buffer
+    // in its channel; `main` spawns the drain task once the DB is up. The receiver
+    // rides alongside the (Option) layer so both share the enabled() decision.
+    let (selflog_layer, selflog_rx) = if selflog::enabled() {
+        let (layer, rx) = selflog::channel_layer();
+        (Some(layer), Some(rx))
+    } else {
+        (None, None)
+    };
     tracing_subscriber::registry()
         .with(
             EnvFilter::try_from_default_env()
@@ -69,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
             ),
         )
         .with(otel_layer)
+        .with(selflog_layer)
         .init();
 
     let database_url = std::env::var("DATABASE_URL")
@@ -146,6 +157,11 @@ async fn main() -> anyhow::Result<()> {
     // metrics path it ingests, so its health rides its own UI and is alertable.
     if selfmon::enabled() {
         tokio::spawn(selfmon::run(pool.clone()));
+    }
+    // Self-logs: drain the buffered self-log records (captured by the tracing layer
+    // installed above) into the `logs` table via the same in-process ingest path.
+    if let Some(rx) = selflog_rx {
+        tokio::spawn(selflog::drain(pool.clone(), rx));
     }
 
     let http = {
