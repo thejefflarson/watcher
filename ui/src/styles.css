@@ -560,13 +560,9 @@ button.range.active {
   font-style: italic;
 }
 
-/* Rules deep-link to their metric chart; hint it without boxes. */
-.alerts tr.rule-row {
-  cursor: pointer;
-}
-.alerts tr.rule-row:hover {
-  background: var(--hover);
-}
+/* Rules deep-link to their metric chart via a primary-cell <Link className="rowlink">
+   (JEF-443, matching TraceList/Services/MetricList); the row hover-scent comes from
+   the shared tr.clickable rule. */
 
 /* Per-rule breach small-multiple: red ticks on a hairline baseline. */
 .breach-strip {
