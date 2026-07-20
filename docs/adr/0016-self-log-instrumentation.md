@@ -87,4 +87,3 @@ filter on the export path anyway.
   for best-effort diagnostics.
 - `DROPPED` is not yet surfaced as a `watcher.*` metric; wiring it into `selfmon` is a
   possible follow-up if drop pressure ever needs alerting.
-</content>
