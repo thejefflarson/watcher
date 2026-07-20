@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link } from "react-router-dom";
 import {
   listAlerts,
   listAlertEvents,
@@ -26,7 +26,7 @@ function humanizeSince(fromMs: number, now: number): string {
 // Deep-link to the metric chart the rule watches, carrying the threshold and the
 // open firing window as overlay params (read by MetricChart). kind/unit pick the
 // right chart type — histogram alerts must not land on a line chart.
-function chartHref(r: AlertRule, firingFrom: string | null): string {
+export function chartHref(r: AlertRule, firingFrom: string | null): string {
   const p = new URLSearchParams();
   if (r.service) p.set("service", r.service);
   if (r.unit) p.set("unit", r.unit);
@@ -71,7 +71,6 @@ export default function Alerts() {
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const { tick } = useControls();
-  const navigate = useNavigate();
 
   const reload = () => {
     Promise.all([listAlerts(), listAlertEvents()])
@@ -148,22 +147,8 @@ export default function Alerts() {
               const openMs = byRule.openSince.get(r.id);
               const openIso =
                 openMs !== undefined ? new Date(openMs).toISOString() : null;
-              const go = () => navigate(chartHref(r, openIso));
               return (
-                <tr
-                  key={r.id}
-                  className="rule-row"
-                  role="link"
-                  tabIndex={0}
-                  onClick={go}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      go();
-                    }
-                  }}
-                  title={`Open ${r.metric} chart`}
-                >
+                <tr key={r.id} className="clickable">
                   <td
                     className={
                       r.firing ? "sev-error" : r.enabled ? "muted" : "disabled"
@@ -171,7 +156,15 @@ export default function Alerts() {
                   >
                     {r.firing ? "FIRING" : r.enabled ? "ok" : "disabled"}
                   </td>
-                  <td>{r.name}</td>
+                  <td>
+                    <Link
+                      className="rowlink"
+                      to={chartHref(r, openIso)}
+                      title={`Open ${r.metric} chart`}
+                    >
+                      {r.name}
+                    </Link>
+                  </td>
                   <td className="mono">
                     {r.agg}({r.metric}
                     {r.service ? `, ${r.service}` : ""}){" "}
