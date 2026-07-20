@@ -22,7 +22,8 @@ use serde_json::json;
 use serial_test::serial;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
-use watcher_server::{alerts, app, db, selfmon};
+use tracing_subscriber::layer::SubscriberExt;
+use watcher_server::{alerts, app, db, selflog, selfmon};
 
 fn now_nanos() -> u64 {
     SystemTime::now()
@@ -658,6 +659,132 @@ async fn self_telemetry_emits_watcher_ops_metrics() {
         .find(|m| m["name"] == "watcher.db.table_bytes")
         .unwrap();
     assert!(tbl["series_count"].as_i64().unwrap() >= 2);
+}
+
+// --- Self-log instrumentation (JEF-452) ------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn self_logs_land_in_logs_table_tagged_watcher() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // Install the self-log layer on a thread-local subscriber (the default
+    // #[tokio::test] runtime is single-threaded, so all awaited work — including the
+    // drain — stays on this thread and stays under this subscriber).
+    let (layer, mut rx) = selflog::channel_layer();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new("info,sqlx=warn"))
+        .with(layer);
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    tracing::info!(order_id = 7, "self log alpha");
+    tracing::warn!("self log beta");
+    tracing::debug!("self log filtered"); // below info → must NOT be captured
+
+    // Drain into the DB while the subscriber is still active: storing self-logs runs
+    // sqlx queries that themselves emit tracing events — those must not feed back into
+    // more stored logs.
+    let stored = selflog::drain_pending(&pool, &mut rx).await;
+    assert_eq!(
+        stored, 2,
+        "info + warn captured, debug filtered by EnvFilter"
+    );
+    // A second drain finds nothing new: the store path generated no captured events.
+    let again = selflog::drain_pending(&pool, &mut rx).await;
+    assert_eq!(
+        again, 0,
+        "storing self-logs must not generate more self-logs"
+    );
+    drop(guard);
+
+    let router = app(pool.clone());
+    let (status, logs) = get_json(&router, "/api/logs?service=watcher").await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = logs.as_array().unwrap();
+    assert_eq!(
+        arr.len(),
+        2,
+        "exactly the two emitted events, no feedback rows"
+    );
+
+    let alpha = arr
+        .iter()
+        .find(|l| l["body"] == "self log alpha")
+        .expect("alpha row");
+    assert_eq!(alpha["service"], "watcher");
+    assert_eq!(alpha["severity_text"], "INFO");
+    assert_eq!(alpha["severity_number"], 9);
+    // Structured fields ride along as attributes.
+    assert_eq!(alpha["attributes"]["order_id"], 7);
+    assert_eq!(alpha["attributes"]["target"], "smoke");
+
+    let beta = arr
+        .iter()
+        .find(|l| l["body"] == "self log beta")
+        .expect("beta row");
+    assert_eq!(beta["severity_text"], "WARN");
+    assert_eq!(beta["severity_number"], 13);
+
+    assert!(
+        !arr.iter().any(|l| l["body"] == "self log filtered"),
+        "debug event must be filtered out, not stored"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn self_logs_correlate_with_current_span() {
+    use opentelemetry::trace::TracerProvider as _;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // With the otel layer in the stack, an event inside a span must carry that span's
+    // trace/span ids so self-logs link to self-traces (the span→logs drill, JEF-429).
+    let (layer, mut rx) = selflog::channel_layer();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("test"));
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new("info"))
+        .with(otel_layer)
+        .with(layer);
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    tracing::info_span!("work").in_scope(|| {
+        tracing::info!("inside span");
+    });
+    tracing::info!("outside span");
+
+    let stored = selflog::drain_pending(&pool, &mut rx).await;
+    assert_eq!(stored, 2);
+    drop(guard);
+
+    let router = app(pool.clone());
+    let (_, logs) = get_json(&router, "/api/logs?service=watcher").await;
+    let arr = logs.as_array().unwrap();
+
+    let inside = arr
+        .iter()
+        .find(|l| l["body"] == "inside span")
+        .expect("inside-span row");
+    assert!(
+        inside["trace_id"].is_string(),
+        "in-span self-log carries a trace_id"
+    );
+    assert!(
+        inside["span_id"].is_string(),
+        "in-span self-log carries a span_id"
+    );
+
+    let outside = arr
+        .iter()
+        .find(|l| l["body"] == "outside span")
+        .expect("outside-span row");
+    assert!(
+        outside["trace_id"].is_null(),
+        "out-of-span self-log has no trace_id"
+    );
+    assert!(outside["span_id"].is_null());
 }
 
 // ===========================================================================

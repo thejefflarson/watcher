@@ -4,6 +4,7 @@ pub mod db;
 pub mod grpc;
 pub mod otlp;
 pub mod retention;
+pub mod selflog;
 pub mod selfmon;
 
 use axum::{
