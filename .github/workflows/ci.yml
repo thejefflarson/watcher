@@ -80,6 +80,10 @@ jobs:
       # Accessibility floor (JEF-431): eslint-plugin-jsx-a11y gates keyboard-
       # operable rows, labeled charts, and no silent-live tables from regressing.
       - run: npm run lint
+      # Runtime a11y route-smoke (JEF-442) runs inside `npm test`: each top-level
+      # route is mounted (jsdom, API mocked) and scanned by axe-core, failing on
+      # serious/critical structural violations. Complements the static lint above —
+      # it catches ARIA that only resolves against the rendered tree.
       - run: npm test
       - run: npm run build
 
