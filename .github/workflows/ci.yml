@@ -107,6 +107,7 @@ jobs:
       contents: read
       packages: write
       id-token: write # keyless cosign signing (OIDC token -> Sigstore Fulcio)
+      attestations: write # Sigstore-signed SLSA build-provenance attestation (protector verifies it)
     steps:
       - uses: actions/checkout@v7
       - name: Connect to BuildKit (mTLS, native per-arch)
@@ -175,3 +176,11 @@ jobs:
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "ghcr.io/${{ github.repository_owner }}/watcher-server@${DIGEST}"
+      # Sigstore-signed SLSA build-provenance attestation (keyless: Fulcio + Rekor), pushed as an
+      # OCI referrer — what protector's provenance observer verifies to "provenance-verified".
+      - name: Attest build provenance (Sigstore-signed SLSA)
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/watcher-server
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
