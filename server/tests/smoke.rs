@@ -23,7 +23,7 @@ use serial_test::serial;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 use tracing_subscriber::layer::SubscriberExt;
-use watcher_server::{alerts, app, db, selflog, selfmon};
+use watcher_server::{alerts, app, db, selflog, selfmon, selftrace};
 
 fn now_nanos() -> u64 {
     SystemTime::now()
@@ -785,6 +785,73 @@ async fn self_logs_correlate_with_current_span() {
         "out-of-span self-log has no trace_id"
     );
     assert!(outside["span_id"].is_null());
+}
+
+// --- Self-trace instrumentation (JEF-462) ----------------------------------
+
+#[tokio::test]
+#[serial]
+async fn self_traces_land_in_spans_and_appear_in_services() {
+    use opentelemetry::trace::TracerProvider as _;
+    use tracing_subscriber::Layer as _; // brings `.with_filter` into scope
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+
+    // The full self-trace path exactly as `main` wires it: an SdkTracerProvider whose
+    // batch processor feeds the in-process exporter, under a tracing_opentelemetry
+    // layer carrying the anti-feedback filter. A single-threaded #[tokio::test]
+    // runtime keeps all awaited work (the drain) on this thread, under this subscriber.
+    let (exporter, mut rx) = selftrace::channel_exporter();
+    let provider = selftrace::build_provider(exporter);
+    let otel_layer = tracing_opentelemetry::layer()
+        .with_tracer(provider.tracer("watcher-server"))
+        .with_filter(tracing_subscriber::filter::dynamic_filter_fn(|_m, _c| {
+            !selflog::suppressed()
+        }));
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new("info"))
+        .with(otel_layer);
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    // Stand in for one of watcher's own /api request spans.
+    tracing::info_span!("GET /api/traces").in_scope(|| {
+        tracing::info!("handling watcher request");
+    });
+    // Flush the batch processor so the ended span reaches the exporter's channel. A
+    // shut-down processor (the JEF-462 bug) would export nothing.
+    provider.force_flush().expect("force_flush");
+
+    // Drain into the DB while the subscriber is still active: storing self-spans runs
+    // sqlx queries whose events/spans must be suppressed by the store guard, not
+    // re-exported into more stored spans.
+    let stored = selftrace::drain_pending(&pool, &mut rx).await;
+    assert!(stored >= 1, "the watcher span was exported and stored");
+
+    // Flush + drain again: the store path generated no captured spans, so nothing new.
+    provider.force_flush().expect("force_flush");
+    let again = selftrace::drain_pending(&pool, &mut rx).await;
+    assert_eq!(
+        again, 0,
+        "storing self-spans must not generate more self-spans"
+    );
+    drop(guard);
+
+    // watcher now appears in /api/services (RED per service reads the spans table),
+    // tagged service=watcher.
+    let router = app(pool.clone());
+    let (status, services) = get_json(&router, "/api/services").await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = services.as_array().expect("array");
+    let watcher = arr
+        .iter()
+        .find(|s| s["service"] == "watcher")
+        .expect("watcher present in /api/services");
+    assert!(
+        watcher["spans"].as_i64().unwrap() >= 1,
+        "watcher has at least the one stored span"
+    );
 }
 
 // ===========================================================================

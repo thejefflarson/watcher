@@ -22,3 +22,7 @@ Copy [`0000-template.md`](0000-template.md) to start one.
 | [0011](0011-metric-rollups.md) | Downsample metrics into rollup buckets | Accepted |
 | [0012](0012-alerting.md) | Threshold alerting with stored events and optional webhook | Accepted |
 | [0013](0013-auth-at-the-edge.md) | Authenticate at the edge (Cloudflare Access), not in the app | Accepted |
+| [0014](0014-self-monitoring-in-process-metrics.md) | Self-monitoring: emit ops metrics in-process, deep `/healthz` gates readiness | Accepted |
+| [0015](0015-sustained-condition-alerts.md) | Sustained-condition alerts (`for: 5m`) | Accepted |
+| [0016](0016-self-log-instrumentation.md) | Self-instrument watcher's own logs in-process | Accepted |
+| [0017](0017-self-trace-instrumentation-in-process.md) | Self-instrument watcher's own traces in-process | Accepted |
