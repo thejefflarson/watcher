@@ -44,6 +44,7 @@ opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 tracing-opentelemetry = "0.33"
 lettre = { version = "0.11.22", default-features = false, features = ["builder", "smtp-transport", "hostname", "tokio1-rustls-tls"] }
+jsonwebtoken = "9"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

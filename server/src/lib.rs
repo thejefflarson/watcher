@@ -1,3 +1,4 @@
+pub mod access_jwt;
 pub mod alerts;
 pub mod api;
 pub mod db;
@@ -8,9 +9,13 @@ pub mod selflog;
 pub mod selfmon;
 pub mod selftrace;
 
+use std::sync::Arc;
+
 use axum::{
     body::Body,
+    extract::State,
     http::{header, Request, StatusCode, Uri},
+    middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
@@ -19,6 +24,12 @@ use rust_embed::RustEmbed;
 use sqlx::PgPool;
 use tower_http::cors::CorsLayer;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+use crate::access_jwt::{Verifier, VerifyError};
+
+/// The header Cloudflare Access sets on requests that cleared its edge policy,
+/// carrying the signed identity JWT the origin re-verifies (JEF-473).
+const ACCESS_JWT_HEADER: &str = "Cf-Access-Jwt-Assertion";
 
 /// Reads W3C trace-context headers off an incoming request so watcher can
 /// continue the caller's trace (e.g. traefik's) rather than starting a new one.
@@ -111,13 +122,58 @@ async fn ui_handler(uri: Uri) -> Response {
     }
 }
 
-/// Build the HTTP router. Shared by the binary and the integration tests.
-///
-/// The server is unauthenticated at the app layer by design — auth lives at the
-/// edge (Cloudflare Access for the public read surface) and ingest is only
-/// reachable in-cluster (see ADR 0013). The permissive CORS layer keeps local
-/// dev (`:5173` → `:4318`) working.
+/// Middleware that re-verifies the Cloudflare Access JWT on the read surface
+/// (JEF-473). Origin-side defense-in-depth on top of the edge Access policy: a
+/// request missing or carrying an invalid `Cf-Access-Jwt-Assertion` is rejected
+/// `401` before reaching a handler. Wired **only** onto the UI shell + `/api`
+/// (never `/v1` ingest or `/healthz`) and only when Access is configured — see
+/// [`app_with_access`] and [`access_jwt`](crate::access_jwt).
+async fn access_guard(
+    State(verifier): State<Arc<Verifier>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let token = req
+        .headers()
+        .get(ACCESS_JWT_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let Some(token) = token else {
+        tracing::warn!(
+            path = %req.uri().path(),
+            "rejecting request with no {ACCESS_JWT_HEADER} header",
+        );
+        return (StatusCode::UNAUTHORIZED, "missing Cloudflare Access token").into_response();
+    };
+
+    match verifier.verify(token).await {
+        Ok(_claims) => next.run(req).await,
+        // Cold-cache / JWKS-outage: fail open (the edge is still the gate) so a
+        // Cloudflare certs blip can't take the whole read surface down.
+        Err(VerifyError::KeysUnavailable) => next.run(req).await,
+        Err(e @ VerifyError::Invalid(_)) => {
+            tracing::warn!(path = %req.uri().path(), "rejecting request: {e}");
+            (StatusCode::UNAUTHORIZED, "invalid Cloudflare Access token").into_response()
+        }
+    }
+}
+
+/// Build the HTTP router with no origin-side auth. Shared by the binary and the
+/// integration tests; the binary calls [`app_with_access`] when Access is
+/// configured. See ADR 0013 for the edge-auth design this augments.
 pub fn app(pool: PgPool) -> Router {
+    app_with_access(pool, None)
+}
+
+/// Build the HTTP router, optionally enforcing Cloudflare Access JWT verification
+/// (JEF-473) on the read surface.
+///
+/// The server holds no app-layer auth by default — auth lives at the edge
+/// (Cloudflare Access for the public read surface) and ingest is only reachable
+/// in-cluster (ADR 0013). When `access` is `Some`, the UI shell + `/api` are
+/// additionally guarded at the origin; `/v1` ingest and `/healthz` are **never**
+/// gated (in-cluster collectors and kubelet probes carry no token). The permissive
+/// CORS layer keeps local dev (`:5173` → `:4318`) working.
+pub fn app_with_access(pool: PgPool, access: Option<Arc<Verifier>>) -> Router {
     let ingest = Router::new()
         .route("/v1/traces", post(otlp::ingest_traces))
         .route("/v1/logs", post(otlp::ingest_logs))
@@ -148,12 +204,22 @@ pub fn app(pool: PgPool) -> Router {
         // can't create a feedback loop.
         .layer(tower_http::trace::TraceLayer::new_for_http().make_span_with(otel_request_span));
 
+    // The guarded surface: `/api` plus the SPA fallback (the UI shell). When Access
+    // is configured, the JWT middleware wraps exactly these — not ingest or healthz.
+    let guarded = api.fallback(ui_handler);
+    let guarded = match access {
+        Some(verifier) => {
+            guarded.layer(axum::middleware::from_fn_with_state(verifier, access_guard))
+        }
+        None => guarded,
+    };
+
     Router::new()
+        // Never gated: kubelet hits /healthz and in-cluster collectors hit /v1
+        // directly, neither carrying an Access token.
         .route("/healthz", get(api::healthz))
         .merge(ingest)
-        .merge(api)
-        // Anything not an API/ingest/health route is the embedded UI (SPA).
-        .fallback(ui_handler)
+        .merge(guarded)
         .layer(CorsLayer::permissive())
         .with_state(pool)
 }

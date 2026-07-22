@@ -2,10 +2,13 @@ use std::io::IsTerminal;
 use std::net::SocketAddr;
 
 use opentelemetry::trace::TracerProvider as _;
+use std::sync::Arc;
 use tracing_subscriber::filter::dynamic_filter_fn;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
-use watcher_server::{alerts, app, db, grpc, retention, selflog, selfmon, selftrace};
+use watcher_server::{
+    access_jwt, alerts, app_with_access, db, grpc, retention, selflog, selfmon, selftrace,
+};
 
 /// Self-instrumentation: capture watcher's own traces **in-process**, tagged
 /// `service.name=watcher`, so they land in its own `spans` table and it shows up in
@@ -170,13 +173,28 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(selftrace::drain(pool.clone(), rx));
     }
 
+    // Origin-side Cloudflare Access JWT verification (JEF-473): when
+    // WATCHER_ACCESS_TEAM_DOMAIN + WATCHER_ACCESS_AUD are set, the UI shell + /api
+    // additionally re-verify the edge-issued Access token as defense-in-depth
+    // (ADR 0013). Unset → not wired in, so local dev / non-Access deploys are
+    // unchanged. /v1 ingest and /healthz are never gated.
+    let access = access_jwt::Verifier::from_env().map(Arc::new);
+    if access.is_some() {
+        tracing::info!("Cloudflare Access origin JWT verification enabled for UI + /api");
+    } else {
+        tracing::info!(
+            "Cloudflare Access origin verification disabled (WATCHER_ACCESS_* unset); \
+             edge auth only"
+        );
+    }
+
     let http = {
         let pool = pool.clone();
         let bind = http_bind.clone();
         async move {
             let listener = tokio::net::TcpListener::bind(&bind).await?;
             tracing::info!("HTTP/OTLP + API on http://{bind}");
-            axum::serve(listener, app(pool)).await?;
+            axum::serve(listener, app_with_access(pool, access)).await?;
             Ok::<(), anyhow::Error>(())
         }
     };

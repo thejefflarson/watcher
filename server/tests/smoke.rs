@@ -23,7 +23,7 @@ use serial_test::serial;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 use tracing_subscriber::layer::SubscriberExt;
-use watcher_server::{alerts, app, db, selflog, selfmon, selftrace};
+use watcher_server::{access_jwt, alerts, app, app_with_access, db, selflog, selfmon, selftrace};
 
 fn now_nanos() -> u64 {
     SystemTime::now()
@@ -2464,4 +2464,193 @@ async fn logs_attribute_filter() {
     // No attr filter → both.
     let (_, all) = get_json(&router, "/api/logs").await;
     assert_eq!(all.as_array().unwrap().len(), 2);
+}
+
+// --- Origin-side Cloudflare Access JWT verification (JEF-473) ---------------
+//
+// The middleware guards the UI shell + /api when Access is configured, and never
+// guards /v1 ingest or /healthz. These prove the route policy end-to-end using a
+// locally-signed JWT and a local JWKS server (no Cloudflare, no network).
+
+const ACCESS_KID: &str = "test-key-1";
+const ACCESS_N: &str = "uvr8rE8LT_sYjwq02YqlXZNFbHga1O3uxDiBLr7J39ELOGtLeTtl6QZF4NNJEufj_nQso32EPIffObihmofqAxiiU_JctOt0IH_Cfbbn5aVnQidUhtzo7URe_neZ4fT8lqtUyPHBcKt1Vt2p9igpntQH0hrfUAnCMXiCh9te0bgBjtV4NjtBlwhZGD8rohumJcMN8Q12gHJNsmhRIym5hvQMeth7nuff7u4Ttr6kAZ90TU57PSgUOT12pbx-UT2yiyaJUv6xMSjIhc4og-wGNRJZ7R-1Zb3WVj5Je_6bvwrA6hwgo7nxXSmKsbmoXpaWBkpxJq0uUNqG09a5-Ivhiw";
+const ACCESS_E: &str = "AQAB";
+const ACCESS_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC6+vysTwtP+xiP
+CrTZiqVdk0VseBrU7e7EOIEuvsnf0Qs4a0t5O2XpBkXg00kS5+P+dCyjfYQ8h985
+uKGah+oDGKJT8ly063Qgf8J9tuflpWdCJ1SG3OjtRF7+d5nh9PyWq1TI8cFwq3VW
+3an2KCme1AfSGt9QCcIxeIKH217RuAGO1Xg2O0GXCFkYPyuiG6Ylww3xDXaAck2y
+aFEjKbmG9Ax62Hue59/u7hO2vqQBn3RNTns9KBQ5PXalvH5RPbKLJolS/rExKMiF
+ziiD7AY1ElntH7VlvdZWPkl7/pu/CsDqHCCjufFdKYqxuahelpYGSnEmrS5Q2obT
+1rn4i+GLAgMBAAECggEABbkk/sk0mXAgIlC7lGUQBrs5RsauW5Ik2tC384xXdYha
+hZGTL9THm8hbXzRYakG60tEPhLmU0J2AEa47FBXQ7eNVJKioeckzNsNyWpK8qmTT
+skyt46rjXk/XcIaMqUPsb1gzMitkNmSpJM2IJEa6b2giDSZRa4vA6+66YBow3s5r
+pq9WxymTWinSmrkPjiH0dQ4X5O9B8VK88ITZZHEbHmN6g7RXnVoVknGyCgV19jEr
+k+iUz5Gmth9PD6tiA7fIhcKcAEyXwCRaWe1dfdWynm2gfHgjhmDME+B3BsiL14DU
+lZ/VuCLcgGky+SdxqG9OsYgoBFygsiGC2DSab+Ja8QKBgQDi/w1IYDoibbaPDO+n
+pm5SAa3vv7snlEcDocNUROcgUGN5qr9Kek4Me4Cgtx/RYdaf/P3SODLV47V7yI4x
+dAQZlqPaKd4ogwJTdr+Bh97if+8gOYprhmZRqsIomCZrNe1f7gjP2GLyIa8FnfD2
+GERliRxE3hHj9SSGfWGRXx7hfQKBgQDS3wiTDuBi1PE2cvp8rytW0dOoJKsEk0K8
+wpHbRIumzhkCMwUdh2o8B46RaFSNPqaoRpiLZJykM5UZ4LKNTEcYHrwkc9W+cOF7
+JhCDWpdrKDeHBnRdNEs1dhJYoIRkmNp/C1YD+PPie9X46Jib1F0FP04ihMJ2KWdD
+wXimXhw9pwKBgQDWCtQWjA4lSrja+MK+nhPmpgjCSlOKxamUxiLuQi6CbOrv3c6U
+xvDzmj02zpZlFFGR+LfKUw20XAxUFU/nV9NJ4Z7NZ69BGg/GbfG0jU7g2uu7wiZA
+r7Gpjk+YgaewbmBPlZ+fhRX/5T0pGb4N/+H2sCwE0DWkcxKm8nFe54ex7QKBgQDF
+dDD8OwbjpI/Fs35X+FK1tj7iCIvW+emZBPw8/H9kD0Kdq5aTovRYB595Ct95bvvx
+QEGg7PI8U0y/cYbgBlff/w+fdpPkAqEwhmEaDl8Q6RStq96UU95Ezi25rXyrEfIu
+2jeN+rSsE9c1ft8/s2fy/Oc2LWhF6tkWOfi2mBMLqwKBgBsBQelfPVHUCmI1Qsyr
+hiyFRxn1pJdezc0RjETBfNsDKTJfuEcAxI4X9Z1iTgGLiJrbO5FuNhRN5ShfnrdU
+rF7q76B1WCT69QpyJ+OHl0Sp6Uegf09l3QeJE6eTxDS9r7qGFPoAn5v5zBpsrrhF
+lsCu2w3KPmCX769JvIYnwU8y
+-----END PRIVATE KEY-----";
+
+const ACCESS_ISSUER: &str = "https://team.cloudflareaccess.com";
+const ACCESS_AUD: &str = "smoke-aud-tag";
+
+/// Spawn a local JWKS endpoint serving the test signing key, returning its URL.
+async fn spawn_jwks() -> String {
+    use axum::{routing::get, Json, Router};
+    let jwks = serde_json::json!({
+        "keys": [{
+            "kid": ACCESS_KID, "kty": "RSA", "alg": "RS256", "use": "sig",
+            "n": ACCESS_N, "e": ACCESS_E,
+        }]
+    });
+    let app = Router::new().route("/certs", get(move || async move { Json(jwks) }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}/certs")
+}
+
+/// Sign an Access-shaped JWT with the test key. `iss`/`aud`/`exp` are overridable
+/// so the negative cases can produce a well-signed-but-invalid token.
+fn access_token(iss: &str, aud: &str, exp_offset: i64) -> String {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    let now = now_nanos() / 1_000_000_000;
+    let claims = json!({
+        "iss": iss,
+        "aud": [aud],
+        "sub": "smoke-user",
+        "email": "smoke@example.com",
+        "exp": (now as i64 + exp_offset),
+        "iat": now,
+    });
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(ACCESS_KID.to_string());
+    let key = EncodingKey::from_rsa_pem(ACCESS_PEM.as_bytes()).unwrap();
+    encode(&header, &claims, &key).unwrap()
+}
+
+/// GET a path, optionally attaching the Cf-Access-Jwt-Assertion header.
+async fn get_status_with_token(
+    router: &axum::Router,
+    uri: &str,
+    token: Option<&str>,
+) -> StatusCode {
+    let mut builder = Request::builder().uri(uri);
+    if let Some(t) = token {
+        builder = builder.header("Cf-Access-Jwt-Assertion", t);
+    }
+    router
+        .clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+#[serial]
+async fn access_configured_gates_api_and_ui_but_not_ingest_or_health() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let certs_url = spawn_jwks().await;
+    let verifier = std::sync::Arc::new(access_jwt::Verifier::new(
+        ACCESS_ISSUER,
+        certs_url,
+        ACCESS_AUD,
+    ));
+    let router = app_with_access(pool, Some(verifier));
+
+    // /api with no token → 401.
+    assert_eq!(
+        get_status_with_token(&router, "/api/traces", None).await,
+        StatusCode::UNAUTHORIZED,
+        "/api must reject a missing Access token"
+    );
+
+    // /api with a valid token → passes (200, real JSON).
+    let good = access_token(ACCESS_ISSUER, ACCESS_AUD, 3600);
+    assert_eq!(
+        get_status_with_token(&router, "/api/traces", Some(&good)).await,
+        StatusCode::OK,
+        "/api must accept a valid Access token"
+    );
+
+    // Well-signed but wrong-audience → 401 (proves aud is checked, not just sig).
+    let wrong_aud = access_token(ACCESS_ISSUER, "some-other-app", 3600);
+    assert_eq!(
+        get_status_with_token(&router, "/api/traces", Some(&wrong_aud)).await,
+        StatusCode::UNAUTHORIZED,
+        "/api must reject a token minted for a different Access app"
+    );
+
+    // Expired → 401 (proves expiry is checked).
+    let expired = access_token(ACCESS_ISSUER, ACCESS_AUD, -3600);
+    assert_eq!(
+        get_status_with_token(&router, "/api/traces", Some(&expired)).await,
+        StatusCode::UNAUTHORIZED,
+        "/api must reject an expired token"
+    );
+
+    // Garbage token → 401.
+    assert_eq!(
+        get_status_with_token(&router, "/api/traces", Some("not-a-jwt")).await,
+        StatusCode::UNAUTHORIZED,
+    );
+
+    // The UI shell (SPA fallback) is gated too — no token → 401.
+    assert_eq!(
+        get_status_with_token(&router, "/some/spa/route", None).await,
+        StatusCode::UNAUTHORIZED,
+        "the UI shell must be gated, not just /api"
+    );
+
+    // /v1 ingest is NEVER gated: a tokenless OTLP POST still succeeds.
+    assert_eq!(
+        post_proto(
+            &router,
+            "/v1/metrics",
+            gauge_request("cpu.load", 0.5, now_nanos()).encode_to_vec()
+        )
+        .await,
+        StatusCode::OK,
+        "/v1 ingest must stay open — collectors carry no token"
+    );
+
+    // /healthz is NEVER gated: kubelet probes it directly with no token.
+    assert_eq!(
+        get_status_with_token(&router, "/healthz", None).await,
+        StatusCode::OK,
+        "/healthz must stay open — probes carry no token"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn access_unconfigured_leaves_api_open() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // No verifier → no enforcement (local dev / non-Access deploys unchanged).
+    let router = app_with_access(pool, None);
+    assert_eq!(
+        get_status_with_token(&router, "/api/traces", None).await,
+        StatusCode::OK,
+        "unconfigured Access must not gate /api"
+    );
 }
