@@ -3,6 +3,7 @@ pub mod alerts;
 pub mod api;
 pub mod db;
 pub mod grpc;
+pub mod mcp;
 pub mod otlp;
 pub mod retention;
 pub mod selflog;
@@ -205,7 +206,8 @@ pub fn app_with_access(pool: PgPool, access: Option<Arc<Verifier>>) -> Router {
         .layer(tower_http::trace::TraceLayer::new_for_http().make_span_with(otel_request_span));
 
     // The guarded surface: `/api` plus the SPA fallback (the UI shell). When Access
-    // is configured, the JWT middleware wraps exactly these — not ingest or healthz.
+    // is configured, the JWT middleware wraps exactly these — not ingest, healthz,
+    // or /mcp.
     let guarded = api.fallback(ui_handler);
     let guarded = match access {
         Some(verifier) => {
@@ -214,12 +216,23 @@ pub fn app_with_access(pool: PgPool, access: Option<Arc<Verifier>>) -> Router {
         None => guarded,
     };
 
-    Router::new()
+    let mut router = Router::new()
         // Never gated: kubelet hits /healthz and in-cluster collectors hit /v1
         // directly, neither carrying an Access token.
         .route("/healthz", get(api::healthz))
         .merge(ingest)
-        .merge(guarded)
-        .layer(CorsLayer::permissive())
-        .with_state(pool)
+        .merge(guarded);
+
+    // Read-only MCP server (JEF-471), opt-in via WATCHER_MCP_ENABLED (default
+    // OFF). Nested as its own tower service *outside* the `/api` router — and
+    // therefore outside the Access guard above. It is not a browser surface and
+    // gets its own auth in JEF-472, so it must not ride the browser-cookie edge
+    // auth the UI/`/api` sit behind. Nesting before the state is applied keeps it
+    // off `with_state` (it carries its own pool). The startup log lives in `main`
+    // (this fn runs per-request in tests).
+    if mcp::enabled() {
+        router = router.nest_service("/mcp", mcp::service(pool.clone()));
+    }
+
+    router.layer(CorsLayer::permissive()).with_state(pool)
 }

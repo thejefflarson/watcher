@@ -7,7 +7,7 @@ use tracing_subscriber::filter::dynamic_filter_fn;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 use watcher_server::{
-    access_jwt, alerts, app_with_access, db, grpc, retention, selflog, selfmon, selftrace,
+    access_jwt, alerts, app_with_access, db, grpc, mcp, retention, selflog, selfmon, selftrace,
 };
 
 /// Self-instrumentation: capture watcher's own traces **in-process**, tagged
@@ -186,6 +186,15 @@ async fn main() -> anyhow::Result<()> {
             "Cloudflare Access origin verification disabled (WATCHER_ACCESS_* unset); \
              edge auth only"
         );
+    }
+
+    // Read-only MCP server (JEF-471): mounted at /mcp by `app_with_access` only when
+    // WATCHER_MCP_ENABLED is set (default OFF). It carries no auth of its own yet
+    // (JEF-472), so it must not be exposed unauthenticated — hence opt-in.
+    if mcp::enabled() {
+        tracing::info!("MCP server (read-only) enabled at /mcp");
+    } else {
+        tracing::debug!("MCP server disabled (set WATCHER_MCP_ENABLED=1 to enable /mcp)");
     }
 
     let http = {

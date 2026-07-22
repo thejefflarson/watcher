@@ -2654,3 +2654,101 @@ async fn access_unconfigured_leaves_api_open() {
         "unconfigured Access must not gate /api"
     );
 }
+
+// --- MCP server (JEF-471) --------------------------------------------------
+
+/// End-to-end MCP smoke test: enable `/mcp`, serve the real app on an ephemeral
+/// port, and drive it with the official rmcp streamable-HTTP client — list the
+/// tools and call `list_services` + `query_logs`, asserting the JSON shape.
+/// Multi-thread runtime so the server accept-loop and client run concurrently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn mcp_lists_tools_and_calls_read_queries() {
+    use rmcp::{
+        model::CallToolRequestParams, transport::StreamableHttpClientTransport, ServiceExt,
+    };
+
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    // Seed one service (span) + one log so list_services / query_logs return data.
+    insert_span_at(&pool, "checkout", "mcp-tr", "mcp-s", 2.0).await;
+    insert_log_at(&pool, "checkout", 2.0).await;
+
+    // Enable the endpoint for this test only (default OFF). #[serial] keeps this
+    // process-global env change from racing the other tests.
+    std::env::set_var("WATCHER_MCP_ENABLED", "1");
+    let router = app(pool);
+    std::env::remove_var("WATCHER_MCP_ENABLED");
+
+    // Serve on an ephemeral port so a real MCP client can drive the transport.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let transport = StreamableHttpClientTransport::from_uri(format!("http://{addr}/mcp"));
+    let client = ().serve(transport).await.expect("mcp handshake");
+
+    // Tools list: exactly the nine read tools are advertised (no write/mutate tool).
+    let tools = client.list_all_tools().await.expect("list_tools");
+    let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
+    for expected in [
+        "search_traces",
+        "get_trace",
+        "query_logs",
+        "list_services",
+        "service_map",
+        "query_metrics",
+        "metric_series",
+        "list_alerts",
+        "alert_events",
+    ] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "missing tool {expected} in {names:?}"
+        );
+    }
+    assert_eq!(names.len(), 9, "exactly the nine read tools: {names:?}");
+
+    // list_services (→ service_red): the seeded service with its RED shape.
+    let res = client
+        .call_tool(CallToolRequestParams::new("list_services"))
+        .await
+        .expect("call list_services");
+    assert_ne!(res.is_error, Some(true), "list_services errored");
+    let text = res
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .expect("text content");
+    let services: serde_json::Value = serde_json::from_str(&text.text).expect("services JSON");
+    let svc = services
+        .as_array()
+        .expect("services array")
+        .iter()
+        .find(|s| s["service"] == "checkout")
+        .expect("checkout present");
+    assert!(svc["spans"].as_i64().unwrap() >= 1);
+
+    // query_logs (→ list_logs): the seeded log with its typed fields, no filters.
+    let res = client
+        .call_tool(CallToolRequestParams::new("query_logs"))
+        .await
+        .expect("call query_logs");
+    assert_ne!(res.is_error, Some(true), "query_logs errored");
+    let text = res
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .expect("text content");
+    let logs: serde_json::Value = serde_json::from_str(&text.text).expect("logs JSON");
+    let larr = logs.as_array().expect("logs array");
+    assert_eq!(larr.len(), 1);
+    assert_eq!(larr[0]["service"], "checkout");
+
+    client.cancel().await.ok();
+    server.abort();
+}

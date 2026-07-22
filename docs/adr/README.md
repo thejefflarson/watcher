@@ -26,3 +26,4 @@ Copy [`0000-template.md`](0000-template.md) to start one.
 | [0015](0015-sustained-condition-alerts.md) | Sustained-condition alerts (`for: 5m`) | Accepted |
 | [0016](0016-self-log-instrumentation.md) | Self-instrument watcher's own logs in-process | Accepted |
 | [0017](0017-self-trace-instrumentation-in-process.md) | Self-instrument watcher's own traces in-process | Accepted |
+| [0018](0018-read-only-mcp-server-in-process.md) | Expose the read API as a read-only MCP server, in-process on `/mcp` | Accepted |
