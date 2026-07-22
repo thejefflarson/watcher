@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-07-21
 - Related: [0013](0013-auth-at-the-edge.md), [0010](0010-ui-embedded-in-server-binary.md), [0002](0002-rust-axum-sqlx-runtime-queries.md)
+- Amended: 2026-07-21 — `/mcp` auth landed in [0019](0019-mcp-auth-cloudflare-access-oidc.md) (Cloudflare Access OIDC Bearer). The "unauthenticated for now" posture below is superseded: `/mcp` now fails closed and the transport's Host allow-list is revisited there.
 
 ## Context
 

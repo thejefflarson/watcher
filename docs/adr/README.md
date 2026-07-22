@@ -27,3 +27,4 @@ Copy [`0000-template.md`](0000-template.md) to start one.
 | [0016](0016-self-log-instrumentation.md) | Self-instrument watcher's own logs in-process | Accepted |
 | [0017](0017-self-trace-instrumentation-in-process.md) | Self-instrument watcher's own traces in-process | Accepted |
 | [0018](0018-read-only-mcp-server-in-process.md) | Expose the read API as a read-only MCP server, in-process on `/mcp` | Accepted |
+| [0019](0019-mcp-auth-cloudflare-access-oidc.md) | Authenticate `/mcp` with a Cloudflare Access OIDC Bearer token | Accepted |

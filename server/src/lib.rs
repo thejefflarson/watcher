@@ -4,6 +4,7 @@ pub mod api;
 pub mod db;
 pub mod grpc;
 pub mod mcp;
+pub mod mcp_auth;
 pub mod otlp;
 pub mod retention;
 pub mod selflog;
@@ -27,6 +28,7 @@ use tower_http::cors::CorsLayer;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::access_jwt::{Verifier, VerifyError};
+use crate::mcp_auth::McpAuth;
 
 /// The header Cloudflare Access sets on requests that cleared its edge policy,
 /// carrying the signed identity JWT the origin re-verifies (JEF-473).
@@ -158,15 +160,22 @@ async fn access_guard(
     }
 }
 
-/// Build the HTTP router with no origin-side auth. Shared by the binary and the
-/// integration tests; the binary calls [`app_with_access`] when Access is
-/// configured. See ADR 0013 for the edge-auth design this augments.
+/// Build the HTTP router with no origin-side auth (MCP auth, if any, still comes from
+/// the environment). Shared by the binary and the integration tests; the binary calls
+/// [`app_with_access`] when Access is configured. See ADR 0013 for the edge-auth
+/// design this augments.
 pub fn app(pool: PgPool) -> Router {
-    app_with_access(pool, None)
+    app_with_auth(pool, None, McpAuth::from_env())
 }
 
 /// Build the HTTP router, optionally enforcing Cloudflare Access JWT verification
-/// (JEF-473) on the read surface.
+/// (JEF-473) on the read surface; MCP auth is taken from the environment.
+pub fn app_with_access(pool: PgPool, access: Option<Arc<Verifier>>) -> Router {
+    app_with_auth(pool, access, McpAuth::from_env())
+}
+
+/// Build the HTTP router, optionally enforcing Cloudflare Access JWT verification
+/// (JEF-473) on the read surface and Bearer auth (JEF-472) on `/mcp`.
 ///
 /// The server holds no app-layer auth by default — auth lives at the edge
 /// (Cloudflare Access for the public read surface) and ingest is only reachable
@@ -174,7 +183,17 @@ pub fn app(pool: PgPool) -> Router {
 /// additionally guarded at the origin; `/v1` ingest and `/healthz` are **never**
 /// gated (in-cluster collectors and kubelet probes carry no token). The permissive
 /// CORS layer keeps local dev (`:5173` → `:4318`) working.
-pub fn app_with_access(pool: PgPool, access: Option<Arc<Verifier>>) -> Router {
+///
+/// `/mcp` (when `WATCHER_MCP_ENABLED`) is served **only** when `mcp_auth` is `Some`:
+/// with no auth configured it is refused rather than exposed unauthenticated (fail
+/// closed). Its Bearer guard and the unauthenticated resource-metadata documents are
+/// wired here — outside the browser Access guard, since an MCP client is not a
+/// browser.
+pub fn app_with_auth(
+    pool: PgPool,
+    access: Option<Arc<Verifier>>,
+    mcp_auth: Option<McpAuth>,
+) -> Router {
     let ingest = Router::new()
         .route("/v1/traces", post(otlp::ingest_traces))
         .route("/v1/logs", post(otlp::ingest_logs))
@@ -223,15 +242,42 @@ pub fn app_with_access(pool: PgPool, access: Option<Arc<Verifier>>) -> Router {
         .merge(ingest)
         .merge(guarded);
 
-    // Read-only MCP server (JEF-471), opt-in via WATCHER_MCP_ENABLED (default
-    // OFF). Nested as its own tower service *outside* the `/api` router — and
-    // therefore outside the Access guard above. It is not a browser surface and
-    // gets its own auth in JEF-472, so it must not ride the browser-cookie edge
-    // auth the UI/`/api` sit behind. Nesting before the state is applied keeps it
-    // off `with_state` (it carries its own pool). The startup log lives in `main`
-    // (this fn runs per-request in tests).
+    // Read-only MCP server (JEF-471), opt-in via WATCHER_MCP_ENABLED (default OFF).
+    // Nested as its own tower service *outside* the `/api` router — and therefore
+    // outside the browser Access guard above, since an MCP client is not a browser
+    // and carries no Access cookie. It gets its **own** Bearer auth (JEF-472): the
+    // transport is wrapped in `mcp_auth::bearer_guard`, and the unauthenticated
+    // discovery documents are served so a client can find the authorization server.
+    //
+    // Fail closed: when MCP is enabled but no auth is configured, `/mcp` is not
+    // mounted at all (the operator-facing error is logged in `main`) — we never
+    // expose an unauthenticated MCP surface.
     if mcp::enabled() {
-        router = router.nest_service("/mcp", mcp::service(pool.clone()));
+        if let Some(auth) = mcp_auth {
+            let auth = Arc::new(auth);
+
+            // Discovery (RFC 9728): served unauthenticated — the client fetches this
+            // *before* it has a token. Explicit routes take precedence over the SPA
+            // fallback, and they sit outside the Access guard. The root path is an
+            // alias some clients probe.
+            for path in [mcp_auth::METADATA_PATH, mcp_auth::METADATA_PATH_ROOT] {
+                let md = auth.clone();
+                router = router.route(
+                    path,
+                    get(move |headers| mcp_auth::protected_resource_metadata(md.clone(), headers)),
+                );
+            }
+
+            // The MCP transport behind the Bearer guard. Nesting before `with_state`
+            // keeps the service off `with_state` (it carries its own pool).
+            let guard = auth.clone();
+            let guarded_mcp = Router::new()
+                .nest_service("/mcp", mcp::service(pool.clone()))
+                .layer(axum::middleware::from_fn(move |req, next| {
+                    mcp_auth::bearer_guard(guard.clone(), req, next)
+                }));
+            router = router.merge(guarded_mcp);
+        }
     }
 
     router.layer(CorsLayer::permissive()).with_state(pool)
