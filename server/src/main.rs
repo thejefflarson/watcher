@@ -2,18 +2,25 @@ use std::io::IsTerminal;
 use std::net::SocketAddr;
 
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_otlp::WithExportConfig;
+use tracing_subscriber::filter::dynamic_filter_fn;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
-use watcher_server::{alerts, app, db, grpc, retention, selflog, selfmon};
+use watcher_server::{alerts, app, db, grpc, retention, selflog, selfmon, selftrace};
 
-/// Self-instrumentation: export watcher's own traces over OTLP, tagged
-/// `service.name=watcher` by default, so it shows up in its own UI. Exports to
-/// itself (`http://localhost:4318`) unless `OTEL_EXPORTER_OTLP_ENDPOINT` says
-/// otherwise; opt out with `WATCHER_SELF_TELEMETRY=0`. Only `/api` requests are
-/// spanned (not `/v1`), so exporting to self can't loop.
-fn init_telemetry() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
-    if !selfmon::enabled() {
+/// Self-instrumentation: capture watcher's own traces **in-process**, tagged
+/// `service.name=watcher`, so they land in its own `spans` table and it shows up in
+/// its own UI. Like self-metrics (ADR 0014) and self-logs (ADR 0016), traces go
+/// straight to the ingest path ([`selftrace`]) — no network hop, no OTLP self-POST,
+/// no batch-to-self that can wedge in a shut-down state (JEF-462). Opt out with
+/// `WATCHER_SELF_TELEMETRY=0`.
+///
+/// Returns the provider (kept alive for the process lifetime; dropping it shuts the
+/// batch processor down) and the receiver its drain task consumes once the pool is up.
+fn init_self_traces() -> Option<(
+    opentelemetry_sdk::trace::SdkTracerProvider,
+    selftrace::SpanReceiver,
+)> {
+    if !selftrace::enabled() {
         return None;
     }
     // W3C trace-context propagation, so incoming `traceparent` headers are
@@ -22,27 +29,8 @@ fn init_telemetry() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
     opentelemetry::global::set_text_map_propagator(
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
-
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .unwrap_or_else(|_| "http://localhost:4318".to_string());
-    let service = std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "watcher".to_string());
-
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_http()
-        .with_endpoint(format!("{}/v1/traces", endpoint.trim_end_matches('/')))
-        .build()
-        .ok()?;
-    // 0.32 API: SdkTracerProvider, a runtime-free batch exporter (its own thread),
-    // and Resource via the builder (Resource::new is no longer public).
-    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_resource(
-            opentelemetry_sdk::Resource::builder()
-                .with_attribute(opentelemetry::KeyValue::new("service.name", service))
-                .build(),
-        )
-        .build();
-    Some(provider)
+    let (exporter, rx) = selftrace::channel_exporter();
+    Some((selftrace::build_provider(exporter), rx))
 }
 
 #[tokio::main]
@@ -50,10 +38,17 @@ async fn main() -> anyhow::Result<()> {
     // Capture boot time up front so retention-stall detection measures uptime
     // from here, not from the first /healthz hit.
     selfmon::mark_started();
-    let telemetry = init_telemetry();
-    let otel_layer = telemetry
-        .as_ref()
-        .map(|p| tracing_opentelemetry::layer().with_tracer(p.tracer("watcher-server")));
+    let self_traces = init_self_traces();
+    let otel_layer = self_traces.as_ref().map(|(provider, _)| {
+        // The per-layer filter is the trace analogue of selflog's `on_event` guard:
+        // while a self-signal store runs (selflog::store_guarded sets the shared
+        // `STORING` task-local), skip capture so a span the store path emits is never
+        // exported and re-stored. `dynamic_filter_fn` (not `filter_fn`) is required —
+        // it reads the task-local per span rather than caching the callsite decision.
+        tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("watcher-server"))
+            .with_filter(dynamic_filter_fn(|_meta, _cx| !selflog::suppressed()))
+    });
     // Self-log capture (JEF-452): a layer that mirrors watcher's own events into its
     // own `logs` table. Built here, before the pool exists, so startup events buffer
     // in its channel; `main` spawns the drain task once the DB is up. The receiver
@@ -81,6 +76,11 @@ async fn main() -> anyhow::Result<()> {
         .with(otel_layer)
         .with(selflog_layer)
         .init();
+
+    // Keep the tracer provider alive for the whole process (dropping it shuts the
+    // batch processor down — the very failure mode JEF-462 fixes), and take the
+    // receiver so the drain task can be spawned once the pool is up.
+    let (_self_trace_provider, selftrace_rx) = self_traces.unzip();
 
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://watcher:watcher@localhost:5432/watcher".to_string());
@@ -162,6 +162,12 @@ async fn main() -> anyhow::Result<()> {
     // installed above) into the `logs` table via the same in-process ingest path.
     if let Some(rx) = selflog_rx {
         tokio::spawn(selflog::drain(pool.clone(), rx));
+    }
+    // Self-traces (JEF-462): drain the buffered self-spans (exported by the in-process
+    // SpanExporter installed above) into the `spans` table via the same ingest path.
+    // Spawned on the main runtime so its sqlx I/O runs on the pool's own reactors.
+    if let Some(rx) = selftrace_rx {
+        tokio::spawn(selftrace::drain(pool.clone(), rx));
     }
 
     let http = {

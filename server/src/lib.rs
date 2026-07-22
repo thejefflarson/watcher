@@ -6,6 +6,7 @@ pub mod otlp;
 pub mod retention;
 pub mod selflog;
 pub mod selfmon;
+pub mod selftrace;
 
 use axum::{
     body::Body,
