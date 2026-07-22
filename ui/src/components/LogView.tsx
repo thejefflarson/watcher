@@ -89,11 +89,13 @@ export default function LogView() {
     <div className="logs">
       <div className="filters">
         <input
+          aria-label="Search log body"
           placeholder="search body…"
           value={q}
           onChange={(e) => setQ(e.target.value)}
         />
         <input
+          aria-label="Filter by an attribute, e.g. k8s.pod.name=api-7f"
           placeholder="attribute key=value"
           value={attr}
           onChange={(e) => setAttr(e.target.value)}

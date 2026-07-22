@@ -217,16 +217,6 @@ async function expectNoBlockingViolations(
 ) {
   const results = await axe(container, {
     rules: {
-      // BASELINE (not a coverage gap in disguise): the header selects (service /
-      // range / live) and the filter inputs carry their accessible name via a
-      // `title` attribute rather than a visible <label> — a deliberate app-wide
-      // dense-UI pattern that predates this smoke and passed JEF-431's static
-      // gate. axe's `label-title-only` is serious, so leaving it on would fail
-      // every route on markup this ticket is scoped out of (test files only).
-      // The controls ARE named (the base `label` rule still enforces that), so
-      // this only waives the "make it a visible label" upgrade. Promoting these
-      // titles to real labels is a follow-up (see PR notes), not a regression.
-      "label-title-only": { enabled: false },
       // Per-route waivers layer on top (kept as narrow as possible so a rule stays
       // enforced everywhere it isn't a documented pre-existing baseline).
       ...ruleOverrides,

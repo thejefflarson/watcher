@@ -126,6 +126,7 @@ function ServiceFocus() {
     <select
       value={service}
       onChange={(e) => setService(e.target.value)}
+      aria-label="Service focus (scopes every tab)"
       title="Service focus (scopes every tab)"
     >
       <option value="">all services</option>
@@ -172,6 +173,7 @@ function Controls() {
       <select
         value={rangeKey}
         onChange={(e) => setRangeKey(e.target.value)}
+        aria-label="Time range"
         title="Time range"
       >
         {RANGES.map((r) => (
@@ -183,6 +185,7 @@ function Controls() {
       <select
         value={intervalKey}
         onChange={(e) => setIntervalKey(e.target.value)}
+        aria-label="Live refresh"
         title="Live refresh"
       >
         {INTERVALS.map((i) => (

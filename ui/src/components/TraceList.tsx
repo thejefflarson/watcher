@@ -59,11 +59,13 @@ export default function TraceList({ to }: { to: (traceId: string) => string }) {
   const filters = (
     <div className="filters">
       <input
+        aria-label="Filter by root span name"
         placeholder="root span name…"
         value={name}
         onChange={(e) => setName(e.target.value)}
       />
       <input
+        aria-label="Filter to traces with a span attribute, e.g. http.method=GET"
         placeholder="attribute key=value"
         value={attr}
         onChange={(e) => setAttr(e.target.value)}
@@ -72,6 +74,7 @@ export default function TraceList({ to }: { to: (traceId: string) => string }) {
       <input
         type="number"
         min={0}
+        aria-label="Only traces at least this many milliseconds long"
         placeholder="min ms"
         value={minDuration}
         onChange={(e) => setMinDuration(e.target.value)}
