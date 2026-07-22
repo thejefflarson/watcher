@@ -23,7 +23,10 @@ use serial_test::serial;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 use tracing_subscriber::layer::SubscriberExt;
-use watcher_server::{access_jwt, alerts, app, app_with_access, db, selflog, selfmon, selftrace};
+use watcher_server::{
+    access_jwt, alerts, app, app_with_access, app_with_auth, db, mcp_auth, selflog, selfmon,
+    selftrace,
+};
 
 fn now_nanos() -> u64 {
     SystemTime::now()
@@ -2655,17 +2658,200 @@ async fn access_unconfigured_leaves_api_open() {
     );
 }
 
-// --- MCP server (JEF-471) --------------------------------------------------
+// --- MCP server + auth (JEF-471 / JEF-472) ---------------------------------
+//
+// `/mcp` authenticates with an `Authorization: Bearer <token>` Cloudflare Access
+// JWT minted for a DEDICATED Access app (its own AUD, distinct from the browser
+// app's) — validated by the shared `access_jwt::Verifier`. These tests reuse the
+// browser-auth test key/JWKS but sign with the MCP AUD, and prove the 401/200
+// matrix, the resource-metadata discovery document, and the fail-closed refusal
+// when `/mcp` is enabled without auth configured.
 
-/// End-to-end MCP smoke test: enable `/mcp`, serve the real app on an ephemeral
-/// port, and drive it with the official rmcp streamable-HTTP client — list the
-/// tools and call `list_services` + `query_logs`, asserting the JSON shape.
-/// Multi-thread runtime so the server accept-loop and client run concurrently.
+const MCP_AUD: &str = "smoke-mcp-aud-tag";
+
+/// Build the app with `/mcp` enabled and Bearer auth wired to a local JWKS (no
+/// Cloudflare, no network), plus a freshly-signed valid MCP token.
+async fn mcp_app_with_auth(pool: sqlx::PgPool) -> (axum::Router, String) {
+    let certs_url = spawn_jwks().await;
+    let verifier =
+        std::sync::Arc::new(access_jwt::Verifier::new(ACCESS_ISSUER, certs_url, MCP_AUD));
+    let auth = mcp_auth::McpAuth::new(verifier);
+
+    // Enable the endpoint for this router only (default OFF). #[serial] keeps this
+    // process-global env change from racing the other tests.
+    std::env::set_var("WATCHER_MCP_ENABLED", "1");
+    let router = app_with_auth(pool, None, Some(auth));
+    std::env::remove_var("WATCHER_MCP_ENABLED");
+
+    (router, access_token(ACCESS_ISSUER, MCP_AUD, 3600))
+}
+
+/// POST an `initialize` frame to `/mcp` with an optional Bearer token, returning the
+/// status, the `WWW-Authenticate` challenge (if any), and whether the MCP transport
+/// admitted the request (it sets an `mcp-session-id` header on a live session).
+async fn mcp_post(
+    router: &axum::Router,
+    bearer: Option<&str>,
+) -> (StatusCode, Option<String>, bool) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream");
+    if let Some(t) = bearer {
+        builder = builder.header("authorization", format!("Bearer {t}"));
+    }
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}"#;
+    let resp = router
+        .clone()
+        .oneshot(builder.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let www = resp
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let has_session = resp.headers().contains_key("mcp-session-id");
+    (status, www, has_session)
+}
+
+#[tokio::test]
+#[serial]
+async fn mcp_bearer_auth_401_matrix() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (router, valid) = mcp_app_with_auth(pool).await;
+
+    // Missing token → 401 with a resource-metadata discovery challenge (NOT a
+    // login redirect), and the transport never saw the request.
+    let (status, www, session) = mcp_post(&router, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "missing Bearer must 401");
+    let www = www.expect("401 must carry a WWW-Authenticate challenge");
+    assert!(
+        www.starts_with("Bearer "),
+        "challenge must be a Bearer scheme"
+    );
+    assert!(
+        www.contains("resource_metadata=") && www.contains(mcp_auth::METADATA_PATH),
+        "challenge must point at the resource metadata: {www}"
+    );
+    assert!(!session, "a rejected request must not open an MCP session");
+
+    // Garbage token → 401.
+    assert_eq!(
+        mcp_post(&router, Some("not-a-jwt")).await.0,
+        StatusCode::UNAUTHORIZED,
+        "garbage Bearer must 401"
+    );
+
+    // Well-signed but minted for a DIFFERENT Access app (browser AUD) → 401. This is
+    // the crux: an MCP token must be scoped to the MCP app's own AUD.
+    let wrong_aud = access_token(ACCESS_ISSUER, ACCESS_AUD, 3600);
+    assert_eq!(
+        mcp_post(&router, Some(&wrong_aud)).await.0,
+        StatusCode::UNAUTHORIZED,
+        "a token for the browser Access app must not be accepted at /mcp"
+    );
+
+    // Expired MCP token → 401.
+    let expired = access_token(ACCESS_ISSUER, MCP_AUD, -3600);
+    assert_eq!(
+        mcp_post(&router, Some(&expired)).await.0,
+        StatusCode::UNAUTHORIZED,
+        "expired Bearer must 401"
+    );
+
+    // Valid MCP token → the guard admits it (not 401); the request reaches the MCP
+    // transport. Full functional proof (handshake + tool calls) is the authenticated
+    // end-to-end client test below.
+    let (status, _, _) = mcp_post(&router, Some(&valid)).await;
+    assert_ne!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "valid Bearer must not 401"
+    );
+    assert!(
+        status.is_success() || status.is_client_error(),
+        "valid Bearer reaches the transport, not a 5xx: {status}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn mcp_serves_protected_resource_metadata_unauthenticated() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (router, _valid) = mcp_app_with_auth(pool).await;
+
+    // The discovery document is served WITHOUT a token (the client fetches it before
+    // it has one) and names the Cloudflare Access OIDC authorization server.
+    for path in [mcp_auth::METADATA_PATH, mcp_auth::METADATA_PATH_ROOT] {
+        let (status, body) = get_json(&router, path).await;
+        assert_eq!(status, StatusCode::OK, "{path} must be served");
+        assert_eq!(
+            body["authorization_servers"],
+            serde_json::json!([ACCESS_ISSUER]),
+            "{path} must point at the Access OIDC authorization server"
+        );
+        assert!(
+            body["resource"]
+                .as_str()
+                .is_some_and(|r| r.ends_with("/mcp")),
+            "{path} resource must be the /mcp endpoint: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn mcp_fails_closed_when_auth_unconfigured() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // Enabled but NO auth wired: /mcp must not be served unauthenticated.
+    std::env::set_var("WATCHER_MCP_ENABLED", "1");
+    let router = app_with_auth(pool, None, None);
+    std::env::remove_var("WATCHER_MCP_ENABLED");
+
+    // The MCP surface is not mounted: an unauthenticated POST to /mcp is NOT met by
+    // the Bearer guard (which would 401) — it falls through to the SPA fallback, and
+    // opens no MCP session. There is simply no MCP endpoint to reach.
+    let (status, _www, session) = mcp_post(&router, None).await;
+    assert_ne!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "fail-closed /mcp is unmounted — no Bearer guard present"
+    );
+    assert!(!session, "fail-closed /mcp must expose no MCP session");
+
+    // And the auth-discovery document is not served (no metadata → the surface is
+    // simply absent), regardless of whether a built UI answers the fallback.
+    let (_, body) = get_json(&router, mcp_auth::METADATA_PATH).await;
+    assert!(
+        body.get("authorization_servers").is_none(),
+        "fail-closed must not serve resource metadata: {body}"
+    );
+}
+
+/// End-to-end MCP smoke test: enable `/mcp` with Bearer auth, serve the real app on
+/// an ephemeral port, and drive it with the official rmcp streamable-HTTP client
+/// (authenticated with a valid Access token) — list the tools and call
+/// `list_services` + `query_logs`, asserting the JSON shape. Multi-thread runtime so
+/// the server accept-loop and client run concurrently.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn mcp_lists_tools_and_calls_read_queries() {
     use rmcp::{
-        model::CallToolRequestParams, transport::StreamableHttpClientTransport, ServiceExt,
+        model::CallToolRequestParams,
+        transport::{
+            streamable_http_client::StreamableHttpClientTransportConfig,
+            StreamableHttpClientTransport,
+        },
+        ServiceExt,
     };
 
     let Some(pool) = pool_or_skip().await else {
@@ -2676,11 +2862,7 @@ async fn mcp_lists_tools_and_calls_read_queries() {
     insert_span_at(&pool, "checkout", "mcp-tr", "mcp-s", 2.0).await;
     insert_log_at(&pool, "checkout", 2.0).await;
 
-    // Enable the endpoint for this test only (default OFF). #[serial] keeps this
-    // process-global env change from racing the other tests.
-    std::env::set_var("WATCHER_MCP_ENABLED", "1");
-    let router = app(pool);
-    std::env::remove_var("WATCHER_MCP_ENABLED");
+    let (router, token) = mcp_app_with_auth(pool).await;
 
     // Serve on an ephemeral port so a real MCP client can drive the transport.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2689,7 +2871,11 @@ async fn mcp_lists_tools_and_calls_read_queries() {
         axum::serve(listener, router).await.unwrap();
     });
 
-    let transport = StreamableHttpClientTransport::from_uri(format!("http://{addr}/mcp"));
+    // The client attaches the Access Bearer token on every request (auth_header is
+    // the raw token; rmcp prefixes `Bearer `).
+    let config = StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+        .auth_header(token);
+    let transport = StreamableHttpClientTransport::from_config(config);
     let client = ().serve(transport).await.expect("mcp handshake");
 
     // Tools list: exactly the nine read tools are advertised (no write/mutate tool).

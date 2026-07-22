@@ -9,10 +9,11 @@
 //! write/mutate tools; `/mcp` touches no ingest or reconcile path (ADR 0018).
 //!
 //! `/mcp` is gated behind `WATCHER_MCP_ENABLED` (default OFF) and only mounted
-//! when enabled — it carries no auth of its own yet (JEF-472), so it must not be
-//! exposed unauthenticated. It mounts *outside* the browser-cookie edge auth the
-//! UI/`/api` sit behind (Cloudflare Access, ADR 0013): an MCP client is not a
-//! browser and will get its own auth in JEF-472.
+//! when enabled. It mounts *outside* the browser-cookie edge auth the UI/`/api` sit
+//! behind (Cloudflare Access, ADR 0013): an MCP client is not a browser and carries
+//! no Access cookie. Its auth is its own `Authorization: Bearer` Access token,
+//! validated by [`crate::mcp_auth`] (JEF-472) — `app_with_access` wraps this service
+//! in that guard and refuses to serve `/mcp` when the guard is unconfigured.
 
 use std::sync::Arc;
 
@@ -33,8 +34,14 @@ use sqlx::PgPool;
 use crate::api;
 
 /// Env flag gating `/mcp`. Default OFF (opt-in) — unlike the self-telemetry
-/// opt-outs — because the endpoint is unauthenticated until JEF-472 lands.
+/// opt-outs — because enabling it exposes read access to anyone the auth (JEF-472)
+/// admits, so it stays an explicit operator decision.
 const ENABLE_FLAG: &str = "WATCHER_MCP_ENABLED";
+
+/// Optional comma-separated Host allow-list for the MCP transport (a DNS-rebinding
+/// guard). When set, only requests whose `Host` matches are served; when unset the
+/// list is disabled (see [`service`]).
+const ALLOWED_HOSTS_ENV: &str = "WATCHER_MCP_ALLOWED_HOSTS";
 
 /// Whether the MCP endpoint should be mounted. Only an explicit truthy value
 /// enables it; anything else (including unset) leaves `/mcp` off.
@@ -334,12 +341,27 @@ impl ServerHandler for WatcherMcp {
 /// [`WatcherMcp`] is created per session, each sharing the same `PgPool`.
 pub fn service(pool: PgPool) -> StreamableHttpService<WatcherMcp, LocalSessionManager> {
     // The transport defaults to a loopback-only Host allow-list (DNS-rebinding
-    // protection for locally-run servers reached by a browser). watcher's MCP is
-    // a server-to-server endpoint reached through a public tunnel host and gated
-    // by the enable flag (and, per JEF-472, its own auth), so that default would
-    // reject every legitimate client. Disable the Host allow-list here; Origin
-    // validation stays off since MCP clients are not browsers.
-    let config = StreamableHttpServerConfig::default().disable_allowed_hosts();
+    // protection for locally-run servers reached by a browser). watcher's MCP is a
+    // server-to-server endpoint reached through a public tunnel host whose name
+    // varies by deployment, so that default would reject every legitimate client.
+    //
+    // With Bearer auth now in front (JEF-472), DNS-rebinding is already defeated: a
+    // rebinding attacker's browser JS cannot forge a valid Access token, so it can
+    // never get past the guard regardless of Host. We therefore disable the list by
+    // default, but let an operator re-scope it to their known public host(s) via
+    // WATCHER_MCP_ALLOWED_HOSTS (comma-separated) for belt-and-braces. Origin
+    // validation stays off — MCP clients are not browsers and send no Origin.
+    let hosts: Vec<String> = std::env::var(ALLOWED_HOSTS_ENV)
+        .unwrap_or_default()
+        .split(',')
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .collect();
+    let config = if hosts.is_empty() {
+        StreamableHttpServerConfig::default().disable_allowed_hosts()
+    } else {
+        StreamableHttpServerConfig::default().with_allowed_hosts(hosts)
+    };
     StreamableHttpService::new(
         move || Ok(WatcherMcp::new(pool.clone())),
         Arc::new(LocalSessionManager::default()),

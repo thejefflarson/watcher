@@ -148,6 +148,32 @@ impl Verifier {
         }
     }
 
+    /// Build a verifier from a Cloudflare Access **team domain** and an expected
+    /// audience, deriving the issuer and JWKS (`certs`) URLs the way Cloudflare does.
+    ///
+    /// The team domain may be given with or without a scheme
+    /// (`team.cloudflareaccess.com`); Cloudflare's `iss` is that host with an
+    /// `https://` scheme and no trailing slash. Shared by [`from_env`](Self::from_env)
+    /// (the browser Access app) and the `/mcp` Bearer guard (JEF-472), which points at
+    /// the same team but a **separate** Access application AUD.
+    pub fn for_team(team_domain: &str, audience: impl Into<String>) -> Self {
+        let host = team_domain
+            .trim()
+            .trim_end_matches('/')
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        let issuer = format!("https://{host}");
+        let certs_url = format!("{issuer}/cdn-cgi/access/certs");
+        Self::new(issuer, certs_url, audience)
+    }
+
+    /// The expected issuer (`iss`) — the team domain as an `https://` URL. Also the
+    /// Cloudflare Access OIDC authorization-server identifier the `/mcp` resource
+    /// metadata advertises (JEF-472).
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
     /// Build a verifier from the environment, or `None` when Access verification is
     /// not configured (so enforcement is simply not wired in — see the module docs).
     ///
@@ -163,16 +189,7 @@ impl Verifier {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())?;
-
-        // Normalize the team domain into an issuer URL. Cloudflare's `iss` is the
-        // team domain with an `https://` scheme and no trailing slash.
-        let host = team
-            .trim_end_matches('/')
-            .trim_start_matches("https://")
-            .trim_start_matches("http://");
-        let issuer = format!("https://{host}");
-        let certs_url = format!("{issuer}/cdn-cgi/access/certs");
-        Some(Self::new(issuer, certs_url, audience))
+        Some(Self::for_team(&team, audience))
     }
 
     /// Verify a raw JWT string against the configured issuer/audience: signature

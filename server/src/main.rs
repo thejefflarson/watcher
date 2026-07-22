@@ -7,7 +7,8 @@ use tracing_subscriber::filter::dynamic_filter_fn;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 use watcher_server::{
-    access_jwt, alerts, app_with_access, db, grpc, mcp, retention, selflog, selfmon, selftrace,
+    access_jwt, alerts, app_with_access, db, grpc, mcp, mcp_auth, retention, selflog, selfmon,
+    selftrace,
 };
 
 /// Self-instrumentation: capture watcher's own traces **in-process**, tagged
@@ -189,10 +190,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Read-only MCP server (JEF-471): mounted at /mcp by `app_with_access` only when
-    // WATCHER_MCP_ENABLED is set (default OFF). It carries no auth of its own yet
-    // (JEF-472), so it must not be exposed unauthenticated — hence opt-in.
+    // WATCHER_MCP_ENABLED is set (default OFF). Its Bearer auth (JEF-472) requires
+    // WATCHER_ACCESS_TEAM_DOMAIN + WATCHER_MCP_ACCESS_AUD; with those unset the
+    // endpoint fails closed (is NOT served) rather than exposing read access.
     if mcp::enabled() {
-        tracing::info!("MCP server (read-only) enabled at /mcp");
+        if mcp_auth::McpAuth::from_env().is_some() {
+            tracing::info!("MCP server (read-only) enabled at /mcp with Access Bearer auth");
+        } else {
+            tracing::error!(
+                "WATCHER_MCP_ENABLED is set but MCP auth is unconfigured \
+                 (need WATCHER_ACCESS_TEAM_DOMAIN + WATCHER_MCP_ACCESS_AUD); \
+                 /mcp will NOT be served (fail closed)"
+            );
+        }
     } else {
         tracing::debug!("MCP server disabled (set WATCHER_MCP_ENABLED=1 to enable /mcp)");
     }
