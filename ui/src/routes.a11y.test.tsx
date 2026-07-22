@@ -283,18 +283,13 @@ describe("runtime axe route smoke", () => {
 
   it("service map has no serious/critical a11y violations", async () => {
     const { container } = render(renderAt("/map"));
-    // The map is an <svg role="img"> labelled with the node/edge/call counts.
-    await screen.findByRole("img", { name: /Service map/ });
-    // BASELINE (waived HERE ONLY, so the rule still guards the other seven
-    // routes): the map's service nodes are focusable — role="button", keyboard-
-    // activated (JEF-431) — nested inside that <svg role="img">, which axe flags
-    // as `nested-interactive` (serious). Fixing it means rethinking the map's role
-    // model (a labelled single image vs. an interactive diagram of focusable
-    // nodes), which is a ServiceMap.tsx design change out of this test-only
-    // ticket's scope. Tracked as a follow-up (see PR notes).
-    await expectNoBlockingViolations(container, {
-      "nested-interactive": { enabled: false },
-    });
+    // The map is an <svg role="group"> labelled with the node/edge/call counts —
+    // a grouping, NOT role="img", so its focusable node-buttons (JEF-431) are
+    // legitimately interactive children. This resolves the pre-existing
+    // `nested-interactive` violation that role="img" caused (JEF-455), so the
+    // rule is now enforced here too — no per-route waiver.
+    await screen.findByRole("group", { name: /Service map/ });
+    await expectNoBlockingViolations(container);
   });
 
   it("alerts has no serious/critical a11y violations", async () => {
