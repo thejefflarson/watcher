@@ -51,7 +51,7 @@ export default function ServiceMap() {
       <svg
         width={W}
         height={H}
-        role="img"
+        role="group"
         aria-label={`Service map — ${data.nodes.length} services, ${data.edges.length} call paths, ${totalCalls} calls`}
       >
         <defs>
