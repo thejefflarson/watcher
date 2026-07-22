@@ -37,22 +37,25 @@ pub async fn healthz(State(pool): State<PgPool>) -> impl IntoResponse {
     (status, body)
 }
 
+// Query param structs carry `pub` fields so the MCP tool layer (src/mcp.rs) can
+// build them and call the shared `query_*` functions below — the same code the
+// HTTP handlers run, so both surfaces share every clamp and default window.
 #[derive(Deserialize)]
 pub struct TraceQuery {
-    limit: Option<i64>,
-    service: Option<String>,
+    pub limit: Option<i64>,
+    pub service: Option<String>,
     /// Substring match on the trace's root span name (operation).
-    name: Option<String>,
+    pub name: Option<String>,
     /// Attribute equality filter, `key=value`, matched against any span in the trace.
-    attr: Option<String>,
+    pub attr: Option<String>,
     /// Only traces that contain at least one error span.
     #[serde(default)]
-    errors_only: bool,
+    pub errors_only: bool,
     /// Only traces at least this long (ms) — for finding slow traces.
-    min_duration_ms: Option<f64>,
+    pub min_duration_ms: Option<f64>,
     /// Time window (RFC3339); both optional. Absent ends are unbounded.
-    from: Option<DateTime<Utc>>,
-    to: Option<DateTime<Utc>>,
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -73,6 +76,12 @@ pub async fn list_traces(
     State(pool): State<PgPool>,
     Query(q): Query<TraceQuery>,
 ) -> Result<Json<Vec<TraceSummary>>, ApiError> {
+    Ok(Json(query_traces(&pool, q).await.map_err(internal)?))
+}
+
+/// Recent-traces query shared by the HTTP handler and the MCP `search_traces`
+/// tool. Applies the same limit clamp + default 24h window.
+pub async fn query_traces(pool: &PgPool, q: TraceQuery) -> Result<Vec<TraceSummary>, sqlx::Error> {
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
     // `key=value` → JSONB containment, matched against any span in the trace.
     let attr_json = q
@@ -86,7 +95,7 @@ pub async fn list_traces(
     // spans_attrs_gin index can serve (a HAVING bool_or couldn't use the index).
     // The remaining trace-level filters (name / errors / duration) are HAVING, so
     // the per-trace aggregates stay computed over the whole trace.
-    let rows = sqlx::query_as::<_, TraceSummary>(
+    sqlx::query_as::<_, TraceSummary>(
         "SELECT trace_id,
                 max(service)                                                   AS service,
                 (array_agg(name ORDER BY start_time))[1]                       AS root_name,
@@ -121,11 +130,9 @@ pub async fn list_traces(
     .bind(attr_json)
     .bind(q.errors_only)
     .bind(q.min_duration_ms)
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .instrument(tracing::info_span!("db.query"))
     .await
-    .map_err(internal)?;
-    Ok(Json(rows))
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -149,7 +156,17 @@ pub async fn get_trace(
     State(pool): State<PgPool>,
     Path(trace_id): Path<String>,
 ) -> Result<Json<Vec<SpanRow>>, ApiError> {
-    let rows = sqlx::query_as::<_, SpanRow>(
+    Ok(Json(
+        query_trace_spans(&pool, trace_id).await.map_err(internal)?,
+    ))
+}
+
+/// All spans of one trace, shared by the HTTP handler and the MCP `get_trace` tool.
+pub async fn query_trace_spans(
+    pool: &PgPool,
+    trace_id: String,
+) -> Result<Vec<SpanRow>, sqlx::Error> {
+    sqlx::query_as::<_, SpanRow>(
         "SELECT trace_id, span_id, parent_span_id, service, name, kind,
                 start_time, end_time, duration_ms, status_code, status_message, attributes
          FROM spans
@@ -157,25 +174,23 @@ pub async fn get_trace(
          ORDER BY start_time ASC",
     )
     .bind(trace_id)
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .instrument(tracing::info_span!("db.query"))
     .await
-    .map_err(internal)?;
-    Ok(Json(rows))
 }
 
 #[derive(Deserialize)]
 pub struct LogQuery {
-    limit: Option<i64>,
-    service: Option<String>,
-    trace_id: Option<String>,
+    pub limit: Option<i64>,
+    pub service: Option<String>,
+    pub trace_id: Option<String>,
     /// Narrow to a single span's logs (used by the trace waterfall drill-down).
-    span_id: Option<String>,
-    q: Option<String>,
-    from: Option<DateTime<Utc>>,
-    to: Option<DateTime<Utc>>,
+    pub span_id: Option<String>,
+    pub q: Option<String>,
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
     /// Attribute equality filter, `key=value` (e.g. `k8s.pod.name=api-7f`).
-    attr: Option<String>,
+    pub attr: Option<String>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -197,6 +212,11 @@ pub async fn list_logs(
     State(pool): State<PgPool>,
     Query(q): Query<LogQuery>,
 ) -> Result<Json<Vec<LogRow>>, ApiError> {
+    Ok(Json(query_logs(&pool, q).await.map_err(internal)?))
+}
+
+/// Recent-logs query shared by the HTTP handler and the MCP `query_logs` tool.
+pub async fn query_logs(pool: &PgPool, q: LogQuery) -> Result<Vec<LogRow>, sqlx::Error> {
     let limit = q.limit.unwrap_or(200).clamp(1, 2000);
     // `key=value` → JSONB containment `attributes @> {"key":"value"}`, which the
     // logs_attrs_gin index serves.
@@ -206,7 +226,7 @@ pub async fn list_logs(
         .and_then(|s| s.split_once('='))
         .filter(|(k, _)| !k.is_empty())
         .map(|(k, v)| serde_json::json!({ k: v }));
-    let rows = sqlx::query_as::<_, LogRow>(
+    sqlx::query_as::<_, LogRow>(
         "SELECT id, time, trace_id, span_id, service, severity_number, severity_text, body, attributes
          FROM logs
          WHERE ($1::text IS NULL OR service = $1)
@@ -227,19 +247,17 @@ pub async fn list_logs(
     .bind(q.to)
     .bind(attr_json)
     .bind(limit)
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .instrument(tracing::info_span!("db.query"))
     .await
-    .map_err(internal)?;
-    Ok(Json(rows))
 }
 
 #[derive(Deserialize)]
 pub struct MetricQuery {
-    limit: Option<i64>,
-    service: Option<String>,
-    from: Option<DateTime<Utc>>,
-    to: Option<DateTime<Utc>>,
+    pub limit: Option<i64>,
+    pub service: Option<String>,
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -270,12 +288,21 @@ pub async fn list_metrics(
     State(pool): State<PgPool>,
     Query(q): Query<MetricQuery>,
 ) -> Result<Json<Vec<MetricSummary>>, ApiError> {
+    Ok(Json(query_metrics(&pool, q).await.map_err(internal)?))
+}
+
+/// Per-metric latest-value summary shared by the HTTP handler and the MCP
+/// `query_metrics` tool.
+pub async fn query_metrics(
+    pool: &PgPool,
+    q: MetricQuery,
+) -> Result<Vec<MetricSummary>, sqlx::Error> {
     let limit = q.limit.unwrap_or(200).clamp(1, 2000);
     // Reading every point in the window to GROUP BY name was ~minutes at scale.
     // Instead: enumerate distinct names with a loose index scan (recursive CTE),
     // then per name read only the 30 most-recent points (via metrics_name_time_idx)
     // for the latest value + sparkline. Names with no points in the window drop out.
-    let rows = sqlx::query_as::<_, MetricSummary>(
+    sqlx::query_as::<_, MetricSummary>(
         "WITH RECURSIVE names AS (
              SELECT min(name) AS name FROM metrics
              UNION ALL
@@ -325,11 +352,9 @@ pub async fn list_metrics(
     .bind(q.from)
     .bind(q.to)
     .bind(limit)
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .instrument(tracing::info_span!("db.query"))
     .await
-    .map_err(internal)?;
-    Ok(Json(rows))
 }
 
 /// Time-bucket width (seconds) used for rollups and raw-series bucketing.
@@ -344,9 +369,9 @@ fn rollup_bucket_secs() -> f64 {
 
 #[derive(Deserialize)]
 pub struct SeriesQuery {
-    name: String,
-    service: Option<String>,
-    hours: Option<i32>,
+    pub name: String,
+    pub service: Option<String>,
+    pub hours: Option<i32>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -363,8 +388,17 @@ pub async fn metric_series(
     State(pool): State<PgPool>,
     Query(q): Query<SeriesQuery>,
 ) -> Result<Json<Vec<SeriesPoint>>, ApiError> {
+    Ok(Json(query_metric_series(&pool, q).await.map_err(internal)?))
+}
+
+/// One metric's collapsed time series, shared by the HTTP handler and the MCP
+/// `metric_series` tool. Applies the same hours clamp.
+pub async fn query_metric_series(
+    pool: &PgPool,
+    q: SeriesQuery,
+) -> Result<Vec<SeriesPoint>, sqlx::Error> {
     let hours = q.hours.unwrap_or(24).clamp(1, 24 * 90);
-    let rows = sqlx::query_as::<_, SeriesPoint>(
+    sqlx::query_as::<_, SeriesPoint>(
         "SELECT bucket AS t, sum(sum) / nullif(sum(count), 0) AS v
          FROM metric_series_rollups
          WHERE name = $1 AND ($2::text IS NULL OR service = $2)
@@ -375,11 +409,9 @@ pub async fn metric_series(
     .bind(q.name)
     .bind(q.service)
     .bind(hours)
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .instrument(tracing::info_span!("db.query"))
     .await
-    .map_err(internal)?;
-    Ok(Json(rows))
 }
 
 #[derive(Deserialize)]
@@ -860,8 +892,8 @@ pub async fn metric_hist_facet(
 
 #[derive(Deserialize)]
 pub struct RedQuery {
-    from: Option<DateTime<Utc>>,
-    to: Option<DateTime<Utc>>,
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -882,7 +914,13 @@ pub async fn service_red(
     State(pool): State<PgPool>,
     Query(q): Query<RedQuery>,
 ) -> Result<Json<Vec<ServiceRed>>, ApiError> {
-    let rows = sqlx::query_as::<_, ServiceRed>(
+    Ok(Json(query_service_red(&pool, q).await.map_err(internal)?))
+}
+
+/// Per-service RED query shared by the HTTP handler and the MCP `list_services`
+/// tool. Keeps the same default 24h window.
+pub async fn query_service_red(pool: &PgPool, q: RedQuery) -> Result<Vec<ServiceRed>, sqlx::Error> {
+    sqlx::query_as::<_, ServiceRed>(
         "SELECT service,
                 count(*)                                AS spans,
                 count(*) FILTER (WHERE status_code = 2) AS errors,
@@ -902,11 +940,9 @@ pub async fn service_red(
     )
     .bind(q.from)
     .bind(q.to)
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .instrument(tracing::info_span!("db.query"))
     .await
-    .map_err(internal)?;
-    Ok(Json(rows))
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -925,6 +961,12 @@ pub struct ServiceMap {
 /// GET /api/servicemap — service dependency graph derived from span parent/child links.
 #[tracing::instrument(skip_all)]
 pub async fn service_map(State(pool): State<PgPool>) -> Result<Json<ServiceMap>, ApiError> {
+    Ok(Json(query_service_map(&pool).await.map_err(internal)?))
+}
+
+/// Service dependency graph shared by the HTTP handler and the MCP `service_map`
+/// tool.
+pub async fn query_service_map(pool: &PgPool) -> Result<ServiceMap, sqlx::Error> {
     // Current topology only: bound to the recent window so this is a tiny
     // index scan, not a self-join over the whole (retention-deep) spans table.
     let nodes: Vec<String> = sqlx::query_scalar(
@@ -932,10 +974,9 @@ pub async fn service_map(State(pool): State<PgPool>) -> Result<Json<ServiceMap>,
          WHERE service IS NOT NULL AND start_time > now() - interval '1 hour'
          ORDER BY 1",
     )
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .instrument(tracing::info_span!("db.query"))
-    .await
-    .map_err(internal)?;
+    .await?;
 
     let edges = sqlx::query_as::<_, ServiceEdge>(
         "SELECT parent.service AS source, child.service AS target, count(*) AS calls
@@ -950,12 +991,11 @@ pub async fn service_map(State(pool): State<PgPool>) -> Result<Json<ServiceMap>,
          GROUP BY parent.service, child.service
          ORDER BY calls DESC",
     )
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .instrument(tracing::info_span!("db.query"))
-    .await
-    .map_err(internal)?;
+    .await?;
 
-    Ok(Json(ServiceMap { nodes, edges }))
+    Ok(ServiceMap { nodes, edges })
 }
 
 // ---------------------------------------------------------------------------
@@ -990,7 +1030,13 @@ pub struct AlertRuleView {
 
 /// GET /api/alerts — all rules with their current firing state.
 pub async fn list_alerts(State(pool): State<PgPool>) -> Result<Json<Vec<AlertRuleView>>, ApiError> {
-    let rows = sqlx::query_as::<_, AlertRuleView>(
+    Ok(Json(query_alerts(&pool).await.map_err(internal)?))
+}
+
+/// Alert rules with firing state, shared by the HTTP handler and the MCP
+/// `list_alerts` tool.
+pub async fn query_alerts(pool: &PgPool) -> Result<Vec<AlertRuleView>, sqlx::Error> {
+    sqlx::query_as::<_, AlertRuleView>(
         "SELECT r.id, r.name, r.metric, r.service, r.comparator, r.threshold, r.agg,
                 r.window_secs, r.enabled, r.created_at,
                 (e.id IS NOT NULL) AS firing, m.kind, m.unit
@@ -1011,11 +1057,9 @@ pub async fn list_alerts(State(pool): State<PgPool>) -> Result<Json<Vec<AlertRul
          ) m ON true
          ORDER BY r.created_at DESC",
     )
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .instrument(tracing::info_span!("db.query"))
     .await
-    .map_err(internal)?;
-    Ok(Json(rows))
 }
 
 // Rules are declarative (reconciled from config on startup — see alerts.rs), so
@@ -1023,7 +1067,7 @@ pub async fn list_alerts(State(pool): State<PgPool>) -> Result<Json<Vec<AlertRul
 
 #[derive(Deserialize)]
 pub struct EventQuery {
-    limit: Option<i64>,
+    pub limit: Option<i64>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -1046,8 +1090,17 @@ pub async fn list_alert_events(
     State(pool): State<PgPool>,
     Query(q): Query<EventQuery>,
 ) -> Result<Json<Vec<AlertEventView>>, ApiError> {
+    Ok(Json(query_alert_events(&pool, q).await.map_err(internal)?))
+}
+
+/// Recent alert transitions, shared by the HTTP handler and the MCP
+/// `alert_events` tool. Applies the same limit clamp.
+pub async fn query_alert_events(
+    pool: &PgPool,
+    q: EventQuery,
+) -> Result<Vec<AlertEventView>, sqlx::Error> {
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    let rows = sqlx::query_as::<_, AlertEventView>(
+    sqlx::query_as::<_, AlertEventView>(
         // Same metric-metadata LATERAL join as list_alerts (see note there).
         "SELECT e.id, e.rule_id, r.name AS rule_name, r.metric, e.value, e.fired_at,
                 e.resolved_at, m.kind, m.unit
@@ -1069,9 +1122,7 @@ pub async fn list_alert_events(
          LIMIT $1",
     )
     .bind(limit)
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .instrument(tracing::info_span!("db.query"))
     .await
-    .map_err(internal)?;
-    Ok(Json(rows))
 }
