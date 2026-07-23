@@ -2908,3 +2908,43 @@ async fn mcp_lists_tools_and_calls_read_queries() {
     client.cancel().await.ok();
     server.abort();
 }
+
+// Regression for JEF-494: a faceted gauge whose latest meta row is a rollup with a
+// NULL `kind` (metric_series_rollups.kind is nullable) must return 200, not 500. The
+// meta query used to decode `kind` as a bare String, so "unexpected null" surfaced as
+// an unlogged 500 — breaking the chart page for e.g. k8s.container.restarts.
+#[tokio::test]
+#[serial]
+async fn facet_gauge_with_null_kind_rollup_returns_200() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let attrs = r#"{"k8s.node.name":"cluster-node-0","k8s.pod.name":"kube-proxy-abc","k8s.container.name":"kube-proxy","container.id":"deadbeef","k8s.pod.uid":"11111111-2222-3333-4444-555555555555"}"#;
+    // No raw `metrics` row (pruned past retention) — only rollups, and their kind is
+    // NULL, exactly the shape that 500'd in production.
+    sqlx::query(
+        "INSERT INTO metric_series_rollups
+             (bucket, name, series_key, attrs, kind, unit, is_monotonic, count, sum, min, max, avg)
+         VALUES
+             (now() - interval '10 min', 'k8s.container.restarts', 'sk1', $1::jsonb, NULL, '{restart}', NULL, 1, 3, 3, 3, 3),
+             (now() - interval '5 min',  'k8s.container.restarts', 'sk1', $1::jsonb, NULL, '{restart}', NULL, 1, 3, 3, 3, 3)",
+    )
+    .bind(attrs)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let router = app(pool);
+    let (status, body) = get_json(&router, "/api/metrics/facet?name=k8s.container.restarts").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "facet must not 500 on a null-kind rollup"
+    );
+    // kind is reported as null (unknown), and the single series' points come through.
+    assert!(body["kind"].is_null());
+    assert_eq!(body["rated"], false);
+    let series = body["series"].as_array().expect("series array");
+    assert_eq!(series.len(), 1);
+    assert_eq!(series[0]["points"].as_array().unwrap().len(), 2);
+}

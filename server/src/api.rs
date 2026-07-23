@@ -13,8 +13,15 @@ use tracing::Instrument;
 
 type ApiError = (StatusCode, String);
 
+/// Map an internal failure to a 500 — and always log it. This is an observability
+/// tool: a silent 5xx (as JEF-494's decode error was) is undiagnosable from
+/// watcher's own logs, so every internal error is recorded at ERROR here. The
+/// active tracing span (each handler is `#[tracing::instrument]`ed) carries the
+/// route, so the log line is attributable without threading it through by hand.
 fn internal(e: impl std::fmt::Display) -> ApiError {
-    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    let msg = e.to_string();
+    tracing::error!(error = %msg, "api request failed with 500");
+    (StatusCode::INTERNAL_SERVER_ERROR, msg)
 }
 
 /// GET /healthz — deep readiness probe: 200 only when the DB is reachable AND
@@ -536,7 +543,12 @@ pub async fn metric_facet(
 
     // kind / monotonicity / unit are constant per metric name; read the most
     // recent from raw or rollup (raw may be pruned past metrics_raw_days).
-    let meta: Option<(String, Option<bool>, Option<String>)> = sqlx::query_as(
+    //
+    // `kind` is decoded as Option: metric_series_rollups.kind is a nullable column
+    // (unlike metrics.kind), so a rollup row can carry a NULL kind. Decoding it as a
+    // bare String made this handler 500 with "unexpected null" for any metric whose
+    // latest meta row is such a rollup (JEF-494) — a null kind just means "unknown".
+    let meta: Option<(Option<String>, Option<bool>, Option<String>)> = sqlx::query_as(
         "SELECT kind, is_monotonic, unit FROM (
              (SELECT kind, is_monotonic, unit, time AS t FROM metrics
               WHERE name = $1 ORDER BY time DESC LIMIT 1)
@@ -551,7 +563,7 @@ pub async fn metric_facet(
     .await
     .map_err(internal)?;
     let (kind, is_monotonic, unit) = match meta {
-        Some((k, m, u)) => (Some(k), m.unwrap_or(false), u),
+        Some((k, m, u)) => (k, m.unwrap_or(false), u),
         None => {
             return Ok(Json(FacetResponse {
                 kind: None,
@@ -1125,4 +1137,55 @@ pub async fn query_alert_events(
     .fetch_all(pool)
     .instrument(tracing::info_span!("db.query"))
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// A `MakeWriter` that appends everything the subscriber emits into a shared
+    /// buffer, so a test can assert on what was logged.
+    #[derive(Clone, Default)]
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+    impl Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for BufWriter {
+        type Writer = BufWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    // JEF-494: every 5xx must be diagnosable from watcher's own logs. `internal()`
+    // maps to a 500 AND logs the error at ERROR — this proves it does both.
+    #[test]
+    fn internal_logs_the_error_and_returns_500() {
+        let buf = BufWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::ERROR)
+            .finish();
+
+        let (status, body) = tracing::subscriber::with_default(subscriber, || {
+            internal("decode blew up: unexpected null")
+        });
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, "decode blew up: unexpected null");
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("ERROR") && logged.contains("decode blew up: unexpected null"),
+            "the 500 was not logged; captured: {logged:?}"
+        );
+    }
 }
