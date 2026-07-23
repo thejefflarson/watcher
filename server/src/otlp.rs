@@ -19,9 +19,10 @@ use opentelemetry_proto::tonic::{
 };
 use prost::Message;
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use std::io::Read;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // HTTP entrypoints
@@ -155,7 +156,7 @@ pub async fn store_traces(pool: &PgPool, req: ExportTraceServiceRequest) -> u64 
             }
         }
     }
-    let count = write_chunked(pool, &rows, insert_spans).await;
+    let count = write_chunked(pool, &rows, |c, r| Box::pin(insert_spans(c, r))).await;
     crate::selfmon::SPANS_INGESTED.fetch_add(count, Ordering::Relaxed);
     count
 }
@@ -176,7 +177,7 @@ pub async fn store_logs(pool: &PgPool, req: ExportLogsServiceRequest) -> u64 {
             }
         }
     }
-    let count = write_chunked(pool, &rows, insert_logs).await;
+    let count = write_chunked(pool, &rows, |c, r| Box::pin(insert_logs(c, r))).await;
     crate::selfmon::LOGS_INGESTED.fetch_add(count, Ordering::Relaxed);
     count
 }
@@ -187,34 +188,120 @@ pub async fn store_logs(pool: &PgPool, req: ExportLogsServiceRequest) -> u64 {
 /// into one or two round-trips.
 const INSERT_CHUNK: usize = 5_000;
 
-/// Write `rows` in chunks, one batched `INSERT` per chunk. On a chunk error, fall
-/// back to inserting each row of that chunk on its own so a single bad row can't
-/// drop the whole batch — every row that still fails is logged and counted in
-/// `DROP_INSERT`, preserving the per-row drop accounting the old loop had. Returns
-/// the number of rows written.
+/// Bounded retries for a single write when the pooled connection lands on a
+/// demoted (read-only) Postgres backend (see [`write_with_failover_retry`]).
+const FAILOVER_MAX_ATTEMPTS: u32 = 3;
+
+/// Backoff before each *retry* (not the first attempt), capped at 1s. A Patroni
+/// failover promotes a new leader and re-points the `-master` service DNS within a
+/// second or two, so a short escalating pause lets a fresh connection re-resolve to
+/// the new leader before we give up. Kept small so a transient blip doesn't stall
+/// ingest longer than it must. Indexed by (attempt - 1), so it holds exactly one
+/// entry per retry — the assertion below couples its length to the attempt bound.
+const FAILOVER_BACKOFF: [Duration; 2] = [Duration::from_millis(200), Duration::from_millis(600)];
+const _: () = assert!(FAILOVER_BACKOFF.len() == FAILOVER_MAX_ATTEMPTS as usize - 1);
+
+/// True for the transient, connection-scoped errors a Patroni/postgres-operator
+/// failover produces — worth retrying on a *fresh* connection, unlike a bad row:
 ///
-/// `insert` runs exactly one `execute` per call (per chunk, and per row on the
-/// fallback path); JEF-496 will wrap that whole-batch write in read-only-failover
-/// retry, so keep it a single isolatable statement.
-async fn write_chunked<T>(
+/// * `25006` read_only_sql_transaction — the pooled connection's backend was
+///   demoted to a read-only replica; the write hits a read-only node (the JEF-496
+///   symptom). A new connection re-resolves `-master` DNS to the new leader.
+/// * `57P01` admin_shutdown — the old leader terminated the backend on demotion.
+///
+/// Deliberately narrow: a constraint violation, encoding error, or any other
+/// database error is NOT retried — it must fall through to the per-row fallback and
+/// DROP_INSERT accounting so a genuinely bad row is never masked by retries.
+fn is_failover_error(e: &sqlx::Error) -> bool {
+    matches!(
+        e,
+        sqlx::Error::Database(db) if matches!(db.code().as_deref(), Some("25006") | Some("57P01"))
+    )
+}
+
+/// A single write's future, boxed with an explicit `Send` bound. `op` builds one of
+/// these per attempt from a fresh connection plus the borrowed batch `data`. The box
+/// (over the async block) is what keeps `Send` inference tractable — an async closure
+/// yielding `&mut PgConnection` otherwise trips "implementation of `Send` is not
+/// general enough" once these futures cross the axum/tonic handler boundary. `data` is
+/// threaded through a parameter rather than captured by `op`, so `op` borrows nothing
+/// and stays a plain `for<'c>` higher-ranked closure.
+type WriteFut<'c> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), sqlx::Error>> + Send + 'c>>;
+
+/// Run one write, retrying on a read-only-failover error against a freshly acquired
+/// connection. Each attempt acquires its own connection from `pool` and builds the
+/// statement via `op(conn, data)`; on a failover error the connection is
+/// dropped-not-recycled (`close_on_drop`) so the pool can't hand the same demoted
+/// backend to the next writer, then we back off and retry. A non-failover error
+/// returns immediately (no retry) so the caller's per-row fallback + DROP_INSERT
+/// accounting still applies. `op` must be a single isolatable statement — it may run
+/// more than once.
+async fn write_with_failover_retry<D: Sync + ?Sized>(
+    pool: &PgPool,
+    data: &D,
+    op: impl for<'c> Fn(&'c mut PgConnection, &'c D) -> WriteFut<'c>,
+) -> Result<(), sqlx::Error> {
+    let mut attempt = 0u32;
+    loop {
+        let mut conn = pool.acquire().await?;
+        match op(&mut conn, data).await {
+            Ok(()) => return Ok(()),
+            Err(e) if is_failover_error(&e) && attempt + 1 < FAILOVER_MAX_ATTEMPTS => {
+                // Evict this connection instead of returning it to the pool — it's
+                // pinned (TCP) to the demoted, now read-only backend, so recycling it
+                // would just hand the same dead node to the next writer. Dropping it
+                // forces the pool to open a fresh one that re-resolves `-master` DNS.
+                conn.close_on_drop();
+                drop(conn);
+                tokio::time::sleep(FAILOVER_BACKOFF[attempt as usize]).await;
+                attempt += 1;
+                tracing::warn!("write hit a read-only/closed backend (failover); retry {attempt}");
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Write `rows` in chunks, one batched `INSERT` per chunk. Each write goes through
+/// [`write_with_failover_retry`], so a Patroni failover's read-only error is retried
+/// on a fresh connection rather than dropped (JEF-496). On a *non-failover* chunk
+/// error, fall back to inserting each row of that chunk on its own so a single bad
+/// row can't drop the whole batch — every row that still fails is logged and counted
+/// in `DROP_INSERT`, preserving the per-row drop accounting the old loop had. If a
+/// chunk still fails with a failover error after retries are exhausted, per-row
+/// isolation would hit the same read-only wall, so the whole chunk is dropped and
+/// counted once rather than multiplying the retry storm. Returns the number of rows
+/// written.
+async fn write_chunked<T: Sync>(
     pool: &PgPool,
     rows: &[T],
-    insert: impl AsyncFn(&PgPool, &[T]) -> Result<(), sqlx::Error>,
+    insert: impl for<'c> Fn(&'c mut PgConnection, &'c [T]) -> WriteFut<'c>,
 ) -> u64 {
     let mut count = 0u64;
     for chunk in rows.chunks(INSERT_CHUNK) {
-        match insert(pool, chunk).await {
+        match write_with_failover_retry(pool, chunk, &insert).await {
             // A successful batch counts every row it attempted — matching the old
             // per-row loop, which counted each `execute` (an ON CONFLICT no-op still
             // succeeded and still counted).
             Ok(()) => count += chunk.len() as u64,
+            Err(e) if is_failover_error(&e) => {
+                // Retries exhausted against a still-read-only backend; per-row would
+                // hit the same wall, so drop the chunk and count it once.
+                tracing::warn!(
+                    "batch insert dropped ({} rows) after failover retries: {e}",
+                    chunk.len()
+                );
+                crate::selfmon::DROP_INSERT.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            }
             Err(e) => {
                 tracing::warn!(
                     "batch insert failed ({} rows), isolating per-row: {e}",
                     chunk.len()
                 );
                 for row in chunk {
-                    match insert(pool, std::slice::from_ref(row)).await {
+                    match write_with_failover_retry(pool, std::slice::from_ref(row), &insert).await
+                    {
                         Ok(()) => count += 1,
                         Err(e) => {
                             tracing::warn!("insert row failed: {e}");
@@ -349,9 +436,10 @@ fn log_row(service: Option<&str>, resource: &[KeyValue], rec: &LogRecord) -> Log
 /// Batch-insert spans: one `INSERT … SELECT * FROM unnest(...)` over parallel
 /// per-column arrays (all bound params — no string interpolation). `ON CONFLICT
 /// (trace_id, span_id) DO NOTHING` de-dupes against existing rows and intra-batch
-/// duplicates alike, matching the old single-row insert. One `execute` per call so
-/// JEF-496 can wrap it in read-only-failover retry.
-async fn insert_spans(pool: &PgPool, rows: &[SpanRow]) -> Result<(), sqlx::Error> {
+/// duplicates alike, matching the old single-row insert. One `execute` per call,
+/// against a caller-supplied connection so `write_with_failover_retry` can rerun it
+/// on a fresh connection after a read-only-failover error.
+async fn insert_spans(conn: &mut PgConnection, rows: &[SpanRow]) -> Result<(), sqlx::Error> {
     // Borrow each column into a parallel array; the row slice outlives the query,
     // so no per-row cloning is needed.
     let trace_ids: Vec<&str> = rows.iter().map(|r| r.trace_id.as_str()).collect();
@@ -387,15 +475,16 @@ async fn insert_spans(pool: &PgPool, rows: &[SpanRow]) -> Result<(), sqlx::Error
     .bind(&status_codes)
     .bind(&status_msgs)
     .bind(&attrs)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
 
 /// Batch-insert logs: one `INSERT … SELECT * FROM unnest(...)` over parallel
-/// per-column arrays (all bound params). One `execute` per call so JEF-496 can wrap
-/// it in read-only-failover retry.
-async fn insert_logs(pool: &PgPool, rows: &[LogRow]) -> Result<(), sqlx::Error> {
+/// per-column arrays (all bound params). One `execute` per call, against a
+/// caller-supplied connection so `write_with_failover_retry` can rerun it on a fresh
+/// connection after a read-only-failover error.
+async fn insert_logs(conn: &mut PgConnection, rows: &[LogRow]) -> Result<(), sqlx::Error> {
     let times: Vec<DateTime<Utc>> = rows.iter().map(|r| r.time).collect();
     let trace_ids: Vec<Option<&str>> = rows.iter().map(|r| r.trace_id.as_deref()).collect();
     let span_ids: Vec<Option<&str>> = rows.iter().map(|r| r.span_id.as_deref()).collect();
@@ -418,7 +507,7 @@ async fn insert_logs(pool: &PgPool, rows: &[LogRow]) -> Result<(), sqlx::Error> 
     .bind(&sev_texts)
     .bind(&bodies)
     .bind(&attrs)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
@@ -537,39 +626,26 @@ fn num_row(
     })
 }
 
-/// Batch-insert all numeric points from one request. Mirrors the per-point
-/// aggregate-on-insert (keep the raw point AND fold it into its live rollup
-/// bucket) but over the whole batch in a single statement: `unnest` expands the
-/// parallel arrays, a data-modifying CTE writes the raw rows, then a GROUP BY
-/// pre-aggregates points that share a (name, series_key, bucket) so the
-/// ON CONFLICT upsert never touches the same rollup row twice. Returns the number
-/// of raw points written (0 on error or empty batch).
-async fn flush_numbers(pool: &PgPool, rows: Vec<NumRow>) -> u64 {
-    let n = rows.len();
-    if n == 0 {
-        return 0;
-    }
-    // One move pass into the parallel arrays sqlx's `unnest` binds — owned fields
-    // (attrs, service, …) move out of each row rather than being cloned.
-    let mut times = Vec::with_capacity(n);
-    let mut services = Vec::with_capacity(n);
-    let mut names = Vec::with_capacity(n);
-    let mut kinds: Vec<&str> = Vec::with_capacity(n);
-    let mut values = Vec::with_capacity(n);
-    let mut units = Vec::with_capacity(n);
-    let mut attrs = Vec::with_capacity(n);
-    let mut monos = Vec::with_capacity(n);
-    for r in rows {
-        times.push(r.time);
-        services.push(r.service);
-        names.push(r.name);
-        kinds.push(r.kind);
-        values.push(r.value);
-        units.push(r.unit);
-        attrs.push(r.attrs);
-        monos.push(r.is_monotonic);
-    }
-    let res = sqlx::query(
+/// One request's numeric points as the parallel per-column arrays sqlx's `unnest`
+/// binds, plus the rollup bucket width. Bundling them lets the batch travel through
+/// [`write_with_failover_retry`] as borrowed `data` (so its `op` captures nothing).
+struct NumBatch {
+    times: Vec<DateTime<Utc>>,
+    services: Vec<Option<String>>,
+    names: Vec<String>,
+    kinds: Vec<&'static str>,
+    values: Vec<f64>,
+    units: Vec<Option<String>>,
+    attrs: Vec<serde_json::Value>,
+    monos: Vec<Option<bool>>,
+    width: f64,
+}
+
+/// The single aggregating statement for a numeric batch — see [`flush_numbers`].
+/// One `execute` per call, against a caller-supplied connection so
+/// `write_with_failover_retry` can rerun it on a fresh connection after a failover.
+async fn insert_numbers(conn: &mut PgConnection, b: &NumBatch) -> Result<(), sqlx::Error> {
+    sqlx::query(
         "WITH pts AS (
              SELECT * FROM unnest($1::timestamptz[], $2::text[], $3::text[], $4::text[],
                                   $5::float8[], $6::text[], $7::jsonb[], $8::bool[])
@@ -601,19 +677,62 @@ async fn flush_numbers(pool: &PgPool, rows: Vec<NumRow>) -> u64 {
              unit  = EXCLUDED.unit,
              is_monotonic = EXCLUDED.is_monotonic",
     )
-    .bind(&times)
-    .bind(&services)
-    .bind(&names)
-    .bind(&kinds)
-    .bind(&values)
-    .bind(&units)
-    .bind(&attrs)
-    .bind(&monos)
-    .bind(rollup_width())
-    .execute(pool)
-    .await;
-    match res {
-        Ok(_) => n as u64,
+    .bind(&b.times)
+    .bind(&b.services)
+    .bind(&b.names)
+    .bind(&b.kinds)
+    .bind(&b.values)
+    .bind(&b.units)
+    .bind(&b.attrs)
+    .bind(&b.monos)
+    .bind(b.width)
+    .execute(&mut *conn)
+    .await
+    .map(|_| ())
+}
+
+/// Batch-insert all numeric points from one request. Mirrors the per-point
+/// aggregate-on-insert (keep the raw point AND fold it into its live rollup
+/// bucket) but over the whole batch in a single statement: `unnest` expands the
+/// parallel arrays, a data-modifying CTE writes the raw rows, then a GROUP BY
+/// pre-aggregates points that share a (name, series_key, bucket) so the
+/// ON CONFLICT upsert never touches the same rollup row twice. Returns the number
+/// of raw points written (0 on error or empty batch).
+async fn flush_numbers(pool: &PgPool, rows: Vec<NumRow>) -> u64 {
+    let n = rows.len();
+    if n == 0 {
+        return 0;
+    }
+    // One move pass into the parallel arrays sqlx's `unnest` binds — owned fields
+    // (attrs, service, …) move out of each row rather than being cloned.
+    let mut b = NumBatch {
+        times: Vec::with_capacity(n),
+        services: Vec::with_capacity(n),
+        names: Vec::with_capacity(n),
+        kinds: Vec::with_capacity(n),
+        values: Vec::with_capacity(n),
+        units: Vec::with_capacity(n),
+        attrs: Vec::with_capacity(n),
+        monos: Vec::with_capacity(n),
+        width: rollup_width(),
+    };
+    for r in rows {
+        b.times.push(r.time);
+        b.services.push(r.service);
+        b.names.push(r.name);
+        b.kinds.push(r.kind);
+        b.values.push(r.value);
+        b.units.push(r.unit);
+        b.attrs.push(r.attrs);
+        b.monos.push(r.is_monotonic);
+    }
+    // The whole-batch write goes through failover retry (JEF-496): a Patroni failover's
+    // read-only error is retried on a fresh connection, not dropped. There's no per-row
+    // fallback here (a metrics batch is one aggregating statement), so on a persistent
+    // error — failover retries exhausted or any other DB error — the batch drops and
+    // every point counts in DROP_INSERT, exactly as before.
+    match write_with_failover_retry(pool, &b, |c, b| Box::pin(insert_numbers(c, b))).await {
+        Ok(()) => n as u64,
         Err(e) => {
             tracing::warn!("batch insert metrics failed: {e}");
             crate::selfmon::DROP_INSERT.fetch_add(n as u64, Ordering::Relaxed);
@@ -651,7 +770,35 @@ async fn flush_histograms(pool: &PgPool, rows: Vec<HistRow>) -> u64 {
             })
             .collect(),
     );
-    let res = sqlx::query(
+    // Whole-batch write through failover retry (JEF-496); see flush_numbers for the
+    // drop/accounting rationale. The JSONB payload + bucket width travel as borrowed
+    // `data` so the retry op captures nothing.
+    let b = HistBatch {
+        payload,
+        width: rollup_width(),
+    };
+    match write_with_failover_retry(pool, &b, |c, b| Box::pin(insert_histograms(c, b))).await {
+        Ok(()) => n as u64,
+        Err(e) => {
+            tracing::warn!("batch insert histograms failed: {e}");
+            crate::selfmon::DROP_INSERT.fetch_add(n as u64, Ordering::Relaxed);
+            0
+        }
+    }
+}
+
+/// One request's histogram points as a JSONB array (one object per point) plus the
+/// rollup bucket width. Borrowed as `data` by [`write_with_failover_retry`].
+struct HistBatch {
+    payload: serde_json::Value,
+    width: f64,
+}
+
+/// The single aggregating statement for a histogram batch — see [`flush_histograms`].
+/// One `execute` per call, against a caller-supplied connection so the failover retry
+/// can rerun it on a fresh connection.
+async fn insert_histograms(conn: &mut PgConnection, b: &HistBatch) -> Result<(), sqlx::Error> {
+    sqlx::query(
         "WITH pts AS (
              SELECT (e->>'time')::timestamptz AS time,
                     e->>'service' AS service,
@@ -691,18 +838,11 @@ async fn flush_histograms(pool: &PgPool, rows: Vec<HistRow>) -> u64 {
              bucket_bounds = coalesce(metric_series_rollups.bucket_bounds, EXCLUDED.bucket_bounds),
              bucket_counts = array_add(metric_series_rollups.bucket_counts, EXCLUDED.bucket_counts)",
     )
-    .bind(payload)
-    .bind(rollup_width())
-    .execute(pool)
-    .await;
-    match res {
-        Ok(_) => n as u64,
-        Err(e) => {
-            tracing::warn!("batch insert histograms failed: {e}");
-            crate::selfmon::DROP_INSERT.fetch_add(n as u64, Ordering::Relaxed);
-            0
-        }
-    }
+    .bind(&b.payload)
+    .bind(b.width)
+    .execute(&mut *conn)
+    .await
+    .map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,5 +1174,94 @@ mod tests {
         };
         // Non-string bodies are JSON-stringified.
         assert_eq!(any_value_to_text(&n), "5");
+    }
+
+    // --- JEF-496: read-only-failover write retry -------------------------------
+    //
+    // These exercise `write_with_failover_retry` against a real Postgres (CI's
+    // service container; skipped when DATABASE_URL is unset). They don't rely on
+    // durable row state — a concurrent test binary's TRUNCATE is harmless — only on
+    // the retry semantics: the attempt count and Ok/Err outcome.
+
+    use std::sync::atomic::AtomicU32;
+
+    async fn pool_or_skip() -> Option<PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        let pool = crate::db::connect(&url).await.expect("connect");
+        crate::db::migrate(&pool).await.expect("migrate");
+        Some(pool)
+    }
+
+    #[tokio::test]
+    async fn failover_retry_recovers_from_read_only() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        // Simulate a Patroni failover: the first connection the helper acquires is
+        // demoted to read-only (SET default_transaction_read_only = on is a
+        // session-scoped setting, so the next statement on it is read-only), so the
+        // INSERT fails with 25006 — exactly the dropped-write symptom. The helper
+        // evicts that connection and retries on a fresh one (server default:
+        // read-write), which succeeds. Zero drops, one recovery.
+        let attempts = AtomicU32::new(0);
+        let res = write_with_failover_retry(&pool, &attempts, |conn, attempts| {
+            Box::pin(async move {
+                let a = attempts.fetch_add(1, Ordering::SeqCst);
+                if a == 0 {
+                    sqlx::query("SET default_transaction_read_only = on")
+                        .execute(&mut *conn)
+                        .await?;
+                }
+                sqlx::query("INSERT INTO logs (time, service, body) VALUES (now(), 'jef496', 'x')")
+                    .execute(&mut *conn)
+                    .await
+                    .map(|_| ())
+            })
+        })
+        .await;
+
+        assert!(
+            res.is_ok(),
+            "read-only write must recover on retry: {res:?}"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "failed once (25006), retried once on a fresh connection, then succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn failover_retry_does_not_retry_other_errors() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        // A non-failover error (division by zero, SQLSTATE 22012) is a stand-in for a
+        // bad row: it must surface immediately, not be retried, so the caller's
+        // per-row fallback + DROP_INSERT accounting still applies.
+        let attempts = AtomicU32::new(0);
+        let res = write_with_failover_retry(&pool, &attempts, |conn, attempts| {
+            Box::pin(async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                sqlx::query("SELECT 1 / 0")
+                    .execute(&mut *conn)
+                    .await
+                    .map(|_| ())
+            })
+        })
+        .await;
+
+        assert!(res.is_err(), "a non-25006 error must surface, not retry");
+        assert!(
+            !is_failover_error(&res.unwrap_err()),
+            "the error is correctly classified as non-failover"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a non-failover error is tried exactly once"
+        );
     }
 }
