@@ -382,6 +382,135 @@ async fn ingest_and_query_a_log() {
 
 #[tokio::test]
 #[serial]
+async fn ingest_a_log_batch_persists_every_row_in_one_call() {
+    // JEF-495: store_logs batches a whole request into chunked INSERTs. A single
+    // multi-record request must land every row (identical column values) and not
+    // touch DROP_INSERT.
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let router = app(pool.clone());
+
+    const N: usize = 250;
+    let drops_before = selfmon::DROP_INSERT.load(std::sync::atomic::Ordering::Relaxed);
+    let records: Vec<LogRecord> = (0..N)
+        .map(|i| LogRecord {
+            time_unix_nano: 1_000_000_000 + i as u64,
+            severity_number: 9,
+            severity_text: "INFO".to_string(),
+            trace_id: vec![(i % 251) as u8 + 1; 16],
+            body: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(format!("line {i}"))),
+            }),
+            ..Default::default()
+        })
+        .collect();
+    let req = ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", "batcher")],
+                ..Default::default()
+            }),
+            scope_logs: vec![ScopeLogs {
+                log_records: records,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+
+    assert_eq!(
+        post_proto(&router, "/v1/logs", req.encode_to_vec()).await,
+        StatusCode::OK
+    );
+
+    // Every row persisted in the one call — the batched path, not O(N) inserts.
+    assert_eq!(count(&pool, "logs").await, N as i64);
+    assert_eq!(
+        selfmon::DROP_INSERT.load(std::sync::atomic::Ordering::Relaxed),
+        drops_before,
+        "a clean batch drops nothing"
+    );
+
+    // Column values survive the UNNEST round-trip intact.
+    let (status, logs) = get_json(&router, "/api/logs?service=batcher&limit=1000").await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = logs.as_array().unwrap();
+    assert_eq!(arr.len(), N);
+    let first = arr
+        .iter()
+        .find(|l| l["body"] == "line 0")
+        .expect("line 0 present");
+    assert_eq!(first["service"], "batcher");
+    assert_eq!(first["severity_text"], "INFO");
+    assert!(first["trace_id"].is_string(), "trace_id preserved");
+}
+
+#[tokio::test]
+#[serial]
+async fn ingest_a_span_batch_persists_and_dedupes_in_one_call() {
+    // JEF-495: store_traces batches too. Distinct spans all land; an intra-batch
+    // duplicate (same trace_id/span_id) is collapsed by ON CONFLICT DO NOTHING,
+    // exactly as the old per-row insert did.
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let router = app(pool.clone());
+
+    const N: usize = 100;
+    let start = nanos_ago(5);
+    let mut spans: Vec<Span> = (0..N)
+        .map(|i| Span {
+            trace_id: vec![7u8; 16],
+            span_id: (i as u64 + 1).to_be_bytes().to_vec(),
+            name: format!("op {i}"),
+            start_time_unix_nano: start,
+            end_time_unix_nano: start + 1_000_000,
+            ..Default::default()
+        })
+        .collect();
+    // A duplicate of span #1 in the same batch — must not create a second row.
+    spans.push(Span {
+        trace_id: vec![7u8; 16],
+        span_id: 1u64.to_be_bytes().to_vec(),
+        name: "op 0 dup".to_string(),
+        start_time_unix_nano: start,
+        end_time_unix_nano: start + 1_000_000,
+        ..Default::default()
+    });
+
+    let req = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", "spanbatch")],
+                ..Default::default()
+            }),
+            scope_spans: vec![ScopeSpans {
+                spans,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+
+    assert_eq!(
+        post_proto(&router, "/v1/traces", req.encode_to_vec()).await,
+        StatusCode::OK
+    );
+
+    // N distinct spans landed; the duplicate did not add a row.
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM spans WHERE service = 'spanbatch'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored, N as i64,
+        "distinct spans persisted, duplicate deduped"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn ingest_and_query_a_metric() {
     let Some(pool) = pool_or_skip().await else {
         eprintln!("skipping: DATABASE_URL not set");
