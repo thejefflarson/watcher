@@ -142,28 +142,29 @@ pub async fn ingest_metrics(
 // ---------------------------------------------------------------------------
 
 pub async fn store_traces(pool: &PgPool, req: ExportTraceServiceRequest) -> u64 {
-    let mut count = 0;
+    // Decode the whole request into rows first, then write them in batched
+    // statements (one per chunk) instead of one INSERT round-trip per span — a
+    // large export was N sequential awaited inserts, each taking a pool connection.
+    let mut rows: Vec<SpanRow> = Vec::new();
     for rs in &req.resource_spans {
         let rattrs = resource_attrs(rs.resource.as_ref());
         let service = service_name(rattrs);
         for ss in &rs.scope_spans {
             for span in &ss.spans {
-                match insert_span(pool, service.as_deref(), rattrs, span).await {
-                    Ok(()) => count += 1,
-                    Err(e) => {
-                        tracing::warn!("insert span failed: {e}");
-                        crate::selfmon::DROP_INSERT.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+                rows.push(span_row(service.as_deref(), rattrs, span));
             }
         }
     }
+    let count = write_chunked(pool, &rows, insert_spans).await;
     crate::selfmon::SPANS_INGESTED.fetch_add(count, Ordering::Relaxed);
     count
 }
 
 pub async fn store_logs(pool: &PgPool, req: ExportLogsServiceRequest) -> u64 {
-    let mut count = 0;
+    // Decode the whole request into rows first, then write them in batched
+    // statements (one per chunk) instead of one INSERT round-trip per record —
+    // the per-row loop was the source of the ~30s ingest p99 (JEF-495).
+    let mut rows: Vec<LogRow> = Vec::new();
     for rl in &req.resource_logs {
         // Keep resource attributes (k8s.pod.name / node / container, …) so logs
         // can be filtered by pod/host, not just service.
@@ -171,17 +172,59 @@ pub async fn store_logs(pool: &PgPool, req: ExportLogsServiceRequest) -> u64 {
         let service = service_name(rattrs);
         for sl in &rl.scope_logs {
             for rec in &sl.log_records {
-                match insert_log(pool, service.as_deref(), rattrs, rec).await {
-                    Ok(()) => count += 1,
-                    Err(e) => {
-                        tracing::warn!("insert log failed: {e}");
-                        crate::selfmon::DROP_INSERT.fetch_add(1, Ordering::Relaxed);
+                rows.push(log_row(service.as_deref(), rattrs, rec));
+            }
+        }
+    }
+    let count = write_chunked(pool, &rows, insert_logs).await;
+    crate::selfmon::LOGS_INGESTED.fetch_add(count, Ordering::Relaxed);
+    count
+}
+
+/// Rows per batched INSERT. UNNEST binds each column as a single array parameter
+/// (so the 65_535 bind-param ceiling is irrelevant), but chunking still bounds the
+/// per-statement array size and memory. 5_000 collapses any realistic OTLP batch
+/// into one or two round-trips.
+const INSERT_CHUNK: usize = 5_000;
+
+/// Write `rows` in chunks, one batched `INSERT` per chunk. On a chunk error, fall
+/// back to inserting each row of that chunk on its own so a single bad row can't
+/// drop the whole batch — every row that still fails is logged and counted in
+/// `DROP_INSERT`, preserving the per-row drop accounting the old loop had. Returns
+/// the number of rows written.
+///
+/// `insert` runs exactly one `execute` per call (per chunk, and per row on the
+/// fallback path); JEF-496 will wrap that whole-batch write in read-only-failover
+/// retry, so keep it a single isolatable statement.
+async fn write_chunked<T>(
+    pool: &PgPool,
+    rows: &[T],
+    insert: impl AsyncFn(&PgPool, &[T]) -> Result<(), sqlx::Error>,
+) -> u64 {
+    let mut count = 0u64;
+    for chunk in rows.chunks(INSERT_CHUNK) {
+        match insert(pool, chunk).await {
+            // A successful batch counts every row it attempted — matching the old
+            // per-row loop, which counted each `execute` (an ON CONFLICT no-op still
+            // succeeded and still counted).
+            Ok(()) => count += chunk.len() as u64,
+            Err(e) => {
+                tracing::warn!(
+                    "batch insert failed ({} rows), isolating per-row: {e}",
+                    chunk.len()
+                );
+                for row in chunk {
+                    match insert(pool, std::slice::from_ref(row)).await {
+                        Ok(()) => count += 1,
+                        Err(e) => {
+                            tracing::warn!("insert row failed: {e}");
+                            crate::selfmon::DROP_INSERT.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }
         }
     }
-    crate::selfmon::LOGS_INGESTED.fetch_add(count, Ordering::Relaxed);
     count
 }
 
@@ -227,21 +270,36 @@ pub async fn store_metrics(pool: &PgPool, req: ExportMetricsServiceRequest) -> u
 // Inserts
 // ---------------------------------------------------------------------------
 
-async fn insert_span(
-    pool: &PgPool,
-    service: Option<&str>,
-    resource: &[KeyValue],
-    span: &Span,
-) -> anyhow::Result<()> {
-    let trace_id = hex::encode(&span.trace_id);
-    let span_id = hex::encode(&span.span_id);
-    let parent = (!span.parent_span_id.is_empty()).then(|| hex::encode(&span.parent_span_id));
-    let start = ts(span.start_time_unix_nano);
-    let end = ts(span.end_time_unix_nano);
-    let duration_ms = span
-        .end_time_unix_nano
-        .saturating_sub(span.start_time_unix_nano) as f64
-        / 1_000_000.0;
+/// One decoded span, ready to batch-insert. Mirrors the `spans` columns.
+struct SpanRow {
+    trace_id: String,
+    span_id: String,
+    parent_span_id: Option<String>,
+    service: Option<String>,
+    name: String,
+    kind: i32,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+    duration_ms: f64,
+    status_code: Option<i32>,
+    status_message: Option<String>,
+    attrs: serde_json::Value,
+}
+
+/// One decoded log record, ready to batch-insert. Mirrors the `logs` columns.
+struct LogRow {
+    time: DateTime<Utc>,
+    trace_id: Option<String>,
+    span_id: Option<String>,
+    service: Option<String>,
+    severity_number: i32,
+    severity_text: String,
+    body: Option<String>,
+    attrs: serde_json::Value,
+}
+
+/// Decode one span into a `SpanRow`. No DB I/O — `store_traces` batches these.
+fn span_row(service: Option<&str>, resource: &[KeyValue], span: &Span) -> SpanRow {
     let (status_code, status_message) = match &span.status {
         Some(s) => (
             Some(s.code),
@@ -249,60 +307,117 @@ async fn insert_span(
         ),
         None => (None, None),
     };
-    let attrs = merged_attrs(resource, &span.attributes);
-
-    sqlx::query(
-        "INSERT INTO spans (trace_id, span_id, parent_span_id, service, name, kind,
-             start_time, end_time, duration_ms, status_code, status_message, attributes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-         ON CONFLICT (trace_id, span_id) DO NOTHING",
-    )
-    .bind(trace_id)
-    .bind(span_id)
-    .bind(parent)
-    .bind(service)
-    .bind(&span.name)
-    .bind(span.kind)
-    .bind(start)
-    .bind(end)
-    .bind(duration_ms)
-    .bind(status_code)
-    .bind(status_message)
-    .bind(attrs)
-    .execute(pool)
-    .await?;
-    Ok(())
+    SpanRow {
+        trace_id: hex::encode(&span.trace_id),
+        span_id: hex::encode(&span.span_id),
+        parent_span_id: (!span.parent_span_id.is_empty())
+            .then(|| hex::encode(&span.parent_span_id)),
+        service: service.map(str::to_string),
+        name: span.name.clone(),
+        kind: span.kind,
+        start_time: ts(span.start_time_unix_nano),
+        end_time: ts(span.end_time_unix_nano),
+        duration_ms: span
+            .end_time_unix_nano
+            .saturating_sub(span.start_time_unix_nano) as f64
+            / 1_000_000.0,
+        status_code,
+        status_message,
+        attrs: merged_attrs(resource, &span.attributes),
+    }
 }
 
-async fn insert_log(
-    pool: &PgPool,
-    service: Option<&str>,
-    resource: &[KeyValue],
-    rec: &LogRecord,
-) -> anyhow::Result<()> {
+/// Decode one log record into a `LogRow`. No DB I/O — `store_logs` batches these.
+fn log_row(service: Option<&str>, resource: &[KeyValue], rec: &LogRecord) -> LogRow {
     let nanos = if rec.time_unix_nano != 0 {
         rec.time_unix_nano
     } else {
         rec.observed_time_unix_nano
     };
-    let time = ts(nanos);
-    let trace_id = (!rec.trace_id.is_empty()).then(|| hex::encode(&rec.trace_id));
-    let span_id = (!rec.span_id.is_empty()).then(|| hex::encode(&rec.span_id));
-    let body = rec.body.as_ref().map(any_value_to_text);
-    let attrs = merged_attrs(resource, &rec.attributes);
+    LogRow {
+        time: ts(nanos),
+        trace_id: (!rec.trace_id.is_empty()).then(|| hex::encode(&rec.trace_id)),
+        span_id: (!rec.span_id.is_empty()).then(|| hex::encode(&rec.span_id)),
+        service: service.map(str::to_string),
+        severity_number: rec.severity_number,
+        severity_text: rec.severity_text.clone(),
+        body: rec.body.as_ref().map(any_value_to_text),
+        attrs: merged_attrs(resource, &rec.attributes),
+    }
+}
+
+/// Batch-insert spans: one `INSERT … SELECT * FROM unnest(...)` over parallel
+/// per-column arrays (all bound params — no string interpolation). `ON CONFLICT
+/// (trace_id, span_id) DO NOTHING` de-dupes against existing rows and intra-batch
+/// duplicates alike, matching the old single-row insert. One `execute` per call so
+/// JEF-496 can wrap it in read-only-failover retry.
+async fn insert_spans(pool: &PgPool, rows: &[SpanRow]) -> Result<(), sqlx::Error> {
+    // Borrow each column into a parallel array; the row slice outlives the query,
+    // so no per-row cloning is needed.
+    let trace_ids: Vec<&str> = rows.iter().map(|r| r.trace_id.as_str()).collect();
+    let span_ids: Vec<&str> = rows.iter().map(|r| r.span_id.as_str()).collect();
+    let parents: Vec<Option<&str>> = rows.iter().map(|r| r.parent_span_id.as_deref()).collect();
+    let services: Vec<Option<&str>> = rows.iter().map(|r| r.service.as_deref()).collect();
+    let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+    let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
+    let starts: Vec<DateTime<Utc>> = rows.iter().map(|r| r.start_time).collect();
+    let ends: Vec<DateTime<Utc>> = rows.iter().map(|r| r.end_time).collect();
+    let durations: Vec<f64> = rows.iter().map(|r| r.duration_ms).collect();
+    let status_codes: Vec<Option<i32>> = rows.iter().map(|r| r.status_code).collect();
+    let status_msgs: Vec<Option<&str>> = rows.iter().map(|r| r.status_message.as_deref()).collect();
+    let attrs: Vec<&serde_json::Value> = rows.iter().map(|r| &r.attrs).collect();
+
+    sqlx::query(
+        "INSERT INTO spans (trace_id, span_id, parent_span_id, service, name, kind,
+             start_time, end_time, duration_ms, status_code, status_message, attributes)
+         SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
+                              $6::int[], $7::timestamptz[], $8::timestamptz[], $9::float8[],
+                              $10::int[], $11::text[], $12::jsonb[])
+         ON CONFLICT (trace_id, span_id) DO NOTHING",
+    )
+    .bind(&trace_ids)
+    .bind(&span_ids)
+    .bind(&parents)
+    .bind(&services)
+    .bind(&names)
+    .bind(&kinds)
+    .bind(&starts)
+    .bind(&ends)
+    .bind(&durations)
+    .bind(&status_codes)
+    .bind(&status_msgs)
+    .bind(&attrs)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Batch-insert logs: one `INSERT … SELECT * FROM unnest(...)` over parallel
+/// per-column arrays (all bound params). One `execute` per call so JEF-496 can wrap
+/// it in read-only-failover retry.
+async fn insert_logs(pool: &PgPool, rows: &[LogRow]) -> Result<(), sqlx::Error> {
+    let times: Vec<DateTime<Utc>> = rows.iter().map(|r| r.time).collect();
+    let trace_ids: Vec<Option<&str>> = rows.iter().map(|r| r.trace_id.as_deref()).collect();
+    let span_ids: Vec<Option<&str>> = rows.iter().map(|r| r.span_id.as_deref()).collect();
+    let services: Vec<Option<&str>> = rows.iter().map(|r| r.service.as_deref()).collect();
+    let sev_nums: Vec<i32> = rows.iter().map(|r| r.severity_number).collect();
+    let sev_texts: Vec<&str> = rows.iter().map(|r| r.severity_text.as_str()).collect();
+    let bodies: Vec<Option<&str>> = rows.iter().map(|r| r.body.as_deref()).collect();
+    let attrs: Vec<&serde_json::Value> = rows.iter().map(|r| &r.attrs).collect();
 
     sqlx::query(
         "INSERT INTO logs (time, trace_id, span_id, service, severity_number, severity_text, body, attributes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+         SELECT * FROM unnest($1::timestamptz[], $2::text[], $3::text[], $4::text[],
+                              $5::int[], $6::text[], $7::text[], $8::jsonb[])",
     )
-    .bind(time)
-    .bind(trace_id)
-    .bind(span_id)
-    .bind(service)
-    .bind(rec.severity_number)
-    .bind(&rec.severity_text)
-    .bind(body)
-    .bind(attrs)
+    .bind(&times)
+    .bind(&trace_ids)
+    .bind(&span_ids)
+    .bind(&services)
+    .bind(&sev_nums)
+    .bind(&sev_texts)
+    .bind(&bodies)
+    .bind(&attrs)
     .execute(pool)
     .await?;
     Ok(())
