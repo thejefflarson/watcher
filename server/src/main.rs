@@ -190,12 +190,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Read-only MCP server (JEF-471): mounted at /mcp by `app_with_access` only when
-    // WATCHER_MCP_ENABLED is set (default OFF). Its Bearer auth (JEF-472) requires
-    // WATCHER_ACCESS_TEAM_DOMAIN + WATCHER_MCP_ACCESS_AUD; with those unset the
-    // endpoint fails closed (is NOT served) rather than exposing read access.
+    // WATCHER_MCP_ENABLED is set (default OFF). Its Managed-OAuth assertion auth
+    // (JEF-493) requires WATCHER_ACCESS_TEAM_DOMAIN + WATCHER_MCP_ACCESS_AUD; with
+    // those unset the endpoint fails closed (is NOT served) rather than exposing read
+    // access.
     if mcp::enabled() {
         if mcp_auth::McpAuth::from_env().is_some() {
-            tracing::info!("MCP server (read-only) enabled at /mcp with Access Bearer auth");
+            tracing::info!(
+                "MCP server (read-only) enabled at /mcp with Cloudflare Access assertion auth"
+            );
         } else {
             tracing::error!(
                 "WATCHER_MCP_ENABLED is set but MCP auth is unconfigured \

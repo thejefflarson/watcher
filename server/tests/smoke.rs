@@ -2658,19 +2658,21 @@ async fn access_unconfigured_leaves_api_open() {
     );
 }
 
-// --- MCP server + auth (JEF-471 / JEF-472) ---------------------------------
+// --- MCP server + auth (JEF-471 / JEF-493) ---------------------------------
 //
-// `/mcp` authenticates with an `Authorization: Bearer <token>` Cloudflare Access
-// JWT minted for a DEDICATED Access app (its own AUD, distinct from the browser
-// app's) — validated by the shared `access_jwt::Verifier`. These tests reuse the
-// browser-auth test key/JWKS but sign with the MCP AUD, and prove the 401/200
-// matrix, the resource-metadata discovery document, and the fail-closed refusal
-// when `/mcp` is enabled without auth configured.
+// Under Cloudflare Managed OAuth the edge resolves the MCP client's opaque OAuth
+// token and forwards the origin the standard `Cf-Access-Jwt-Assertion` JWT — the
+// SAME header `/api` validates (JEF-473), but minted for a DEDICATED Access app
+// (its own AUD, distinct from the browser app's) and validated by the shared
+// `access_jwt::Verifier`. These tests reuse the browser-auth test key/JWKS but sign
+// with the MCP AUD, and prove the 401/200 matrix (fail-closed) and the fail-closed
+// refusal when `/mcp` is enabled without auth configured. There is no self-served
+// OAuth metadata — Cloudflare owns discovery.
 
 const MCP_AUD: &str = "smoke-mcp-aud-tag";
 
-/// Build the app with `/mcp` enabled and Bearer auth wired to a local JWKS (no
-/// Cloudflare, no network), plus a freshly-signed valid MCP token.
+/// Build the app with `/mcp` enabled and assertion auth wired to a local JWKS (no
+/// Cloudflare, no network), plus a freshly-signed valid MCP assertion token.
 async fn mcp_app_with_auth(pool: sqlx::PgPool) -> (axum::Router, String) {
     let certs_url = spawn_jwks().await;
     let verifier =
@@ -2686,20 +2688,18 @@ async fn mcp_app_with_auth(pool: sqlx::PgPool) -> (axum::Router, String) {
     (router, access_token(ACCESS_ISSUER, MCP_AUD, 3600))
 }
 
-/// POST an `initialize` frame to `/mcp` with an optional Bearer token, returning the
-/// status, the `WWW-Authenticate` challenge (if any), and whether the MCP transport
-/// admitted the request (it sets an `mcp-session-id` header on a live session).
-async fn mcp_post(
-    router: &axum::Router,
-    bearer: Option<&str>,
-) -> (StatusCode, Option<String>, bool) {
+/// POST an `initialize` frame to `/mcp` with an optional `Cf-Access-Jwt-Assertion`
+/// (the header Cloudflare's edge forwards after resolving the client's opaque OAuth
+/// token), returning the status and whether the MCP transport admitted the request
+/// (it sets an `mcp-session-id` header on a live session).
+async fn mcp_post(router: &axum::Router, assertion: Option<&str>) -> (StatusCode, bool) {
     let mut builder = Request::builder()
         .method("POST")
         .uri("/mcp")
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream");
-    if let Some(t) = bearer {
-        builder = builder.header("authorization", format!("Bearer {t}"));
+    if let Some(t) = assertion {
+        builder = builder.header("Cf-Access-Jwt-Assertion", t);
     }
     let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}"#;
     let resp = router
@@ -2708,47 +2708,38 @@ async fn mcp_post(
         .await
         .unwrap();
     let status = resp.status();
-    let www = resp
-        .headers()
-        .get("www-authenticate")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
     let has_session = resp.headers().contains_key("mcp-session-id");
-    (status, www, has_session)
+    (status, has_session)
 }
 
 #[tokio::test]
 #[serial]
-async fn mcp_bearer_auth_401_matrix() {
+async fn mcp_assertion_auth_401_matrix() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
     let (router, valid) = mcp_app_with_auth(pool).await;
 
-    // Missing token → 401 with a resource-metadata discovery challenge (NOT a
-    // login redirect), and the transport never saw the request.
-    let (status, www, session) = mcp_post(&router, None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "missing Bearer must 401");
-    let www = www.expect("401 must carry a WWW-Authenticate challenge");
-    assert!(
-        www.starts_with("Bearer "),
-        "challenge must be a Bearer scheme"
-    );
-    assert!(
-        www.contains("resource_metadata=") && www.contains(mcp_auth::METADATA_PATH),
-        "challenge must point at the resource metadata: {www}"
+    // Missing assertion → 401, and the transport never saw the request. By default
+    // (Managed OAuth) the origin emits no WWW-Authenticate — Cloudflare owns the
+    // OAuth challenge/discovery.
+    let (status, session) = mcp_post(&router, None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "missing assertion must 401"
     );
     assert!(!session, "a rejected request must not open an MCP session");
 
-    // Garbage token → 401.
+    // Garbage assertion → 401.
     assert_eq!(
         mcp_post(&router, Some("not-a-jwt")).await.0,
         StatusCode::UNAUTHORIZED,
-        "garbage Bearer must 401"
+        "garbage assertion must 401"
     );
 
     // Well-signed but minted for a DIFFERENT Access app (browser AUD) → 401. This is
-    // the crux: an MCP token must be scoped to the MCP app's own AUD.
+    // the crux: an MCP assertion must be scoped to the MCP app's own AUD.
     let wrong_aud = access_token(ACCESS_ISSUER, ACCESS_AUD, 3600);
     assert_eq!(
         mcp_post(&router, Some(&wrong_aud)).await.0,
@@ -2756,54 +2747,27 @@ async fn mcp_bearer_auth_401_matrix() {
         "a token for the browser Access app must not be accepted at /mcp"
     );
 
-    // Expired MCP token → 401.
+    // Expired MCP assertion → 401.
     let expired = access_token(ACCESS_ISSUER, MCP_AUD, -3600);
     assert_eq!(
         mcp_post(&router, Some(&expired)).await.0,
         StatusCode::UNAUTHORIZED,
-        "expired Bearer must 401"
+        "expired assertion must 401"
     );
 
-    // Valid MCP token → the guard admits it (not 401); the request reaches the MCP
-    // transport. Full functional proof (handshake + tool calls) is the authenticated
-    // end-to-end client test below.
-    let (status, _, _) = mcp_post(&router, Some(&valid)).await;
+    // Valid MCP assertion → the guard admits it (not 401); the request reaches the
+    // MCP transport. Full functional proof (handshake + tool calls) is the
+    // authenticated end-to-end client test below.
+    let (status, _) = mcp_post(&router, Some(&valid)).await;
     assert_ne!(
         status,
         StatusCode::UNAUTHORIZED,
-        "valid Bearer must not 401"
+        "valid assertion must not 401"
     );
     assert!(
         status.is_success() || status.is_client_error(),
-        "valid Bearer reaches the transport, not a 5xx: {status}"
+        "valid assertion reaches the transport, not a 5xx: {status}"
     );
-}
-
-#[tokio::test]
-#[serial]
-async fn mcp_serves_protected_resource_metadata_unauthenticated() {
-    let Some(pool) = pool_or_skip().await else {
-        return;
-    };
-    let (router, _valid) = mcp_app_with_auth(pool).await;
-
-    // The discovery document is served WITHOUT a token (the client fetches it before
-    // it has one) and names the Cloudflare Access OIDC authorization server.
-    for path in [mcp_auth::METADATA_PATH, mcp_auth::METADATA_PATH_ROOT] {
-        let (status, body) = get_json(&router, path).await;
-        assert_eq!(status, StatusCode::OK, "{path} must be served");
-        assert_eq!(
-            body["authorization_servers"],
-            serde_json::json!([ACCESS_ISSUER]),
-            "{path} must point at the Access OIDC authorization server"
-        );
-        assert!(
-            body["resource"]
-                .as_str()
-                .is_some_and(|r| r.ends_with("/mcp")),
-            "{path} resource must be the /mcp endpoint: {body}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -2818,30 +2782,24 @@ async fn mcp_fails_closed_when_auth_unconfigured() {
     std::env::remove_var("WATCHER_MCP_ENABLED");
 
     // The MCP surface is not mounted: an unauthenticated POST to /mcp is NOT met by
-    // the Bearer guard (which would 401) — it falls through to the SPA fallback, and
-    // opens no MCP session. There is simply no MCP endpoint to reach.
-    let (status, _www, session) = mcp_post(&router, None).await;
+    // the assertion guard (which would 401) — it falls through to the SPA fallback,
+    // and opens no MCP session. There is simply no MCP endpoint to reach.
+    let (status, session) = mcp_post(&router, None).await;
     assert_ne!(
         status,
         StatusCode::UNAUTHORIZED,
-        "fail-closed /mcp is unmounted — no Bearer guard present"
+        "fail-closed /mcp is unmounted — no assertion guard present"
     );
     assert!(!session, "fail-closed /mcp must expose no MCP session");
-
-    // And the auth-discovery document is not served (no metadata → the surface is
-    // simply absent), regardless of whether a built UI answers the fallback.
-    let (_, body) = get_json(&router, mcp_auth::METADATA_PATH).await;
-    assert!(
-        body.get("authorization_servers").is_none(),
-        "fail-closed must not serve resource metadata: {body}"
-    );
 }
 
-/// End-to-end MCP smoke test: enable `/mcp` with Bearer auth, serve the real app on
-/// an ephemeral port, and drive it with the official rmcp streamable-HTTP client
-/// (authenticated with a valid Access token) — list the tools and call
-/// `list_services` + `query_logs`, asserting the JSON shape. Multi-thread runtime so
-/// the server accept-loop and client run concurrently.
+/// End-to-end MCP smoke test: enable `/mcp` with assertion auth, serve the real app
+/// on an ephemeral port, and drive it with the official rmcp streamable-HTTP client
+/// — list the tools and call `list_services` + `query_logs`, asserting the JSON
+/// shape. A tiny front layer injects the `Cf-Access-Jwt-Assertion` header on every
+/// request, standing in for Cloudflare's edge (which resolves the client's opaque
+/// OAuth token into that assertion). Multi-thread runtime so the server accept-loop
+/// and client run concurrently.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn mcp_lists_tools_and_calls_read_queries() {
@@ -2864,6 +2822,21 @@ async fn mcp_lists_tools_and_calls_read_queries() {
 
     let (router, token) = mcp_app_with_auth(pool).await;
 
+    // Stand in for Cloudflare's edge: inject the `Cf-Access-Jwt-Assertion` the origin
+    // validates on every request (the edge sets it after resolving the client's opaque
+    // Managed-OAuth token). The rmcp client itself sends no auth header.
+    let assertion: axum::http::HeaderValue = token.parse().unwrap();
+    let router = router.layer(axum::middleware::from_fn(
+        move |mut req: axum::extract::Request, next: axum::middleware::Next| {
+            let assertion = assertion.clone();
+            async move {
+                req.headers_mut()
+                    .insert("Cf-Access-Jwt-Assertion", assertion);
+                next.run(req).await
+            }
+        },
+    ));
+
     // Serve on an ephemeral port so a real MCP client can drive the transport.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2871,10 +2844,7 @@ async fn mcp_lists_tools_and_calls_read_queries() {
         axum::serve(listener, router).await.unwrap();
     });
 
-    // The client attaches the Access Bearer token on every request (auth_header is
-    // the raw token; rmcp prefixes `Bearer `).
-    let config = StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
-        .auth_header(token);
+    let config = StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"));
     let transport = StreamableHttpClientTransport::from_config(config);
     let client = ().serve(transport).await.expect("mcp handshake");
 
