@@ -31,8 +31,46 @@ use crate::access_jwt::{Verifier, VerifyError};
 use crate::mcp_auth::McpAuth;
 
 /// The header Cloudflare Access sets on requests that cleared its edge policy,
-/// carrying the signed identity JWT the origin re-verifies (JEF-473).
+/// carrying the signed identity JWT the origin re-verifies (JEF-473). Under
+/// Managed OAuth this is also what the edge forwards after resolving an MCP
+/// client's opaque OAuth token (JEF-493), so `/api` and `/mcp` verify the same
+/// header. Cloudflare strips any client-supplied `Cf-Access-*` header, so the
+/// origin can trust it as edge-set.
 const ACCESS_JWT_HEADER: &str = "Cf-Access-Jwt-Assertion";
+
+/// Outcome of checking a request's `Cf-Access-Jwt-Assertion` header against a
+/// [`Verifier`]. Shared by the `/api` [`access_guard`] (which fails **open** on
+/// `KeysUnavailable`, since the edge is still the gate) and the `/mcp`
+/// [`mcp_auth::assertion_guard`] (which fails **closed** — it is the only auth).
+pub(crate) enum Assertion {
+    /// A valid assertion — admit the request.
+    Valid,
+    /// No `Cf-Access-Jwt-Assertion` header on the request.
+    Missing,
+    /// Header present but the JWT did not validate (bad signature, wrong
+    /// `aud`/`iss`, or expired); carries the reason for the guard's warn log.
+    Invalid(String),
+    /// The JWKS could not be obtained (cold cache) so the token can't be checked;
+    /// the caller decides fail-open vs. fail-closed.
+    KeysUnavailable,
+}
+
+/// Verify a request's `Cf-Access-Jwt-Assertion` header against `verifier`. The
+/// single place the header name and the `VerifyError` → outcome mapping live, so
+/// the `/api` and `/mcp` guards share exactly one verification path (JEF-493).
+pub(crate) async fn check_access_assertion(
+    verifier: &Verifier,
+    headers: &axum::http::HeaderMap,
+) -> Assertion {
+    let Some(token) = headers.get(ACCESS_JWT_HEADER).and_then(|v| v.to_str().ok()) else {
+        return Assertion::Missing;
+    };
+    match verifier.verify(token).await {
+        Ok(_claims) => Assertion::Valid,
+        Err(VerifyError::KeysUnavailable) => Assertion::KeysUnavailable,
+        Err(VerifyError::Invalid(why)) => Assertion::Invalid(why),
+    }
+}
 
 /// Reads W3C trace-context headers off an incoming request so watcher can
 /// continue the caller's trace (e.g. traefik's) rather than starting a new one.
@@ -136,25 +174,20 @@ async fn access_guard(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let token = req
-        .headers()
-        .get(ACCESS_JWT_HEADER)
-        .and_then(|v| v.to_str().ok());
-    let Some(token) = token else {
-        tracing::warn!(
-            path = %req.uri().path(),
-            "rejecting request with no {ACCESS_JWT_HEADER} header",
-        );
-        return (StatusCode::UNAUTHORIZED, "missing Cloudflare Access token").into_response();
-    };
-
-    match verifier.verify(token).await {
-        Ok(_claims) => next.run(req).await,
+    match check_access_assertion(&verifier, req.headers()).await {
+        Assertion::Valid => next.run(req).await,
         // Cold-cache / JWKS-outage: fail open (the edge is still the gate) so a
         // Cloudflare certs blip can't take the whole read surface down.
-        Err(VerifyError::KeysUnavailable) => next.run(req).await,
-        Err(e @ VerifyError::Invalid(_)) => {
-            tracing::warn!(path = %req.uri().path(), "rejecting request: {e}");
+        Assertion::KeysUnavailable => next.run(req).await,
+        Assertion::Missing => {
+            tracing::warn!(
+                path = %req.uri().path(),
+                "rejecting request with no {ACCESS_JWT_HEADER} header",
+            );
+            (StatusCode::UNAUTHORIZED, "missing Cloudflare Access token").into_response()
+        }
+        Assertion::Invalid(why) => {
+            tracing::warn!(path = %req.uri().path(), "rejecting request: invalid Access token: {why}");
             (StatusCode::UNAUTHORIZED, "invalid Cloudflare Access token").into_response()
         }
     }
@@ -175,7 +208,7 @@ pub fn app_with_access(pool: PgPool, access: Option<Arc<Verifier>>) -> Router {
 }
 
 /// Build the HTTP router, optionally enforcing Cloudflare Access JWT verification
-/// (JEF-473) on the read surface and Bearer auth (JEF-472) on `/mcp`.
+/// (JEF-473) on the read surface and Managed-OAuth assertion auth (JEF-493) on `/mcp`.
 ///
 /// The server holds no app-layer auth by default — auth lives at the edge
 /// (Cloudflare Access for the public read surface) and ingest is only reachable
@@ -186,9 +219,10 @@ pub fn app_with_access(pool: PgPool, access: Option<Arc<Verifier>>) -> Router {
 ///
 /// `/mcp` (when `WATCHER_MCP_ENABLED`) is served **only** when `mcp_auth` is `Some`:
 /// with no auth configured it is refused rather than exposed unauthenticated (fail
-/// closed). Its Bearer guard and the unauthenticated resource-metadata documents are
-/// wired here — outside the browser Access guard, since an MCP client is not a
-/// browser.
+/// closed). Its guard validates the same `Cf-Access-Jwt-Assertion` the edge forwards
+/// after resolving the MCP client's opaque Managed-OAuth token — but with a distinct
+/// AUD and failing closed. It is wired outside the browser Access guard since an MCP
+/// client is not a browser.
 pub fn app_with_auth(
     pool: PgPool,
     access: Option<Arc<Verifier>>,
@@ -245,36 +279,23 @@ pub fn app_with_auth(
     // Read-only MCP server (JEF-471), opt-in via WATCHER_MCP_ENABLED (default OFF).
     // Nested as its own tower service *outside* the `/api` router — and therefore
     // outside the browser Access guard above, since an MCP client is not a browser
-    // and carries no Access cookie. It gets its **own** Bearer auth (JEF-472): the
-    // transport is wrapped in `mcp_auth::bearer_guard`, and the unauthenticated
-    // discovery documents are served so a client can find the authorization server.
+    // and carries no Access cookie. Under Cloudflare Managed OAuth (JEF-493) the edge
+    // resolves the client's opaque OAuth token and forwards a `Cf-Access-Jwt-Assertion`;
+    // `mcp_auth::assertion_guard` validates that assertion (its own AUD, fail-closed).
+    // Cloudflare owns OAuth discovery, so no `.well-known` metadata is self-served.
     //
     // Fail closed: when MCP is enabled but no auth is configured, `/mcp` is not
     // mounted at all (the operator-facing error is logged in `main`) — we never
     // expose an unauthenticated MCP surface.
     if mcp::enabled() {
         if let Some(auth) = mcp_auth {
+            // The MCP transport behind the assertion guard. Nesting before
+            // `with_state` keeps the service off `with_state` (it carries its own pool).
             let auth = Arc::new(auth);
-
-            // Discovery (RFC 9728): served unauthenticated — the client fetches this
-            // *before* it has a token. Explicit routes take precedence over the SPA
-            // fallback, and they sit outside the Access guard. The root path is an
-            // alias some clients probe.
-            for path in [mcp_auth::METADATA_PATH, mcp_auth::METADATA_PATH_ROOT] {
-                let md = auth.clone();
-                router = router.route(
-                    path,
-                    get(move |headers| mcp_auth::protected_resource_metadata(md.clone(), headers)),
-                );
-            }
-
-            // The MCP transport behind the Bearer guard. Nesting before `with_state`
-            // keeps the service off `with_state` (it carries its own pool).
-            let guard = auth.clone();
             let guarded_mcp = Router::new()
                 .nest_service("/mcp", mcp::service(pool.clone()))
                 .layer(axum::middleware::from_fn(move |req, next| {
-                    mcp_auth::bearer_guard(guard.clone(), req, next)
+                    mcp_auth::assertion_guard(auth.clone(), req, next)
                 }));
             router = router.merge(guarded_mcp);
         }

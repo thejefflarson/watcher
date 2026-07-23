@@ -11,9 +11,11 @@
 //! `/mcp` is gated behind `WATCHER_MCP_ENABLED` (default OFF) and only mounted
 //! when enabled. It mounts *outside* the browser-cookie edge auth the UI/`/api` sit
 //! behind (Cloudflare Access, ADR 0013): an MCP client is not a browser and carries
-//! no Access cookie. Its auth is its own `Authorization: Bearer` Access token,
-//! validated by [`crate::mcp_auth`] (JEF-472) — `app_with_access` wraps this service
-//! in that guard and refuses to serve `/mcp` when the guard is unconfigured.
+//! no Access cookie. Under Cloudflare Managed OAuth the edge resolves the client's
+//! opaque OAuth token and forwards a `Cf-Access-Jwt-Assertion`, which
+//! [`crate::mcp_auth`] validates (JEF-493, its own AUD) — `app_with_access` wraps
+//! this service in that guard and refuses to serve `/mcp` when the guard is
+//! unconfigured.
 
 use std::sync::Arc;
 
@@ -345,9 +347,10 @@ pub fn service(pool: PgPool) -> StreamableHttpService<WatcherMcp, LocalSessionMa
     // server-to-server endpoint reached through a public tunnel host whose name
     // varies by deployment, so that default would reject every legitimate client.
     //
-    // With Bearer auth now in front (JEF-472), DNS-rebinding is already defeated: a
-    // rebinding attacker's browser JS cannot forge a valid Access token, so it can
-    // never get past the guard regardless of Host. We therefore disable the list by
+    // With Access-assertion auth now in front (JEF-493), DNS-rebinding is already
+    // defeated: the `Cf-Access-Jwt-Assertion` is an edge-set header (Cloudflare
+    // strips any client-supplied copy), so a rebinding attacker's browser JS cannot
+    // forge one and never gets past the guard regardless of Host. We disable the list by
     // default, but let an operator re-scope it to their known public host(s) via
     // WATCHER_MCP_ALLOWED_HOSTS (comma-separated) for belt-and-braces. Origin
     // validation stays off — MCP clients are not browsers and send no Origin.
