@@ -236,6 +236,9 @@ impl Mailer {
         let transport = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.relay)?
             .port(cfg.port)
             .credentials(Credentials::new(cfg.username.clone(), cfg.password.clone()))
+            // Bound the SMTP handshake/send: a slow relay must give up in seconds so
+            // it can't stall the alert-eval loop (`notify` is awaited on the tick).
+            .timeout(Some(Duration::from_secs(10)))
             .build();
         Ok(Self {
             transport,
@@ -369,6 +372,19 @@ fn breached(value: Option<f64>, comparator: &str, threshold: f64) -> bool {
     }
 }
 
+/// The HTTP client for webhook delivery, bounded so a slow/unresponsive receiver
+/// can't stall the eval loop (`notify` is awaited on the tick): 10s total per
+/// request, 5s to connect — short enough a dead sink gives up in seconds, long
+/// enough for a legitimately slow-but-alive receiver. Shared by `run` and
+/// `evaluate_once` so both delivery paths get identical bounds. Fallible (the TLS
+/// backend init can fail); callers log and disable the webhook rather than panic.
+fn build_webhook_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+}
+
 /// Runs forever; ticks immediately, then every `interval_secs`.
 pub async fn run(
     pool: PgPool,
@@ -376,7 +392,15 @@ pub async fn run(
     email: Option<EmailConfig>,
     interval_secs: u64,
 ) {
-    let client = reqwest::Client::new();
+    // A failed client build disables the webhook (logged) rather than taking down
+    // the alert loop, consistent with how a bad SMTP config disables email below.
+    let (client, webhook) = match build_webhook_client() {
+        Ok(c) => (c, webhook),
+        Err(e) => {
+            tracing::error!("alert webhook disabled — failed to build HTTP client: {e}");
+            (reqwest::Client::new(), None)
+        }
+    };
     // Build the mailer once. A bad address/relay disables email (logged) rather
     // than taking down the alert loop.
     let mailer = match email.as_ref().map(Mailer::build) {
@@ -400,7 +424,14 @@ pub async fn run(
 /// Exposed for tests and one-shot use; `run` calls it on a timer. Email is only
 /// wired through `run` (it owns the built mailer), so this path is webhook-only.
 pub async fn evaluate_once(pool: &PgPool, webhook: Option<&str>) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
+    // Same bounded client as `run`; a failed build disables the webhook (logged).
+    let (client, webhook) = match build_webhook_client() {
+        Ok(c) => (c, webhook),
+        Err(e) => {
+            tracing::error!("alert webhook disabled — failed to build HTTP client: {e}");
+            (reqwest::Client::new(), None)
+        }
+    };
     evaluate(pool, webhook, None, &client).await
 }
 
@@ -598,8 +629,8 @@ async fn notify(
 #[cfg(test)]
 mod tests {
     use super::{
-        agg_expr, breached, email_body, email_subject, eval_sql, validate, AlertRule, RuleConfig,
-        MAX_FOR_SECS,
+        agg_expr, breached, build_webhook_client, email_body, email_subject, eval_sql, notify,
+        validate, AlertRule, RuleConfig, MAX_FOR_SECS,
     };
 
     #[test]
@@ -811,6 +842,48 @@ mod tests {
         assert!(sql.contains("avg(value)"));
         // No rate machinery in the plain path.
         assert!(!sql.contains("lag(value)"));
+    }
+
+    // A webhook receiver that accepts the TCP connection but never sends a byte of
+    // response — the exact "slow/unresponsive receiver" that used to stall `notify`
+    // for ~11.5s. The bounded client's 10s request timeout must make `notify` give
+    // up well within the margin rather than blocking on the OS TCP timeout.
+    #[tokio::test]
+    async fn notify_gives_up_on_a_hung_webhook_within_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept forever, holding each connection open without ever responding.
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock); // keep it alive; never write back
+            }
+        });
+
+        let client = build_webhook_client().unwrap();
+        let url = format!("http://{addr}/hook");
+        let rule = rule();
+
+        let start = std::time::Instant::now();
+        // No mailer — this exercises the webhook sink in isolation.
+        notify(
+            &client,
+            Some(url.as_str()),
+            None,
+            &rule,
+            "firing",
+            Some(87.5),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        // The call must complete (it returns unit even on error, logging the failure)
+        // bounded by the 10s request timeout — never the multi-second-to-minutes OS
+        // TCP timeout. Generous 15s ceiling keeps it non-flaky under load.
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "notify() should give up on a hung webhook within the bounded timeout, took {elapsed:?}"
+        );
     }
 
     #[test]
