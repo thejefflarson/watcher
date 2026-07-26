@@ -118,9 +118,12 @@ fn validate(r: &RuleConfig) -> anyhow::Result<()> {
     if !matches!(r.comparator.as_str(), "gt" | "lt") {
         anyhow::bail!("alert rule '{}': comparator must be 'gt' or 'lt'", r.name);
     }
-    if !matches!(r.agg.as_str(), "avg" | "max" | "min" | "sum" | "last") {
+    if !matches!(
+        r.agg.as_str(),
+        "avg" | "max" | "min" | "sum" | "last" | "increase"
+    ) {
         anyhow::bail!(
-            "alert rule '{}': agg must be one of avg|max|min|sum|last",
+            "alert rule '{}': agg must be one of avg|max|min|sum|last|increase",
             r.name
         );
     }
@@ -290,6 +293,8 @@ fn email_body(rule: &AlertRule, state: &str, value: Option<f64>) -> String {
 
 /// Whitelisted aggregate expression — `agg` comes from the DB but is only ever
 /// written through the validated API, and we map it here rather than interpolate.
+/// `"increase"` never reaches here: `eval_sql` short-circuits to its own
+/// self-contained SQL shape before calling this.
 fn agg_expr(agg: &str) -> &'static str {
     match agg {
         "max" => "max(value)",
@@ -308,6 +313,19 @@ fn agg_expr(agg: &str) -> &'static str {
 /// When `rate` is set the cumulative counter level is differenced per series into
 /// a per-second rate *before* aggregating, reset-safe like `/api/metrics/facet`:
 /// a level that drops (counter reset) yields 0 for that interval, never a spike.
+///
+/// `agg == "increase"` is a third, self-contained shape (JEF-463): "how much did
+/// this monotonic counter go up within the window", e.g. "container restarted >N
+/// times in the last 10m" rather than `max` of its lifetime total (which never
+/// resolves once a pod has ever restarted a lot). It reuses the same per-series
+/// step-differencing as `rate` — each series' consecutive-point deltas — but sums
+/// the *raw* positive steps instead of dividing by `dt` and averaging/maxing a
+/// per-second rate: `sum(GREATEST(step, 0))` is the reset-safe total increase
+/// (window-end minus window-start, except a counter reset contributes 0 for that
+/// step instead of a negative spike, so a reset mid-window undercounts by the
+/// pre-reset increase rather than going negative — the safe direction for an
+/// alert). `rate` is ignored for this agg: the differencing isn't optional here,
+/// it's what "increase" means, so `agg_expr` (avg/max/min/sum/last) never applies.
 fn eval_sql(agg: &str, rate: bool) -> String {
     // Residual JSONB predicates ride on top of the (name, time) index narrowing;
     // a NULL operand disables its clause so pre-JEF-426 rules are unaffected.
@@ -319,6 +337,17 @@ fn eval_sql(agg: &str, rate: bool) -> String {
                AND ($5::jsonb IS NULL OR NOT (attributes @> $5))
                AND value IS NOT NULL
                AND time >= now() - make_interval(secs => $3)";
+    if agg == "increase" {
+        return format!(
+            "WITH pts AS ({filtered}),
+             steps AS (
+                 SELECT GREATEST(value - lag(value) OVER w, 0) AS step
+                 FROM pts
+                 WINDOW w AS (PARTITION BY service, attributes ORDER BY time)
+             )
+             SELECT sum(step) FROM steps WHERE step IS NOT NULL"
+        );
+    }
     if rate {
         format!(
             "WITH pts AS ({filtered}),
@@ -450,7 +479,13 @@ async fn evaluate(
     .await?;
 
     for rule in rules {
-        let rate = resolve_rate(pool, &rule).await?;
+        // `eval_sql` ignores `rate` for agg "increase" (its differencing is always
+        // on), so skip the extra auto-detect query — it'd be a wasted round trip.
+        let rate = if rule.agg == "increase" {
+            false
+        } else {
+            resolve_rate(pool, &rule).await?
+        };
         let sql = eval_sql(&rule.agg, rate);
         // AssertSqlSafe: sqlx 0.9 requires dynamic SQL to be audited. Only the
         // enum-whitelisted agg_expr() is interpolated; metric/service/window and
@@ -688,6 +723,13 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_increase_agg() {
+        // JEF-463: "restarts increased by >N in window_secs" — a rule keying on
+        // window delta rather than lifetime level must validate like any other agg.
+        assert!(validate(&cfg("crashlooping", "gt", "increase")).is_ok());
+    }
+
+    #[test]
     fn validate_for_secs_range() {
         let mut r = cfg("dwell", "gt", "avg");
         r.for_secs = None;
@@ -896,5 +938,27 @@ mod tests {
         // The predicate filters still apply before differencing.
         assert!(sql.contains("attributes @> $4"));
         assert!(sql.contains("max(value)"));
+    }
+
+    #[test]
+    fn eval_sql_increase_sums_reset_safe_positive_steps() {
+        // JEF-463: window-increase of a monotonic counter, not its lifetime `max`.
+        // `rate` is irrelevant to this agg — pass both to confirm it's ignored.
+        for rate in [false, true] {
+            let sql = eval_sql("increase", rate);
+            // Per-series consecutive-point deltas, clamped to 0 rather than going
+            // negative on a counter reset (pod recreate) — the reset-safety this
+            // ticket requires, reusing the same per-series/ordered-by-time shape
+            // as the `rate` path.
+            assert!(sql.contains("GREATEST(value - lag(value) OVER w, 0)"));
+            assert!(sql.contains("PARTITION BY service, attributes ORDER BY time"));
+            // Summed, not averaged/maxed: total increase over the window, not a
+            // per-second rate — agg_expr (avg/max/min/sum/last) never applies here.
+            assert!(sql.contains("sum(step)"));
+            assert!(!sql.contains("dv / dt"));
+            // The predicate filters (window, match/exclude) still gate the input.
+            assert!(sql.contains("attributes @> $4"));
+            assert!(sql.contains("make_interval(secs => $3)"));
+        }
     }
 }
