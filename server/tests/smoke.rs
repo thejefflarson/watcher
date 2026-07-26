@@ -11,8 +11,8 @@ use opentelemetry_proto::tonic::{
     common::v1::{any_value, AnyValue, KeyValue},
     logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
     metrics::v1::{
-        metric, number_data_point, Gauge, Histogram, HistogramDataPoint, Metric, NumberDataPoint,
-        ResourceMetrics, ScopeMetrics, Sum,
+        exemplar, metric, number_data_point, Exemplar, Gauge, Histogram, HistogramDataPoint,
+        Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum,
     },
     resource::v1::Resource,
     trace::v1::{ResourceSpans, ScopeSpans, Span},
@@ -153,6 +153,38 @@ fn one_number(
         }),
     };
     metric_request(name, service, data)
+}
+
+/// One gauge point carrying a single OTLP exemplar (JEF-433), so ingest's
+/// `first_exemplar` decode path has something to pick up. `trace_id`/`span_id`
+/// are raw bytes — hex-encode the return value to compare against the API.
+fn gauge_with_exemplar(
+    name: &str,
+    service: &str,
+    value: f64,
+    trace_id: Vec<u8>,
+    span_id: Vec<u8>,
+    nanos: u64,
+) -> ExportMetricsServiceRequest {
+    let dp = NumberDataPoint {
+        time_unix_nano: nanos,
+        value: Some(number_data_point::Value::AsDouble(value)),
+        exemplars: vec![Exemplar {
+            time_unix_nano: nanos,
+            trace_id,
+            span_id,
+            value: Some(exemplar::Value::AsDouble(value)),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    metric_request(
+        name,
+        service,
+        metric::Data::Gauge(Gauge {
+            data_points: vec![dp],
+        }),
+    )
 }
 
 /// One histogram point with the given bounds/counts, optionally `pod`-tagged.
@@ -603,6 +635,160 @@ async fn metric_series_returns_recent_points() {
 
     // A metric that doesn't exist yields an empty series, not an error.
     let (status, empty) = get_json(&router, "/api/metrics/series?name=nope").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(empty.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn metric_series_honors_absolute_from_to_window() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let router = app(pool);
+
+    // Two points an hour apart: one 3h ago (outside a 1h-wide absolute window
+    // anchored 2h ago), one 90m ago (inside it).
+    ingest(&router, gauge_request("cpu.load", 0.1, nanos_ago(3 * 3600))).await;
+    ingest(&router, gauge_request("cpu.load", 0.9, nanos_ago(5400))).await;
+
+    // RFC3339 with a `Z` suffix (no `+`) — a literal `+` in a query string is
+    // form-decoded as a space, corrupting a `+00:00` offset (see
+    // time_window_filters_traces_and_logs for the same pitfall).
+    let now = chrono::Utc::now();
+    let from =
+        (now - chrono::Duration::hours(2)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let to = (now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let (status, series) = get_json(
+        &router,
+        &format!("/api/metrics/series?name=cpu.load&from={from}&to={to}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = series.as_array().expect("array");
+    assert_eq!(arr.len(), 1, "only the point inside the absolute window");
+    assert_eq!(arr[0]["v"], 0.9);
+
+    // Same window via facet and histogram — both must render the exact absolute
+    // range too, not just `series` (JEF-433).
+    ingest(
+        &router,
+        one_number("reqs", None, "api", None, 0.9, nanos_ago(5400)),
+    )
+    .await;
+    ingest(
+        &router,
+        one_number("reqs", None, "api", None, 0.1, nanos_ago(3 * 3600)),
+    )
+    .await;
+    let (status, facet) = get_json(
+        &router,
+        &format!("/api/metrics/facet?name=reqs&from={from}&to={to}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let series = facet["series"].as_array().unwrap();
+    assert_eq!(series.len(), 1);
+    let points = series[0]["points"].as_array().unwrap();
+    assert_eq!(points.len(), 1, "only the in-window bucket");
+    assert_eq!(points[0]["v"], 0.9);
+
+    ingest(
+        &router,
+        one_histogram(
+            "lat2",
+            "api",
+            None,
+            vec![10.0, 20.0],
+            vec![0, 5, 0],
+            5,
+            75.0,
+            nanos_ago(5400),
+        ),
+    )
+    .await;
+    ingest(
+        &router,
+        one_histogram(
+            "lat2",
+            "api",
+            None,
+            vec![10.0, 20.0],
+            vec![5, 0, 0],
+            5,
+            50.0,
+            nanos_ago(3 * 3600),
+        ),
+    )
+    .await;
+    let (status, hist) = get_json(
+        &router,
+        &format!("/api/metrics/histogram?name=lat2&from={from}&to={to}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let buckets = hist["buckets"].as_array().unwrap();
+    assert_eq!(buckets.len(), 1, "only the in-window bucket");
+    assert_eq!(buckets[0]["counts"], serde_json::json!([0, 5, 0]));
+}
+
+#[tokio::test]
+#[serial]
+async fn metric_exemplar_persists_trace_id_and_surfaces_in_exemplars_endpoint() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let router = app(pool.clone());
+
+    let trace_id = vec![0xAB; 16];
+    let span_id = vec![0xCD; 8];
+    let now = now_nanos();
+    ingest(
+        &router,
+        gauge_with_exemplar(
+            "lat.p99",
+            "api",
+            42.0,
+            trace_id.clone(),
+            span_id.clone(),
+            now,
+        ),
+    )
+    .await;
+
+    // The raw row keeps the exemplar's trace/span id, hex-encoded.
+    let (raw_trace, raw_span): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT exemplar_trace_id, exemplar_span_id FROM metrics WHERE name = 'lat.p99'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(raw_trace.as_deref(), Some(hex::encode(&trace_id).as_str()));
+    assert_eq!(raw_span.as_deref(), Some(hex::encode(&span_id).as_str()));
+
+    // The exemplars endpoint surfaces it so a chart can deep-link to the trace.
+    let (status, exemplars) =
+        get_json(&router, "/api/metrics/exemplars?name=lat.p99&hours=1").await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = exemplars.as_array().expect("array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["trace_id"], hex::encode(&trace_id));
+    assert_eq!(arr[0]["span_id"], hex::encode(&span_id));
+    assert_eq!(arr[0]["v"], 42.0);
+
+    // A metric ingested WITHOUT an exemplar is completely unaffected: no row picks
+    // up a stray trace id, and it doesn't show up in the exemplars endpoint.
+    ingest(&router, gauge_request("plain.metric", 1.0, now_nanos())).await;
+    let (plain_trace,): (Option<String>,) =
+        sqlx::query_as("SELECT exemplar_trace_id FROM metrics WHERE name = 'plain.metric'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(plain_trace, None);
+    let (status, empty) =
+        get_json(&router, "/api/metrics/exemplars?name=plain.metric&hours=1").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(empty.as_array().unwrap().len(), 0);
 }

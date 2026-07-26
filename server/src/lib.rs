@@ -247,6 +247,7 @@ pub fn app_with_auth(
         .route("/api/metrics/facet", get(api::metric_facet))
         .route("/api/metrics/histogram", get(api::metric_histogram))
         .route("/api/metrics/hist_facet", get(api::metric_hist_facet))
+        .route("/api/metrics/exemplars", get(api::metric_exemplars))
         .route("/api/servicemap", get(api::service_map))
         .route("/api/services", get(api::service_red))
         // Rules are declarative (reconciled from config at startup), so this is

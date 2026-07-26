@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import {
+  getMetricExemplars,
   getMetricFacet,
   getMetricHistogram,
+  type ExemplarPoint,
   type HistResponse,
   type SeriesPoint,
 } from "../api";
@@ -32,21 +34,35 @@ interface Series {
   points: SeriesPoint[];
 }
 
+// One raw point that carries a sampled trace exemplar (JEF-433), positioned by
+// time + value so `Chart` can plot it as a marker on the line it belongs to.
+interface ExemplarMark {
+  t: string;
+  v: number | null;
+  traceId: string;
+}
+
 // A small multi-line chart drawn by hand — hairline axes, ink for the lines.
 // `threshold` (an alert rule's bound) is drawn as a dashed reference line and
 // `firingFrom` (ms) shades the still-open firing window when deep-linked here.
+// `exemplars` overlays a marker per point with a sampled trace (correlational —
+// "a trace recorded here" — never causal); clicking one calls `onExemplarClick`.
 function Chart({
   series,
   unit,
   threshold,
   firingFrom,
   desc,
+  exemplars,
+  onExemplarClick,
 }: {
   series: Series[];
   unit?: string | null;
   threshold?: number | null;
   firingFrom?: number | null;
   desc: string;
+  exemplars?: ExemplarMark[];
+  onExemplarClick?: (traceId: string) => void;
 }) {
   const w = 720;
   const h = 240;
@@ -78,7 +94,7 @@ function Chart({
     // Clamp the firing-window start to the plotted range (it may predate it).
     const firingX =
       firingFrom != null ? Math.max(pad.l, Math.min(x(firingFrom), w - pad.r)) : null;
-    return { lo, hi, t0, t1, lines, thresholdY, firingX };
+    return { lo, hi, t0, t1, lines, thresholdY, firingX, x, y };
   }, [series, threshold, firingFrom]);
 
   if (!geom) return <p className="muted">Not enough data to plot.</p>;
@@ -153,6 +169,32 @@ function Chart({
             strokeWidth="1"
           />
         ))}
+        {exemplars?.map((e) => {
+          if (e.v == null) return null;
+          const t = new Date(e.t).getTime();
+          if (t < geom.t0 || t > geom.t1) return null;
+          return (
+            <circle
+              key={`${e.traceId}-${e.t}`}
+              className="exemplar-dot"
+              cx={geom.x(t)}
+              cy={geom.y(e.v)}
+              r={3.5}
+              role="link"
+              tabIndex={0}
+              aria-label={`View trace ${e.traceId} recorded near this point`}
+              onClick={() => onExemplarClick?.(e.traceId)}
+              onKeyDown={(ev) => {
+                if (ev.key === "Enter" || ev.key === " ") {
+                  ev.preventDefault();
+                  onExemplarClick?.(e.traceId);
+                }
+              }}
+            >
+              <title>{`trace ${e.traceId} — open`}</title>
+            </circle>
+          );
+        })}
       </svg>
       {series.length > 1 && (
         <div className="legend">
@@ -238,6 +280,7 @@ const MAX_LINES = 12;
 // Gauge/sum: one line per series. Sums (counters) arrive as per-second rates.
 function FacetView({
   name,
+  service,
   hours,
   unit,
   threshold,
@@ -245,18 +288,23 @@ function FacetView({
   rangeLabel,
 }: {
   name: string;
+  service: string | null;
   hours: number;
   unit?: string | null;
   threshold?: number | null;
   firingFrom?: number | null;
   rangeLabel: string;
 }) {
+  const navigate = useNavigate();
   const [data, setData] = useState<{
     series: Series[];
     rated: boolean;
     truncated: number;
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Best-effort — exemplars only exist in the raw-metric window, so an empty
+  // result is the normal case, not a failure (JEF-433).
+  const [exemplars, setExemplars] = useState<ExemplarPoint[]>([]);
 
   useEffect(() => {
     let active = true;
@@ -279,6 +327,16 @@ function FacetView({
     };
   }, [name, hours]);
 
+  useEffect(() => {
+    let active = true;
+    getMetricExemplars({ name, service: service ?? undefined, hours })
+      .then((e) => active && setExemplars(e))
+      .catch(() => active && setExemplars([]));
+    return () => {
+      active = false;
+    };
+  }, [name, service, hours]);
+
   if (error) return <p className="error">Failed to load: {error}</p>;
   if (!data) return <p className="muted">Loading…</p>;
   return (
@@ -289,6 +347,9 @@ function FacetView({
           : "gauge — value"}
         {data.series.length > 1 ? ` · ${data.series.length} series` : ""}
         {data.truncated > 0 ? ` · +${data.truncated} more not shown` : ""}
+        {exemplars.length > 0
+          ? ` · ${exemplars.length} traces recorded here (○, click to open)`
+          : ""}
       </p>
       <Chart
         series={data.series}
@@ -296,6 +357,10 @@ function FacetView({
         threshold={threshold}
         firingFrom={firingFrom}
         desc={`${name} ${data.rated ? "per-second rate" : "value"}, ${rangeLabel}`}
+        exemplars={exemplars.map((e) => ({ t: e.t, v: e.v, traceId: e.trace_id }))}
+        onExemplarClick={(traceId) =>
+          navigate(`/traces/${traceId}${service ? `?service=${encodeURIComponent(service)}` : ""}`)
+        }
       />
     </div>
   );
@@ -382,6 +447,20 @@ export default function MetricChart({
     firingRaw && !Number.isNaN(Date.parse(firingRaw)) ? Date.parse(firingRaw) : null;
   const rangeLabel = RANGES.find((r) => r.hours === hours)?.label ?? `${hours}h`;
 
+  // One-action deep link to the trace list scoped to this chart's service +
+  // displayed window (JEF-433) — the window is the picker's hours-back-from-now
+  // range, matching what's actually plotted. Correlational ("traces in this
+  // window"), not a claim that any one of them caused what the chart shows.
+  const tracesHref = useMemo(() => {
+    const now = Date.now();
+    const qs = new URLSearchParams({
+      from: new Date(now - hours * 60 * 60 * 1000).toISOString(),
+      to: new Date(now).toISOString(),
+    });
+    if (service) qs.set("service", service);
+    return `/traces?${qs.toString()}`;
+  }, [service, hours]);
+
   return (
     <div className="metric-chart">
       <button className="back" onClick={onBack}>
@@ -401,6 +480,9 @@ export default function MetricChart({
             {r.label}
           </button>
         ))}
+        <Link className="back traces-link" to={tracesHref}>
+          traces in this window →
+        </Link>
       </div>
       {kind === "histogram" ? (
         <HistogramView
@@ -413,6 +495,7 @@ export default function MetricChart({
       ) : (
         <FacetView
           name={name}
+          service={service}
           hours={hours}
           unit={unit}
           threshold={threshold}

@@ -110,8 +110,17 @@ export interface SeriesPoint {
   v: number | null;
 }
 
-export const getMetricSeries = (p: { name: string; service?: string; hours?: number }) =>
-  get<SeriesPoint[]>(`/api/metrics/series?${qs(p)}`);
+// `from`/`to` (RFC3339) render an exact absolute window instead of the
+// hours-back-from-now default — e.g. "metrics around this trace"
+// (JEF-433). Either may be omitted; an omitted end falls back to the
+// hours-relative bound.
+export const getMetricSeries = (p: {
+  name: string;
+  service?: string;
+  hours?: number;
+  from?: string;
+  to?: string;
+}) => get<SeriesPoint[]>(`/api/metrics/series?${qs(p)}`);
 
 export interface LabeledPoint {
   label: string | null;
@@ -139,8 +148,27 @@ export interface FacetResponse {
   series: FacetSeries[];
   truncated: number;
 }
-export const getMetricFacet = (p: { name: string; hours?: number }) =>
+// See getMetricSeries for the from/to override.
+export const getMetricFacet = (p: { name: string; hours?: number; from?: string; to?: string }) =>
   get<FacetResponse>(`/api/metrics/facet?${qs(p)}`);
+
+// Raw points that carry a sampled trace exemplar (JEF-433) — a chart overlays
+// these as markers linking to the exact trace. Only ever covers the raw-metric
+// retention window (a few hours); older points never have exemplars, by design
+// (rollups aggregate them away). Correlational, not causal.
+export interface ExemplarPoint {
+  t: string;
+  v: number | null;
+  trace_id: string;
+  span_id: string | null;
+}
+export const getMetricExemplars = (p: {
+  name: string;
+  service?: string;
+  hours?: number;
+  from?: string;
+  to?: string;
+}) => get<ExemplarPoint[]>(`/api/metrics/exemplars?${qs(p)}`);
 
 // Histogram distribution over time: a heatmap row (counts per value bucket) plus
 // interpolated percentiles per time bucket.
@@ -156,8 +184,13 @@ export interface HistResponse {
   unit: string | null;
   buckets: HistBucket[];
 }
-export const getMetricHistogram = (p: { name: string; hours?: number }) =>
-  get<HistResponse>(`/api/metrics/histogram?${qs(p)}`);
+// See getMetricSeries for the from/to override.
+export const getMetricHistogram = (p: {
+  name: string;
+  hours?: number;
+  from?: string;
+  to?: string;
+}) => get<HistResponse>(`/api/metrics/histogram?${qs(p)}`);
 
 // Per-series histogram percentiles over time (one series per attribute set) —
 // for expanding a histogram metric in the list into its series' p50/p95/p99.
@@ -178,8 +211,13 @@ export interface HistFacetResponse {
   series: HistFacetSeries[];
   truncated: number;
 }
-export const getMetricHistFacet = (p: { name: string; hours?: number }) =>
-  get<HistFacetResponse>(`/api/metrics/hist_facet?${qs(p)}`);
+// See getMetricSeries for the from/to override.
+export const getMetricHistFacet = (p: {
+  name: string;
+  hours?: number;
+  from?: string;
+  to?: string;
+}) => get<HistFacetResponse>(`/api/metrics/hist_facet?${qs(p)}`);
 
 export const getServiceMap = () => get<ServiceMapData>(`/api/servicemap`);
 

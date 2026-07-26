@@ -300,6 +300,10 @@ impl WatcherMcp {
             name: a.name,
             service: a.service,
             hours: a.hours,
+            // Absolute from/to (JEF-433) are an HTTP-only affordance for now — the
+            // MCP tool keeps its existing hours-only surface.
+            from: None,
+            to: None,
         };
         let rows = api::query_metric_series(&self.pool, q)
             .await

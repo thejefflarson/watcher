@@ -14,7 +14,7 @@ use opentelemetry_proto::tonic::{
     collector::trace::v1::ExportTraceServiceRequest,
     common::v1::{any_value, AnyValue, KeyValue},
     logs::v1::LogRecord,
-    metrics::v1::{metric, number_data_point, Metric, NumberDataPoint},
+    metrics::v1::{metric, number_data_point, Exemplar, Metric, NumberDataPoint},
     trace::v1::Span,
 };
 use prost::Message;
@@ -522,6 +522,10 @@ struct NumRow {
     unit: Option<String>,
     is_monotonic: Option<bool>,
     attrs: serde_json::Value,
+    /// One exemplar trace/span id (JEF-433), picked from the point's exemplars —
+    /// `None` for points that carry no sampled exemplar (the common case).
+    exemplar_trace_id: Option<String>,
+    exemplar_span_id: Option<String>,
 }
 
 /// One decoded histogram point, ready to batch-insert.
@@ -535,6 +539,9 @@ struct HistRow {
     count: i64,
     bounds: Vec<f64>,
     counts: Vec<i64>,
+    /// One exemplar trace/span id (JEF-433); see `NumRow`.
+    exemplar_trace_id: Option<String>,
+    exemplar_span_id: Option<String>,
 }
 
 /// Decode one metric's data points into the per-request batches. No DB I/O here —
@@ -580,6 +587,7 @@ fn collect_metric(
                 if full(nums, hists) {
                     break;
                 }
+                let (exemplar_trace_id, exemplar_span_id) = first_exemplar(&dp.exemplars);
                 hists.push(HistRow {
                     time: ts(dp.time_unix_nano),
                     service: service.map(str::to_string),
@@ -591,6 +599,8 @@ fn collect_metric(
                     // bucket_counts has one more entry than explicit_bounds (+Inf).
                     bounds: dp.explicit_bounds.clone(),
                     counts: dp.bucket_counts.iter().map(|&c| c as i64).collect(),
+                    exemplar_trace_id,
+                    exemplar_span_id,
                 });
             }
         }
@@ -614,6 +624,7 @@ fn num_row(
         Some(number_data_point::Value::AsInt(i)) => i as f64,
         None => return None,
     };
+    let (exemplar_trace_id, exemplar_span_id) = first_exemplar(&dp.exemplars);
     Some(NumRow {
         time: ts(dp.time_unix_nano),
         service: service.map(str::to_string),
@@ -623,7 +634,25 @@ fn num_row(
         unit: unit.clone(),
         is_monotonic,
         attrs: merged_attrs(resource, &dp.attributes),
+        exemplar_trace_id,
+        exemplar_span_id,
     })
+}
+
+/// Pick one exemplar to keep per data point (JEF-433): the first exemplar that
+/// actually carries a trace id — an exemplar's span/trace ids are optional in the
+/// OTLP spec (absent when the measurement wasn't recorded inside a sampled trace),
+/// so a point can have exemplars with no usable id. `metrics` keeps at most one
+/// exemplar per row (not the full list) — enough to link a chart point to *a*
+/// concrete trace without a separate exemplars table.
+fn first_exemplar(exemplars: &[Exemplar]) -> (Option<String>, Option<String>) {
+    match exemplars.iter().find(|e| !e.trace_id.is_empty()) {
+        Some(e) => (
+            Some(hex::encode(&e.trace_id)),
+            (!e.span_id.is_empty()).then(|| hex::encode(&e.span_id)),
+        ),
+        None => (None, None),
+    }
 }
 
 /// One request's numeric points as the parallel per-column arrays sqlx's `unnest`
@@ -638,6 +667,8 @@ struct NumBatch {
     units: Vec<Option<String>>,
     attrs: Vec<serde_json::Value>,
     monos: Vec<Option<bool>>,
+    exemplar_trace_ids: Vec<Option<String>>,
+    exemplar_span_ids: Vec<Option<String>>,
     width: f64,
 }
 
@@ -645,20 +676,27 @@ struct NumBatch {
 /// One `execute` per call, against a caller-supplied connection so
 /// `write_with_failover_retry` can rerun it on a fresh connection after a failover.
 async fn insert_numbers(conn: &mut PgConnection, b: &NumBatch) -> Result<(), sqlx::Error> {
+    // Exemplars are per-raw-point only — deliberately absent from the rollup
+    // INSERT/UPDATE below (ADR 0011: rollups aggregate the dimension away, same
+    // as the existing constraint on bucket_bounds/bucket_counts).
     sqlx::query(
         "WITH pts AS (
              SELECT * FROM unnest($1::timestamptz[], $2::text[], $3::text[], $4::text[],
-                                  $5::float8[], $6::text[], $7::jsonb[], $8::bool[])
-                 AS t(time, service, name, kind, value, unit, attrs, is_monotonic)
+                                  $5::float8[], $6::text[], $7::jsonb[], $8::bool[],
+                                  $9::text[], $10::text[])
+                 AS t(time, service, name, kind, value, unit, attrs, is_monotonic,
+                      exemplar_trace_id, exemplar_span_id)
          ),
          raw AS (
-             INSERT INTO metrics (time, service, name, kind, value, unit, attributes, is_monotonic)
-             SELECT time, service, name, kind, value, unit, attrs, is_monotonic FROM pts
+             INSERT INTO metrics (time, service, name, kind, value, unit, attributes, is_monotonic,
+                                  exemplar_trace_id, exemplar_span_id)
+             SELECT time, service, name, kind, value, unit, attrs, is_monotonic,
+                    exemplar_trace_id, exemplar_span_id FROM pts
          )
          INSERT INTO metric_series_rollups
              (bucket, name, series_key, attrs, service, kind, unit, is_monotonic,
               count, sum, min, max, avg)
-         SELECT metric_bucket(time, $9),
+         SELECT metric_bucket(time, $11),
                 name, metric_series_key(service, attrs), attrs, service, kind, unit,
                 is_monotonic, count(*), sum(value), min(value), max(value), avg(value)
          FROM pts
@@ -685,6 +723,8 @@ async fn insert_numbers(conn: &mut PgConnection, b: &NumBatch) -> Result<(), sql
     .bind(&b.units)
     .bind(&b.attrs)
     .bind(&b.monos)
+    .bind(&b.exemplar_trace_ids)
+    .bind(&b.exemplar_span_ids)
     .bind(b.width)
     .execute(&mut *conn)
     .await
@@ -714,6 +754,8 @@ async fn flush_numbers(pool: &PgPool, rows: Vec<NumRow>) -> u64 {
         units: Vec::with_capacity(n),
         attrs: Vec::with_capacity(n),
         monos: Vec::with_capacity(n),
+        exemplar_trace_ids: Vec::with_capacity(n),
+        exemplar_span_ids: Vec::with_capacity(n),
         width: rollup_width(),
     };
     for r in rows {
@@ -725,6 +767,8 @@ async fn flush_numbers(pool: &PgPool, rows: Vec<NumRow>) -> u64 {
         b.units.push(r.unit);
         b.attrs.push(r.attrs);
         b.monos.push(r.is_monotonic);
+        b.exemplar_trace_ids.push(r.exemplar_trace_id);
+        b.exemplar_span_ids.push(r.exemplar_span_id);
     }
     // The whole-batch write goes through failover retry (JEF-496): a Patroni failover's
     // read-only error is retried on a fresh connection, not dropped. There's no per-row
@@ -766,6 +810,8 @@ async fn flush_histograms(pool: &PgPool, rows: Vec<HistRow>) -> u64 {
                     "count": r.count,
                     "bounds": r.bounds,
                     "counts": r.counts,
+                    "exemplar_trace_id": r.exemplar_trace_id,
+                    "exemplar_span_id": r.exemplar_span_id,
                 })
             })
             .collect(),
@@ -798,6 +844,8 @@ struct HistBatch {
 /// One `execute` per call, against a caller-supplied connection so the failover retry
 /// can rerun it on a fresh connection.
 async fn insert_histograms(conn: &mut PgConnection, b: &HistBatch) -> Result<(), sqlx::Error> {
+    // Exemplars are per-raw-point only — the rollup INSERT/UPDATE below doesn't
+    // carry them; see insert_numbers.
     sqlx::query(
         "WITH pts AS (
              SELECT (e->>'time')::timestamptz AS time,
@@ -808,13 +856,17 @@ async fn insert_histograms(conn: &mut PgConnection, b: &HistBatch) -> Result<(),
                     (e->>'sum')::float8 AS sum,
                     (e->>'count')::bigint AS count,
                     (SELECT array_agg(x::float8) FROM jsonb_array_elements_text(e->'bounds') x) AS bounds,
-                    (SELECT array_agg(x::bigint) FROM jsonb_array_elements_text(e->'counts') x) AS counts
+                    (SELECT array_agg(x::bigint) FROM jsonb_array_elements_text(e->'counts') x) AS counts,
+                    e->>'exemplar_trace_id' AS exemplar_trace_id,
+                    e->>'exemplar_span_id' AS exemplar_span_id
              FROM jsonb_array_elements($1::jsonb) e
          ),
          raw AS (
              INSERT INTO metrics
-                 (time, service, name, kind, value, count, unit, attributes, bucket_bounds, bucket_counts)
-             SELECT time, service, name, 'histogram', sum, count, unit, attrs, bounds, counts FROM pts
+                 (time, service, name, kind, value, count, unit, attributes, bucket_bounds, bucket_counts,
+                  exemplar_trace_id, exemplar_span_id)
+             SELECT time, service, name, 'histogram', sum, count, unit, attrs, bounds, counts,
+                    exemplar_trace_id, exemplar_span_id FROM pts
          )
          INSERT INTO metric_series_rollups
              (bucket, name, series_key, attrs, service, kind, unit,

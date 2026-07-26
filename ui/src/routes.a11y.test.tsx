@@ -181,6 +181,7 @@ vi.mock("./api", () => {
     listLogs: vi.fn().mockResolvedValue(logs),
     listMetrics: vi.fn().mockResolvedValue(metrics),
     getMetricSeries: vi.fn().mockResolvedValue([]),
+    getMetricExemplars: vi.fn().mockResolvedValue([]),
     getMetricDims: vi.fn().mockResolvedValue([]),
     getMetricSeriesGrouped: vi.fn().mockResolvedValue([]),
     getMetricFacet: vi.fn().mockResolvedValue(facet),

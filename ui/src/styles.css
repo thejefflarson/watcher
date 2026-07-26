@@ -494,6 +494,28 @@ a.xlink:hover,
   font-size: 10px;
 }
 
+/* Exemplar markers (JEF-433): a hollow ring, ink on hover/focus — data-colored
+   like everything else in the chart, not a decorative accent. */
+.exemplar-dot {
+  fill: var(--bg);
+  stroke: var(--text);
+  stroke-width: 1.5;
+  cursor: pointer;
+}
+
+.exemplar-dot:hover,
+.exemplar-dot:focus {
+  fill: var(--text);
+  outline: none;
+}
+
+/* "traces in this window" deep link, inline with the range buttons. */
+.traces-link {
+  margin-bottom: 0;
+  margin-left: auto;
+  font-size: 0.9rem;
+}
+
 button.range {
   background: none;
   border: none;

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { listTraces, type TraceSummary } from "../api";
 import { useControls, rangeParams } from "../timerange";
 import { useSort } from "../sort";
@@ -22,6 +22,12 @@ export default function TraceList({ to }: { to: (traceId: string) => string }) {
   const [attr, setAttr] = useState("");
   const [errorsOnly, setErrorsOnly] = useState(false);
   const [minDuration, setMinDuration] = useState("");
+  // An absolute `?from=&to=` (e.g. a metric chart's "traces in this window" deep
+  // link, JEF-433) overrides the picker's relative range so a chart's exact
+  // moment is reachable even for a window the picker's presets can't express.
+  const [urlParams] = useSearchParams();
+  const absFrom = urlParams.get("from");
+  const absTo = urlParams.get("to");
 
   useEffect(() => {
     let active = true;
@@ -34,7 +40,7 @@ export default function TraceList({ to }: { to: (traceId: string) => string }) {
         attr: attr.includes("=") ? attr : undefined,
         errors_only: errorsOnly || undefined,
         min_duration_ms: minDuration && !Number.isNaN(min) ? min : undefined,
-        ...rangeParams(rangeKey),
+        ...(absFrom ? { from: absFrom, to: absTo ?? undefined } : rangeParams(rangeKey)),
       })
         .then((t) => {
           if (active) {
@@ -49,7 +55,7 @@ export default function TraceList({ to }: { to: (traceId: string) => string }) {
       active = false;
       clearTimeout(handle);
     };
-  }, [service, name, attr, errorsOnly, minDuration, rangeKey, tick]);
+  }, [service, name, attr, errorsOnly, minDuration, rangeKey, tick, absFrom, absTo]);
 
   const sort = useSort(traces, "start_time");
   const { sorted } = sort;
