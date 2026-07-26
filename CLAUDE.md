@@ -63,15 +63,16 @@ digest and rolls it. ARM images are required for Raspberry Pi nodes (CI builds t
 ## Implemented
 
 Traces, logs, metrics (latest-value table **and** time-series charts), OTLP HTTP +
-gRPC, service map, retention, metric downsampling/rollups, threshold alerting
-(rules + events + email/webhook). Alert rules are **declarative**: a JSON config
-(rendered from the chart's `server.alerts` values, env `WATCHER_ALERTS_CONFIG`) is
-reconciled into the DB on startup and the `/api/alerts` surface is read-only. No
-app-layer auth — the public read surface is gated by Cloudflare Access at the edge
-and ingest stays in-cluster (ADR 0013).
+gRPC, service map, retention (global default + optional per-table
+spans/logs/metrics windows, JEF-434), metric downsampling/rollups, threshold
+alerting (rules + events + email/webhook). Alert rules are **declarative**: a JSON
+config (rendered from the chart's `server.alerts` values, env
+`WATCHER_ALERTS_CONFIG`) is reconciled into the DB on startup and the
+`/api/alerts` surface is read-only. No app-layer auth — the public read surface is
+gated by Cloudflare Access at the edge and ingest stays in-cluster (ADR 0013).
 
 ## Not yet (good first issues)
 
-Sustained-condition alerts (`for: 5m` rather than a single breach), per-service /
-per-signal retention policies, exemplar/trace links from metrics, and webhook
-delivery retries.
+Sustained-condition alerts (`for: 5m` rather than a single breach), per-service
+retention policies, exemplar/trace links from metrics, and webhook delivery
+retries.

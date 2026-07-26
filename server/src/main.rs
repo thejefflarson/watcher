@@ -98,10 +98,19 @@ async fn main() -> anyhow::Result<()> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(default)
     };
+    let env_i32_opt =
+        |k: &str| -> Option<i32> { std::env::var(k).ok().and_then(|s| s.parse().ok()) };
     let retention_days = env_i32("WATCHER_RETENTION_DAYS", 7);
     // Raw metric points are aggregated into per-series rollups on ingest, so raw
     // is kept only as a short full-resolution window for inspection.
     let metrics_raw_hours = env_i32("WATCHER_METRICS_RAW_HOURS", 6);
+    // Per-signal retention windows (JEF-434): each is optional and falls back to
+    // WATCHER_RETENTION_DAYS above when unset, so omitting these is a no-op.
+    let retention_windows = retention::Windows {
+        spans_days: env_i32_opt("WATCHER_RETENTION_SPANS_DAYS"),
+        logs_days: env_i32_opt("WATCHER_RETENTION_LOGS_DAYS"),
+        metrics_days: env_i32_opt("WATCHER_RETENTION_METRICS_DAYS"),
+    };
     // How often to evaluate alert rules, and where to POST when one fires.
     let alert_interval_secs = env_i32("WATCHER_ALERT_INTERVAL_SECS", 30).max(5) as u64;
     let alert_webhook = std::env::var("WATCHER_ALERT_WEBHOOK")
@@ -150,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
         pool.clone(),
         retention_days,
         metrics_raw_hours,
+        retention_windows,
     ));
     tokio::spawn(alerts::run(
         pool.clone(),

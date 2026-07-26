@@ -76,7 +76,10 @@ last rollup bucket, so it stays continuous after pruning.
 | `DATABASE_URL` | `postgres://watcher:watcher@localhost:5432/watcher` | Postgres |
 | `BIND_ADDR` | `0.0.0.0:4318` | HTTP listener |
 | `GRPC_BIND_ADDR` | `0.0.0.0:4317` | gRPC listener |
-| `WATCHER_RETENTION_DAYS` | `7` | prune age for spans/logs/rollups; `0` disables |
+| `WATCHER_RETENTION_DAYS` | `7` | global default prune age for spans/logs/rollups; `0` disables |
+| `WATCHER_RETENTION_SPANS_DAYS` | — | per-table override of `WATCHER_RETENTION_DAYS` for `spans`; unset falls back to the default |
+| `WATCHER_RETENTION_LOGS_DAYS` | — | per-table override of `WATCHER_RETENTION_DAYS` for `logs`; unset falls back to the default |
+| `WATCHER_RETENTION_METRICS_DAYS` | — | per-table override of `WATCHER_RETENTION_DAYS` for `metric_series_rollups`; unset falls back to the default |
 | `WATCHER_METRICS_RAW_DAYS` | `2` | prune age for raw metric points (rollups keep history); `0` = same as retention |
 | `WATCHER_ROLLUP_BUCKET_SECS` | `300` | downsample bucket width; `0` disables rollups |
 | `WATCHER_ALERT_INTERVAL_SECS` | `30` | how often alert rules are evaluated (min 5) |
