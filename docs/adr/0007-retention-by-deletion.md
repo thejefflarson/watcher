@@ -21,4 +21,9 @@ For v0, a background task prunes rows older than `WATCHER_RETENTION_DAYS`
 - Old data is gone, not summarized — you lose long-term trends. That's fine for a
   homelab default; if we want history, the follow-up is Timescale hypertables +
   continuous aggregates, which slots in under the same schema ([0001](0001-postgres-only-no-clickhouse.md)).
-- Deletes are coarse (whole-row, by age); no per-service or per-signal policy yet.
+- Deletes are coarse (whole-row, by age); no per-service policy yet. Spans, logs,
+  and metric rollups can each be given their own window via
+  `WATCHER_RETENTION_{SPANS,LOGS,METRICS}_DAYS` (JEF-434, an omitted override
+  falls back to `WATCHER_RETENTION_DAYS`) — per-service is still out of scope,
+  since a per-service delete over these tables would need `ctid`-batching like
+  the raw-metrics prune to avoid the statement-timeout failure mode.

@@ -2,16 +2,38 @@
 //! window. Raw metric points are pruned on a shorter window than everything else
 //! because `metric_series_rollups` (maintained on ingest) preserves their
 //! downsampled per-series history.
+//!
+//! Spans, logs, and metric rollups can each be given their own window (JEF-434):
+//! [`Windows`] carries an optional per-table override, declared via
+//! `WATCHER_RETENTION_SPANS_DAYS` / `WATCHER_RETENTION_LOGS_DAYS` /
+//! `WATCHER_RETENTION_METRICS_DAYS`. A table with no override falls back to the
+//! existing global `WATCHER_RETENTION_DAYS` — an all-omitted config is exactly
+//! today's single window, so this is a no-op for anyone who doesn't set the new
+//! vars. This is deliberately per-*table*, not per-service: a per-service delete
+//! over these tables would need `ctid`-batching like `prune_raw_metrics` below to
+//! avoid the statement-timeout failure mode (JEF-425); that's a separate ticket.
 
 use sqlx::PgPool;
 use std::time::Duration;
 
+/// Optional per-table retention overrides, in days. A `None` field falls back to
+/// the global default passed to [`run`] / [`prune_once`]. An explicit `Some(n)`
+/// with `n <= 0` disables pruning for just that table.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Windows {
+    pub spans_days: Option<i32>,
+    pub logs_days: Option<i32>,
+    pub metrics_days: Option<i32>,
+}
+
 /// Runs forever; ticks immediately, then hourly.
 ///
-/// * `days` — retention for spans, logs, and the per-series metric rollups.
+/// * `days` — the global default window, used by any table without its own
+///   override in `windows`.
 /// * `raw_hours` — retention for raw metric points (a short full-resolution
 ///   window; rollups carry the longer history). `<= 0` disables raw pruning.
-pub async fn run(pool: PgPool, days: i32, raw_hours: i32) {
+/// * `windows` — optional per-table overrides of `days` (see module docs).
+pub async fn run(pool: PgPool, days: i32, raw_hours: i32, windows: Windows) {
     if days <= 0 {
         tracing::info!("retention disabled (WATCHER_RETENTION_DAYS <= 0)");
         return;
@@ -19,7 +41,7 @@ pub async fn run(pool: PgPool, days: i32, raw_hours: i32) {
     let mut interval = tokio::time::interval(Duration::from_secs(3600));
     loop {
         interval.tick().await;
-        if let Err(e) = prune_once(&pool, days, raw_hours).await {
+        if let Err(e) = prune_once(&pool, days, raw_hours, windows).await {
             tracing::warn!("retention sweep failed: {e}");
         }
     }
@@ -27,19 +49,28 @@ pub async fn run(pool: PgPool, days: i32, raw_hours: i32) {
 
 /// A single retention sweep. Returns total rows deleted. Exposed for tests and
 /// one-shot use; `run` calls it hourly.
-pub async fn prune_once(pool: &PgPool, days: i32, raw_hours: i32) -> anyhow::Result<u64> {
+pub async fn prune_once(
+    pool: &PgPool,
+    days: i32,
+    raw_hours: i32,
+    windows: Windows,
+) -> anyhow::Result<u64> {
     let mut total = 0;
-    // History tables age out on the day window.
-    for (table, col) in [
-        ("spans", "start_time"),
-        ("logs", "time"),
-        ("metric_series_rollups", "bucket"),
+    // History tables age out on their own window (falling back to `days`).
+    for (table, col, override_days) in [
+        ("spans", "start_time", windows.spans_days),
+        ("logs", "time", windows.logs_days),
+        ("metric_series_rollups", "bucket", windows.metrics_days),
     ] {
+        let table_days = override_days.unwrap_or(days);
+        if table_days <= 0 {
+            continue;
+        }
         let sql = format!("DELETE FROM {table} WHERE {col} < now() - make_interval(days => $1)");
         // AssertSqlSafe: sqlx 0.9 requires dynamic SQL be audited; table/col come
         // only from the hardcoded list above, so there's no injection surface.
         let r = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(days)
+            .bind(table_days)
             .execute(pool)
             .await?;
         if r.rows_affected() > 0 {

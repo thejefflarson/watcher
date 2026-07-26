@@ -1909,15 +1909,68 @@ async fn retention_prunes_raw_metrics_before_rollups() {
     insert_rollup_at(&pool, "m", 10.0 * day).await;
     insert_rollup_at(&pool, "m", 3.0 * day).await;
 
-    let deleted = watcher_server::retention::prune_once(&pool, 7, 6)
-        .await
-        .unwrap();
+    let deleted = watcher_server::retention::prune_once(
+        &pool,
+        7,
+        6,
+        watcher_server::retention::Windows::default(),
+    )
+    .await
+    .unwrap();
     assert!(deleted >= 4);
 
     assert_eq!(count(&pool, "spans").await, 1);
     assert_eq!(count(&pool, "logs").await, 1);
     assert_eq!(count(&pool, "metrics").await, 1);
     assert_eq!(count(&pool, "metric_series_rollups").await, 1);
+}
+
+/// Per-table windows (JEF-434): spans get a short window, logs a long one, and
+/// metric rollups fall back to the global default (no override at all) — each
+/// table must prune to its own cutoff, not the global one.
+#[tokio::test]
+#[serial]
+async fn retention_prunes_each_table_to_its_own_window() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let day = 86_400.0;
+    // spans: window = 1d override, so the 2-day-old row goes, the 12h row stays.
+    insert_span_at(&pool, "svc", "old", "o", 2.0 * day).await;
+    insert_span_at(&pool, "svc", "new", "n", 0.5 * day).await;
+    // logs: window = 30d override, so both the 2-day and 20-day rows survive a
+    // sweep that would prune them under the 1d/7d windows above.
+    insert_log_at(&pool, "svc", 2.0 * day).await;
+    insert_log_at(&pool, "svc", 20.0 * day).await;
+    // rollups: no override, falls back to the global default (7d) — the 10-day
+    // row goes, the 3-day row stays.
+    insert_rollup_at(&pool, "m", 10.0 * day).await;
+    insert_rollup_at(&pool, "m", 3.0 * day).await;
+
+    let windows = watcher_server::retention::Windows {
+        spans_days: Some(1),
+        logs_days: Some(30),
+        metrics_days: None,
+    };
+    watcher_server::retention::prune_once(&pool, 7, 6, windows)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        count(&pool, "spans").await,
+        1,
+        "1d window: only the recent span survives"
+    );
+    assert_eq!(
+        count(&pool, "logs").await,
+        2,
+        "30d window: both logs survive"
+    );
+    assert_eq!(
+        count(&pool, "metric_series_rollups").await,
+        1,
+        "falls back to the 7d global default"
+    );
 }
 
 /// A backlog larger than one batch must fully drain. `batch = 1` forces the loop
