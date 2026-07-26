@@ -338,6 +338,12 @@ tr.clickable:hover td {
   font-size: 0.85rem;
 }
 
+/* Error spans carry the red into the label too, not just the bar — legible
+   at a glance without hunting across the row (JEF-432). */
+.bar-label.err {
+  color: var(--error);
+}
+
 .bar-track {
   position: relative;
   flex: 1;
@@ -356,8 +362,43 @@ tr.clickable:hover td {
   background: var(--error);
 }
 
+/* Critical path: one ink step heavier, never a new hue (ADR 0009) — an error
+   bar stays red even when it's also on the path. */
+.bar.crit {
+  top: 0.4rem;
+  height: 0.6rem;
+}
+.bar.crit:not(.err) {
+  background: #222;
+}
+
 .bar-row.selected {
   background: var(--hover);
+}
+
+/* In-trace filter: non-matches (and non-ancestors of a match) fade back;
+   ink weight down, not a color change. */
+.bar-row.dim {
+  opacity: 0.45;
+}
+
+/* Deep traces (>40 rows) scroll their own region so the minimap's viewport
+   rect means something. */
+.bars.scrollable {
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.minimap {
+  display: block;
+  width: 100%;
+  margin-bottom: 0.6rem;
+  cursor: pointer;
+}
+
+.minimap-viewport {
+  fill: rgba(17, 17, 17, 0.08);
+  stroke: var(--rule);
 }
 
 /* Span detail panel under the waterfall. */
