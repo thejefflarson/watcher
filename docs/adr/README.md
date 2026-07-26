@@ -19,7 +19,7 @@ Copy [`0000-template.md`](0000-template.md) to start one.
 | [0008](0008-optional-bearer-auth.md) | Optional bearer-token auth, open by default | Superseded by 0013 |
 | [0009](0009-minimal-tufte-ui.md) | Minimal, high-data-ink UI | Accepted |
 | [0010](0010-ui-embedded-in-server-binary.md) | Embed the UI in the server binary (drop nginx) | Accepted |
-| [0011](0011-metric-rollups.md) | Downsample metrics into rollup buckets | Accepted |
+| [0011](0011-metric-rollups.md) | Downsample metrics into rollup buckets | Partially superseded by 0020 |
 | [0012](0012-alerting.md) | Threshold alerting with stored events and optional webhook | Accepted |
 | [0013](0013-auth-at-the-edge.md) | Authenticate at the edge (Cloudflare Access), not in the app | Accepted |
 | [0014](0014-self-monitoring-in-process-metrics.md) | Self-monitoring: emit ops metrics in-process, deep `/healthz` gates readiness | Accepted |
@@ -28,3 +28,4 @@ Copy [`0000-template.md`](0000-template.md) to start one.
 | [0017](0017-self-trace-instrumentation-in-process.md) | Self-instrument watcher's own traces in-process | Accepted |
 | [0018](0018-read-only-mcp-server-in-process.md) | Expose the read API as a read-only MCP server, in-process on `/mcp` | Accepted |
 | [0019](0019-mcp-auth-cloudflare-access-oidc.md) | Authenticate `/mcp` via Cloudflare Access Managed OAuth (validate `Cf-Access-Jwt-Assertion`) | Accepted |
+| [0020](0020-on-ingest-per-series-metric-rollups.md) | On-ingest per-series metric rollups (refines 0011) | Accepted |

@@ -3,6 +3,15 @@
 - Status: Accepted
 - Date: 2026-05-30
 - Refines: [0007](0007-retention-by-deletion.md)
+- Refined by: [0020](0020-on-ingest-per-series-metric-rollups.md)
+
+> **Partially superseded.** The downsample-into-buckets decision still stands, but
+> the mechanism below is stale: there is no `rollup.rs` background sweep, no
+> collapsed `metric_rollups` table (dropped in migration 0010), and no
+> `WATCHER_METRICS_RAW_DAYS`. Rollups are now written per-series, on ingest, into
+> `metric_series_rollups`, and raw-point retention is an hours window
+> (`WATCHER_METRICS_RAW_HOURS`). See
+> [0020](0020-on-ingest-per-series-metric-rollups.md).
 
 ## Context
 
