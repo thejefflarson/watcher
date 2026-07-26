@@ -6,7 +6,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::Instrument;
@@ -374,11 +374,37 @@ fn rollup_bucket_secs() -> f64 {
         .unwrap_or(300.0)
 }
 
+/// Resolve a metric endpoint's window to concrete bounds, shared by every
+/// series/facet/histogram/exemplar query below (JEF-433). An absolute `from`/`to`
+/// takes precedence; either end may be omitted, in which case it falls back to
+/// the `hours`-relative bound anchored on the *other* end (so `to` alone still
+/// yields an `hours`-wide window ending at `to`, not at the real "now"). With
+/// neither given, it's `hours` back from now — the original behavior.
+fn resolve_window(
+    hours: Option<i32>,
+    default_hours: i32,
+    max_hours: i32,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+) -> (DateTime<Utc>, DateTime<Utc>) {
+    let hi = to.unwrap_or_else(Utc::now);
+    let lo = from.unwrap_or_else(|| {
+        hi - Duration::hours(hours.unwrap_or(default_hours).clamp(1, max_hours) as i64)
+    });
+    (lo, hi)
+}
+
 #[derive(Deserialize)]
 pub struct SeriesQuery {
     pub name: String,
     pub service: Option<String>,
     pub hours: Option<i32>,
+    /// Absolute window (RFC3339), taking precedence over `hours` when given —
+    /// lets "metrics around this trace" render the trace's exact moment instead
+    /// of an hours-back-from-now window (JEF-433). Either end may be omitted;
+    /// an omitted end falls back to the `hours`-relative bound.
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -399,23 +425,25 @@ pub async fn metric_series(
 }
 
 /// One metric's collapsed time series, shared by the HTTP handler and the MCP
-/// `metric_series` tool. Applies the same hours clamp.
+/// `metric_series` tool. Applies the same hours clamp, and honors an absolute
+/// `from`/`to` window when given (see `SeriesQuery`).
 pub async fn query_metric_series(
     pool: &PgPool,
     q: SeriesQuery,
 ) -> Result<Vec<SeriesPoint>, sqlx::Error> {
-    let hours = q.hours.unwrap_or(24).clamp(1, 24 * 90);
+    let (lo, hi) = resolve_window(q.hours, 24, 24 * 90, q.from, q.to);
     sqlx::query_as::<_, SeriesPoint>(
         "SELECT bucket AS t, sum(sum) / nullif(sum(count), 0) AS v
          FROM metric_series_rollups
          WHERE name = $1 AND ($2::text IS NULL OR service = $2)
-           AND bucket >= now() - make_interval(hours => $3)
+           AND bucket >= $3 AND bucket <= $4
          GROUP BY bucket
          ORDER BY t ASC",
     )
     .bind(q.name)
     .bind(q.service)
-    .bind(hours)
+    .bind(lo)
+    .bind(hi)
     .fetch_all(pool)
     .instrument(tracing::info_span!("db.query"))
     .await
@@ -490,12 +518,74 @@ pub async fn metric_series_grouped(
     Ok(Json(rows))
 }
 
+// --- Exemplars (metric -> trace correlation, JEF-433) -----------------------
+
+#[derive(Deserialize)]
+pub struct ExemplarQuery {
+    name: String,
+    service: Option<String>,
+    hours: Option<i32>,
+    /// Absolute window, taking precedence over `hours`; see `SeriesQuery::from`.
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct ExemplarPoint {
+    t: DateTime<Utc>,
+    v: Option<f64>,
+    trace_id: String,
+    span_id: Option<String>,
+}
+
+/// Cap on returned exemplars — a safety ceiling only (a busy metric with an
+/// exemplar on every point shouldn't hand the chart thousands of dots).
+const EXEMPLAR_MAX_POINTS: i64 = 200;
+
+/// GET /api/metrics/exemplars — raw points for `name` that carry a sampled trace
+/// exemplar, so a chart can plot a marker at that point linking straight to the
+/// trace behind it. Reads the raw `metrics` table directly (unlike series/facet/
+/// histogram, which read `metric_series_rollups`): exemplars are per-point and
+/// rollups aggregate them away, so this only ever sees the raw-retention window
+/// (`WATCHER_METRICS_RAW_DAYS`, a few hours by default) — correlational ("a trace
+/// recorded in this window"), never causal, and it's a recent-debugging
+/// affordance rather than history (see ADR 0011).
+#[tracing::instrument(skip_all)]
+pub async fn metric_exemplars(
+    State(pool): State<PgPool>,
+    Query(q): Query<ExemplarQuery>,
+) -> Result<Json<Vec<ExemplarPoint>>, ApiError> {
+    let (lo, hi) = resolve_window(q.hours, 6, 24 * 7, q.from, q.to);
+    let rows: Vec<ExemplarPoint> = sqlx::query_as(
+        "SELECT time AS t, value AS v, exemplar_trace_id AS trace_id, exemplar_span_id AS span_id
+         FROM metrics
+         WHERE name = $1 AND exemplar_trace_id IS NOT NULL
+           AND ($2::text IS NULL OR service = $2)
+           AND time >= $3 AND time <= $4
+         ORDER BY time ASC
+         LIMIT $5",
+    )
+    .bind(&q.name)
+    .bind(&q.service)
+    .bind(lo)
+    .bind(hi)
+    .bind(EXEMPLAR_MAX_POINTS)
+    .fetch_all(&pool)
+    .instrument(tracing::info_span!("db.query"))
+    .await
+    .map_err(internal)?;
+    Ok(Json(rows))
+}
+
 // --- Faceted series (one line per full attribute set) ----------------------
 
 #[derive(Deserialize)]
 pub struct FacetQuery {
     name: String,
     hours: Option<i32>,
+    /// Absolute window, taking precedence over `hours`; see `SeriesQuery::from`.
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
 }
 
 #[derive(Serialize)]
@@ -539,7 +629,7 @@ pub async fn metric_facet(
     State(pool): State<PgPool>,
     Query(q): Query<FacetQuery>,
 ) -> Result<Json<FacetResponse>, ApiError> {
-    let hours = q.hours.unwrap_or(6).clamp(1, 24 * 7);
+    let (lo, hi) = resolve_window(q.hours, 6, 24 * 7, q.from, q.to);
 
     // kind / monotonicity / unit are constant per metric name; read the most
     // recent from raw or rollup (raw may be pruned past metrics_raw_days).
@@ -583,11 +673,12 @@ pub async fn metric_facet(
     let rows: Vec<FacetRow> = sqlx::query_as(
         "SELECT attrs, bucket AS t, avg, max AS last
          FROM metric_series_rollups
-         WHERE name = $1 AND bucket >= now() - make_interval(hours => $2)
+         WHERE name = $1 AND bucket >= $2 AND bucket <= $3
          ORDER BY t ASC",
     )
     .bind(&q.name)
-    .bind(hours)
+    .bind(lo)
+    .bind(hi)
     .fetch_all(&pool)
     .instrument(tracing::info_span!("db.query"))
     .await
@@ -659,6 +750,10 @@ pub async fn metric_facet(
 pub struct HistQuery {
     name: String,
     hours: Option<i32>,
+    /// Absolute window, taking precedence over `hours`; see `SeriesQuery::from`.
+    /// Shared by both `metric_histogram` and `metric_hist_facet` below.
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
 }
 
 #[derive(Serialize)]
@@ -696,7 +791,7 @@ pub async fn metric_histogram(
     State(pool): State<PgPool>,
     Query(q): Query<HistQuery>,
 ) -> Result<Json<HistResponse>, ApiError> {
-    let hours = q.hours.unwrap_or(6).clamp(1, 24 * 7);
+    let (lo, hi) = resolve_window(q.hours, 6, 24 * 7, q.from, q.to);
 
     // Per-series rollup counts (already summed within series+bucket) straight
     // from the rollup; the Rust pass below sums across series per time bucket.
@@ -704,11 +799,12 @@ pub async fn metric_histogram(
         "SELECT bucket AS t, bucket_bounds AS bounds, bucket_counts AS counts, unit
          FROM metric_series_rollups
          WHERE name = $1 AND kind = 'histogram' AND bucket_counts IS NOT NULL
-           AND bucket >= now() - make_interval(hours => $2)
+           AND bucket >= $2 AND bucket <= $3
          ORDER BY t ASC",
     )
     .bind(&q.name)
-    .bind(hours)
+    .bind(lo)
+    .bind(hi)
     .fetch_all(&pool)
     .instrument(tracing::info_span!("db.query"))
     .await
@@ -833,17 +929,18 @@ pub async fn metric_hist_facet(
     State(pool): State<PgPool>,
     Query(q): Query<HistQuery>,
 ) -> Result<Json<HistFacetResponse>, ApiError> {
-    let hours = q.hours.unwrap_or(6).clamp(1, 24 * 7);
+    let (lo, hi) = resolve_window(q.hours, 6, 24 * 7, q.from, q.to);
 
     let rows: Vec<HistFacetRow> = sqlx::query_as(
         "SELECT attrs, bucket AS t, bucket_bounds AS bounds, bucket_counts AS counts, unit
          FROM metric_series_rollups
          WHERE name = $1 AND kind = 'histogram' AND bucket_counts IS NOT NULL
-           AND bucket >= now() - make_interval(hours => $2)
+           AND bucket >= $2 AND bucket <= $3
          ORDER BY t ASC",
     )
     .bind(&q.name)
-    .bind(hours)
+    .bind(lo)
+    .bind(hi)
     .fetch_all(&pool)
     .instrument(tracing::info_span!("db.query"))
     .await
