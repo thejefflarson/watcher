@@ -733,6 +733,50 @@ async fn metric_series_honors_absolute_from_to_window() {
     assert_eq!(buckets[0]["counts"], serde_json::json!([0, 5, 0]));
 }
 
+/// The series endpoint's window can be up to 90 days wide (`resolve_window`'s
+/// `max_hours` for `/api/metrics/series`, JEF-548) — this is the query whose
+/// wide-window rollup scan was traced holding a pool connection for tens of
+/// seconds (the fix: a covering index on `metric_series_rollups`, migration
+/// 0017). This doesn't benchmark the index directly (no way to force a plan
+/// choice through the HTTP API), but it does pin the behavior the index must
+/// not change: a request at the 90-day ceiling returns exactly the points
+/// inside that window — none dropped, none leaked in from just outside it —
+/// so a future change to the index or the query can't silently narrow or
+/// widen what's returned.
+#[tokio::test]
+#[serial]
+async fn metric_series_wide_window_returns_bounded_correct_points() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let day = 86_400.0;
+    insert_rollup_at(&pool, "wide.metric", 89.0 * day).await;
+    insert_rollup_at(&pool, "wide.metric", 45.0 * day).await;
+    insert_rollup_at(&pool, "wide.metric", 10.0 * day).await;
+    // Just past the 90-day ceiling: must be excluded, not silently included.
+    insert_rollup_at(&pool, "wide.metric", 91.0 * day).await;
+
+    let router = app(pool);
+    let (status, series) =
+        get_json(&router, "/api/metrics/series?name=wide.metric&hours=2160").await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = series.as_array().expect("array");
+    assert_eq!(
+        arr.len(),
+        3,
+        "the 91-day-old point is outside the 90-day window, series = {arr:?}"
+    );
+    for point in arr {
+        assert_eq!(point["v"], 1.0);
+    }
+    // Ascending by time — oldest (89d) first, newest (10d) last.
+    let times: Vec<&str> = arr.iter().map(|p| p["t"].as_str().unwrap()).collect();
+    let mut sorted = times.clone();
+    sorted.sort();
+    assert_eq!(times, sorted, "points must be ordered t ASC");
+}
+
 #[tokio::test]
 #[serial]
 async fn metric_exemplar_persists_trace_id_and_surfaces_in_exemplars_endpoint() {

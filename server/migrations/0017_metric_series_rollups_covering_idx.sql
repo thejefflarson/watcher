@@ -1,0 +1,41 @@
+-- no-transaction
+-- Covering index for the wide-window metric read path (JEF-548). The
+-- series/facet/histogram/hist_facet queries in api.rs (query_metric_series,
+-- metric_facet, metric_histogram, metric_hist_facet) all filter
+-- `metric_series_rollups` on `name = $1 AND bucket BETWEEN $lo AND $hi` — a
+-- window that can be up to 90 days wide (`resolve_window`'s `max_hours`). The
+-- old `metric_series_rollups_name_bucket_idx (name, bucket DESC)` (dropped in
+-- 0018, see that file) let Postgres find the matching rows via the index, but
+-- still had to fetch each matching row's heap tuple for the columns the
+-- SELECT actually needs (service, kind, unit, is_monotonic, attrs, count,
+-- sum, avg, max, bucket_bounds, bucket_counts — between them, every column
+-- these four queries select). For a high-cardinality metric over a wide
+-- window that's up to hundreds of thousands of heap fetches; confirmed
+-- locally with `EXPLAIN (ANALYZE, BUFFERS)` against ~2.6M synthetic rows (one
+-- metric, 100 series, 5-minute buckets over 90 days): the old index produced
+-- a Bitmap Heap Scan with `Heap Blocks: exact=57603` (57,603 random heap-page
+-- reads); with this covering index the same query plans as an
+-- `Index Only Scan` with `Heap Fetches: 0`. On the fast, warm-cache disk in
+-- that environment the wall-clock difference was modest, but each of those
+-- 57,603 heap reads is a random I/O — on the slow disk this runs against in
+-- production (a Raspberry Pi / network-attached Postgres volume), that's the
+-- ~20-70s idle-bound `db.query` spans this ticket traced.
+--
+-- INCLUDEing every column the four hot read queries select turns their
+-- lookups into index-only scans (subject to the visibility map being current,
+-- which autovacuum keeps true for this table). `min` is left out: no read
+-- query selects it.
+--
+-- CREATE INDEX CONCURRENTLY avoids taking a write lock against ingest's
+-- rollup upserts while the (large) index builds. It can't run inside a
+-- transaction, which is why this file starts with `-- no-transaction` (sqlx
+-- 0.9 opts a migration out of its normal per-migration transaction wrapper
+-- when the file's first line is exactly that) — and why this is its own
+-- migration file rather than sharing one with 0018's DROP INDEX: a
+-- multi-statement migration is still sent to Postgres as a single simple-query
+-- message, which Postgres implicitly wraps in one transaction across all its
+-- statements regardless of sqlx's own transaction handling, and CONCURRENTLY
+-- can't run in that either.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS metric_series_rollups_name_bucket_covering_idx
+    ON metric_series_rollups (name, bucket)
+    INCLUDE (service, kind, unit, is_monotonic, count, sum, avg, max, attrs, bucket_bounds, bucket_counts);
