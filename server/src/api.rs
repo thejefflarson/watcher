@@ -413,6 +413,45 @@ fn rollup_bucket_secs() -> f64 {
         .unwrap_or(300.0)
 }
 
+/// Point count a chart plausibly renders usefully; wide-window rollup reads
+/// coarsen their output bucket to stay near this bound (JEF-561) rather than
+/// returning one point per raw rollup bucket regardless of window width — a
+/// 90-day series at the base 5-min bucket is ~26k points.
+const TARGET_POINTS: f64 = 1000.0;
+
+/// Adaptive output-bucket width (seconds) for a rollup-backed series/facet/
+/// histogram read: the width, in whole multiples of the base rollup bucket
+/// (`base`, from [`rollup_bucket_secs`]), that keeps `span_secs / width` under
+/// [`TARGET_POINTS`]. A narrow window collapses to exactly `base` — unchanged,
+/// full rollup resolution — and only widens once the window would otherwise
+/// return more points than a chart can use. Because it's always a whole
+/// multiple of `base`, every output bucket covers a fixed number of complete
+/// rollup rows, so re-aggregating with `sum(sum) / nullif(sum(count), 0)` (a
+/// count-weighted average) or `array_sum(bucket_counts)` stays exact — the same
+/// fold ingest already uses to combine raw points into a rollup row, just
+/// applied one level up.
+fn output_bucket_secs(span_secs: f64, base: f64) -> f64 {
+    if base <= 0.0 || span_secs <= 0.0 {
+        return base;
+    }
+    let factor = (span_secs / base / TARGET_POINTS).ceil().max(1.0);
+    base * factor
+}
+
+/// `resolve_window` plus the adaptive output-bucket width for the resolved
+/// span (JEF-561) — shared by every series/facet/histogram rollup read below.
+fn resolve_window_and_width(
+    hours: Option<i32>,
+    default_hours: i32,
+    max_hours: i32,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+) -> (DateTime<Utc>, DateTime<Utc>, f64) {
+    let (lo, hi) = resolve_window(hours, default_hours, max_hours, from, to);
+    let width = output_bucket_secs((hi - lo).num_seconds() as f64, rollup_bucket_secs());
+    (lo, hi, width)
+}
+
 /// Resolve a metric endpoint's window to concrete bounds, shared by every
 /// series/facet/histogram/exemplar query below (JEF-433). An absolute `from`/`to`
 /// takes precedence; either end may be omitted, in which case it falls back to
@@ -476,24 +515,28 @@ pub async fn metric_series(
 
 /// One metric's collapsed time series, shared by the HTTP handler and the MCP
 /// `metric_series` tool. Applies the same hours clamp, and honors an absolute
-/// `from`/`to` window when given (see `SeriesQuery`).
+/// `from`/`to` window when given (see `SeriesQuery`). The 90-day ceiling here is
+/// deliberate (JEF-561): the covering index (JEF-548) makes the read itself
+/// cheap, and the adaptive output bucket below keeps the *result* bounded
+/// regardless of window width, so there's no remaining cost to widening it.
 pub async fn query_metric_series(
     pool: &PgPool,
     q: SeriesQuery,
 ) -> Result<Vec<SeriesPoint>, sqlx::Error> {
-    let (lo, hi) = resolve_window(q.hours, 24, 24 * 90, q.from, q.to);
+    let (lo, hi, width) = resolve_window_and_width(q.hours, 24, 24 * 90, q.from, q.to);
     sqlx::query_as::<_, SeriesPoint>(
-        "SELECT bucket AS t, sum(sum) / nullif(sum(count), 0) AS v
+        "SELECT metric_bucket(bucket, $5) AS t, sum(sum) / nullif(sum(count), 0) AS v
          FROM metric_series_rollups
          WHERE name = $1 AND ($2::text IS NULL OR service = $2)
            AND bucket >= $3 AND bucket <= $4
-         GROUP BY bucket
+         GROUP BY t
          ORDER BY t ASC",
     )
     .bind(q.name)
     .bind(q.service)
     .bind(lo)
     .bind(hi)
+    .bind(width)
     .fetch_all(pool)
     .instrument(tracing::info_span!("db.query"))
     .await
@@ -679,7 +722,7 @@ pub async fn metric_facet(
     State(pool): State<PgPool>,
     Query(q): Query<FacetQuery>,
 ) -> Result<Json<FacetResponse>, ApiError> {
-    let (lo, hi) = resolve_window(q.hours, 6, 24 * 7, q.from, q.to);
+    let (lo, hi, width) = resolve_window_and_width(q.hours, 6, 24 * 7, q.from, q.to);
 
     // kind / monotonicity / unit are constant per metric name; read the most
     // recent from raw or rollup (raw may be pruned past metrics_raw_days).
@@ -718,17 +761,24 @@ pub async fn metric_facet(
 
     // Per-series points straight from the downsampled rollup — index-fast, no
     // raw scan. Rollups are maintained on ingest, so the current (still-filling)
-    // bucket is present, just partial. avg = bucket mean (gauges); max =
-    // cumulative level (counters, for rate differencing).
+    // bucket is present, just partial. avg = bucket mean (gauges), re-aggregated
+    // as a count-weighted average across the adaptive output bucket (JEF-561, same
+    // fold as `query_metric_series`); last = cumulative level (counters, for rate
+    // differencing) — monotonic non-decreasing outside a reset, so the max seen
+    // within the output bucket is its most recent value.
     let rows: Vec<FacetRow> = sqlx::query_as(
-        "SELECT attrs, bucket AS t, avg, max AS last
+        "SELECT attrs, metric_bucket(bucket, $4) AS t,
+                sum(sum) / nullif(sum(count), 0) AS avg,
+                max(max) AS last
          FROM metric_series_rollups
          WHERE name = $1 AND bucket >= $2 AND bucket <= $3
+         GROUP BY attrs, t
          ORDER BY t ASC",
     )
     .bind(&q.name)
     .bind(lo)
     .bind(hi)
+    .bind(width)
     .fetch_all(&pool)
     .instrument(tracing::info_span!("db.query"))
     .await
@@ -841,20 +891,25 @@ pub async fn metric_histogram(
     State(pool): State<PgPool>,
     Query(q): Query<HistQuery>,
 ) -> Result<Json<HistResponse>, ApiError> {
-    let (lo, hi) = resolve_window(q.hours, 6, 24 * 7, q.from, q.to);
+    let (lo, hi, width) = resolve_window_and_width(q.hours, 6, 24 * 7, q.from, q.to);
 
-    // Per-series rollup counts (already summed within series+bucket) straight
-    // from the rollup; the Rust pass below sums across series per time bucket.
+    // Per-series rollup counts, first re-aggregated per series into the adaptive
+    // output bucket (JEF-561: `array_sum`/`min(bounds)`, the same fold ingest
+    // uses to combine raw points into a rollup row — see `insert_histograms`),
+    // then the Rust pass below sums across series per time bucket.
     let rows: Vec<HistRow> = sqlx::query_as(
-        "SELECT bucket AS t, bucket_bounds AS bounds, bucket_counts AS counts, unit
+        "SELECT metric_bucket(bucket, $4) AS t, min(bucket_bounds) AS bounds,
+                array_sum(bucket_counts) AS counts, min(unit) AS unit
          FROM metric_series_rollups
          WHERE name = $1 AND kind = 'histogram' AND bucket_counts IS NOT NULL
            AND bucket >= $2 AND bucket <= $3
+         GROUP BY series_key, t
          ORDER BY t ASC",
     )
     .bind(&q.name)
     .bind(lo)
     .bind(hi)
+    .bind(width)
     .fetch_all(&pool)
     .instrument(tracing::info_span!("db.query"))
     .await
@@ -979,18 +1034,23 @@ pub async fn metric_hist_facet(
     State(pool): State<PgPool>,
     Query(q): Query<HistQuery>,
 ) -> Result<Json<HistFacetResponse>, ApiError> {
-    let (lo, hi) = resolve_window(q.hours, 6, 24 * 7, q.from, q.to);
+    let (lo, hi, width) = resolve_window_and_width(q.hours, 6, 24 * 7, q.from, q.to);
 
+    // Re-aggregated per series into the adaptive output bucket (JEF-561), same
+    // fold as `metric_histogram` above.
     let rows: Vec<HistFacetRow> = sqlx::query_as(
-        "SELECT attrs, bucket AS t, bucket_bounds AS bounds, bucket_counts AS counts, unit
+        "SELECT attrs, metric_bucket(bucket, $4) AS t, min(bucket_bounds) AS bounds,
+                array_sum(bucket_counts) AS counts, min(unit) AS unit
          FROM metric_series_rollups
          WHERE name = $1 AND kind = 'histogram' AND bucket_counts IS NOT NULL
            AND bucket >= $2 AND bucket <= $3
+         GROUP BY attrs, t
          ORDER BY t ASC",
     )
     .bind(&q.name)
     .bind(lo)
     .bind(hi)
+    .bind(width)
     .fetch_all(&pool)
     .instrument(tracing::info_span!("db.query"))
     .await
@@ -1404,5 +1464,55 @@ mod tests {
     #[test]
     fn parse_max_lookback_hours_leaves_in_range_value_unchanged() {
         assert_eq!(parse_max_lookback_hours(Some("48")), 48);
+    }
+
+    // JEF-561: a narrow window (well under TARGET_POINTS * base) must collapse
+    // to exactly `base` — unwidened, full rollup resolution — so a short-range
+    // chart's points are unaffected.
+    #[test]
+    fn output_bucket_secs_narrow_window_collapses_to_base() {
+        assert_eq!(output_bucket_secs(3_600.0, 300.0), 300.0, "1h span");
+        assert_eq!(
+            output_bucket_secs(300.0 * TARGET_POINTS, 300.0),
+            300.0,
+            "exactly at the TARGET_POINTS boundary must still be the base width"
+        );
+    }
+
+    // A 90-day window at the base 300s bucket is ~25,920 raw points; the width
+    // must scale up so the output stays under TARGET_POINTS, in a whole
+    // multiple of the base bucket (so re-aggregation folds complete rollup rows).
+    #[test]
+    fn output_bucket_secs_wide_window_scales_up_in_whole_base_multiples() {
+        let span = 90.0 * 24.0 * 3600.0;
+        let w = output_bucket_secs(span, 300.0);
+        assert_eq!(w, 7_800.0, "300 * ceil(25920 / 1000) = 300 * 26");
+        assert_eq!(
+            w % 300.0,
+            0.0,
+            "must be a whole multiple of the base bucket"
+        );
+        assert!(
+            span / w <= TARGET_POINTS,
+            "resulting point count {} must stay under TARGET_POINTS",
+            span / w
+        );
+    }
+
+    // Just one point over the TARGET_POINTS boundary must still widen (ceil,
+    // not floor/round) — otherwise a window one point over the target would
+    // silently return more than TARGET_POINTS points.
+    #[test]
+    fn output_bucket_secs_rounds_up_past_the_boundary() {
+        let span = 300.0 * (TARGET_POINTS + 1.0);
+        assert_eq!(output_bucket_secs(span, 300.0), 600.0);
+    }
+
+    // Degenerate inputs must not divide by zero or return a non-finite width.
+    #[test]
+    fn output_bucket_secs_handles_degenerate_inputs() {
+        assert_eq!(output_bucket_secs(0.0, 300.0), 300.0);
+        assert_eq!(output_bucket_secs(-100.0, 300.0), 300.0);
+        assert_eq!(output_bucket_secs(3_600.0, 0.0), 0.0);
     }
 }

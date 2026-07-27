@@ -784,6 +784,89 @@ async fn metric_series_wide_window_returns_bounded_correct_points() {
     assert_eq!(times, sorted, "points must be ordered t ASC");
 }
 
+/// JEF-561: at the 90-day ceiling the adaptive output bucket widens from the
+/// base 300s rollup bucket to `300 * ceil((2160h in secs / 300) / 1000) = 7800s`
+/// (see `output_bucket_secs`'s unit tests for that math) — a chart gets ~1000
+/// points instead of ~26k. This pins that the widening re-aggregates rollup
+/// rows *correctly*: two rows placed well inside the same 7800s output bucket
+/// must collapse into one point whose value is the count-weighted average of
+/// both (not a plain average), while a row a full bucket-width away stays its
+/// own point, unmerged.
+#[tokio::test]
+#[serial]
+async fn metric_series_wide_window_reaggregates_merged_buckets_correctly() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    const WIDTH: f64 = 7800.0;
+    let now_epoch = chrono::Utc::now().timestamp() as f64;
+    // A bucket safely inside the 90-day window (well clear of "now" and of the
+    // 91-day exclusion edge exercised by the sibling test above).
+    let bucket_start = ((now_epoch - 5.0 * 86_400.0) / WIDTH).floor() * WIDTH;
+    let secs_ago_at = |frac: f64| now_epoch - (bucket_start + WIDTH * frac);
+
+    // Two rows well inside the same output bucket (30%/60% across it — a wide
+    // margin around any clock skew between this timestamp and the request's
+    // own `Utc::now()`): count=3/sum=15 (avg 5) and count=1/sum=2 (avg 2).
+    insert_rollup_with(&pool, "wide.reagg", secs_ago_at(0.3), 3, 15.0).await;
+    insert_rollup_with(&pool, "wide.reagg", secs_ago_at(0.6), 1, 2.0).await;
+    // A row half a bucket-width before `bucket_start` falls in the *previous*
+    // output bucket — must not merge with the pair above.
+    insert_rollup_with(
+        &pool,
+        "wide.reagg",
+        now_epoch - (bucket_start - WIDTH * 0.5),
+        10,
+        100.0,
+    )
+    .await;
+
+    let router = app(pool);
+    let (status, series) =
+        get_json(&router, "/api/metrics/series?name=wide.reagg&hours=2160").await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = series.as_array().expect("array");
+    assert_eq!(
+        arr.len(),
+        2,
+        "the two same-bucket rows must collapse into one point, series = {arr:?}"
+    );
+    // Ascending by time: the older, unmerged row (avg 10) first, then the
+    // merged pair — (15 + 2) / (3 + 1) = 4.25, not (5 + 2) / 2 = 3.5.
+    assert_eq!(arr[0]["v"], 10.0);
+    assert_eq!(arr[1]["v"], 4.25);
+}
+
+/// JEF-561: a narrow window (well under `TARGET_POINTS * base`) must keep the
+/// base 5-min rollup resolution unchanged — two points a couple of buckets
+/// apart must stay distinct, not fold into a coarser bucket.
+#[tokio::test]
+#[serial]
+async fn metric_series_narrow_window_keeps_five_minute_buckets() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    // 600s apart (2 base buckets) — an exact multiple of the base width, so the
+    // bucket-index gap is exactly 2 regardless of where "now" falls in the grid.
+    insert_rollup_with(&pool, "narrow.metric", 900.0, 3, 15.0).await; // avg 5
+    insert_rollup_with(&pool, "narrow.metric", 300.0, 1, 2.0).await; // avg 2
+
+    let router = app(pool);
+    let (status, series) =
+        get_json(&router, "/api/metrics/series?name=narrow.metric&hours=1").await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = series.as_array().expect("array");
+    assert_eq!(
+        arr.len(),
+        2,
+        "narrow window must keep each 5-min bucket distinct, series = {arr:?}"
+    );
+    assert_eq!(arr[0]["v"], 5.0);
+    assert_eq!(arr[1]["v"], 2.0);
+}
+
 #[tokio::test]
 #[serial]
 async fn metric_exemplar_persists_trace_id_and_surfaces_in_exemplars_endpoint() {
@@ -1293,6 +1376,52 @@ async fn insert_rollup_at(pool: &sqlx::PgPool, name: &str, secs_ago: f64) {
     .unwrap();
 }
 
+/// Like `insert_rollup_at`, but with an explicit `count`/`sum` so a test can
+/// pin the exact count-weighted average a re-aggregated (JEF-561) output
+/// bucket must produce.
+async fn insert_rollup_with(pool: &sqlx::PgPool, name: &str, secs_ago: f64, count: i64, sum: f64) {
+    sqlx::query(
+        "INSERT INTO metric_series_rollups
+             (bucket, name, series_key, attrs, kind, count, sum, min, max, avg)
+         VALUES (now() - make_interval(secs => $1), $2, md5($2), '{}', 'gauge',
+                 $3, $4, $4, $4, $4 / $3::float8)",
+    )
+    .bind(secs_ago)
+    .bind(name)
+    .bind(count)
+    .bind(sum)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A raw histogram rollup row (same `series_key` for every call with the same
+/// `name`, so multiple rows are one series) — lets a test pin exact
+/// `bucket_counts` a re-aggregated (JEF-561) output bucket's `array_sum` must
+/// produce.
+async fn insert_hist_rollup_with(
+    pool: &sqlx::PgPool,
+    name: &str,
+    secs_ago: f64,
+    bounds: &[f64],
+    counts: &[i64],
+) {
+    sqlx::query(
+        "INSERT INTO metric_series_rollups
+             (bucket, name, series_key, attrs, kind, count, sum, bucket_bounds, bucket_counts)
+         VALUES (now() - make_interval(secs => $1), $2, md5($2), '{}', 'histogram',
+                 $3, $3::float8, $4, $5)",
+    )
+    .bind(secs_ago)
+    .bind(name)
+    .bind(counts.iter().sum::<i64>())
+    .bind(bounds)
+    .bind(counts)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 async fn count(pool: &sqlx::PgPool, table: &str) -> i64 {
     sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
         .fetch_one(pool)
@@ -1676,6 +1805,41 @@ async fn metric_histogram_interpolates_percentiles() {
     assert!((p50 - 15.0).abs() < 0.001, "p50 was {p50}");
     assert!((p95 - 19.5).abs() < 0.001, "p95 was {p95}");
     assert_eq!(b["counts"], serde_json::json!([0, 100, 0, 0]));
+}
+
+/// JEF-561: `metric_histogram` now pre-aggregates each series into the
+/// adaptive output bucket in SQL (`array_sum(bucket_counts)`, the same fold
+/// `insert_histograms` uses on ingest) before the Rust pass sums across
+/// series. `hours=100` puts the span at 360,000s, so the adaptive width there
+/// is `300 * ceil((360_000 / 300) / 1000) = 600s` — two base rollup rows one
+/// base bucket (300s) apart land in the same 600s output bucket and must sum
+/// element-wise into one heatmap row, not two.
+#[tokio::test]
+#[serial]
+async fn metric_histogram_wide_window_reaggregates_counts_correctly() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    const WIDTH: f64 = 600.0;
+    let now_epoch = chrono::Utc::now().timestamp() as f64;
+    let bucket_start = ((now_epoch - 2.0 * 86_400.0) / WIDTH).floor() * WIDTH;
+    let secs_ago_at = |frac: f64| now_epoch - (bucket_start + WIDTH * frac);
+
+    let bounds = vec![10.0, 20.0];
+    insert_hist_rollup_with(&pool, "wide.hist", secs_ago_at(0.2), &bounds, &[1, 2, 0]).await;
+    insert_hist_rollup_with(&pool, "wide.hist", secs_ago_at(0.7), &bounds, &[0, 3, 1]).await;
+
+    let router = app(pool);
+    let (status, h) = get_json(&router, "/api/metrics/histogram?name=wide.hist&hours=100").await;
+    assert_eq!(status, StatusCode::OK);
+    let buckets = h["buckets"].as_array().unwrap();
+    assert_eq!(
+        buckets.len(),
+        1,
+        "the two same-output-bucket rows must merge into one time bucket, buckets = {buckets:?}"
+    );
+    assert_eq!(buckets[0]["counts"], serde_json::json!([1, 5, 1]));
 }
 
 #[tokio::test]
