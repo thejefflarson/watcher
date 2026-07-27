@@ -86,19 +86,27 @@ pub async fn list_traces(
     Ok(Json(query_traces(&pool, q).await.map_err(internal)?))
 }
 
-/// Hard ceiling (hours) on how far back a `spans`-table query may reach, even
-/// when the caller passes an explicit `from` (JEF-532). Without this, the
-/// `COALESCE($n, now() - interval '24 hours')` default-window floor below only
-/// applies when `from` is unset — an arbitrarily-far-past explicit `from`
-/// would defeat it and full-scan the retention-deep `spans` table. Defaults to
+/// Hard ceiling (hours) on how far back a `spans`/`logs`-table query may
+/// reach, even when the caller passes an explicit `from` (JEF-532). Without
+/// this, the `COALESCE($n, now() - interval '24 hours')` default-window floor
+/// below only applies when `from` is unset — an arbitrarily-far-past explicit
+/// `from` would defeat it and full-scan the retention-deep table. Defaults to
 /// the same 7-day ceiling most metric endpoints use (`resolve_window`'s
 /// `max_hours` for facet/histogram); override with `WATCHER_MAX_QUERY_HOURS`.
+/// Clamped to `[1, 8760]` (1 hour .. 1 year, JEF-546) so a misconfigured env
+/// value can't disable the ceiling (0/negative) or resolve it to the distant
+/// past and re-open the full-scan it exists to prevent (an absurdly large
+/// value).
 fn max_lookback_hours() -> i32 {
-    std::env::var("WATCHER_MAX_QUERY_HOURS")
-        .ok()
-        .and_then(|s| s.parse::<i32>().ok())
-        .filter(|h| *h > 0)
+    parse_max_lookback_hours(std::env::var("WATCHER_MAX_QUERY_HOURS").ok().as_deref())
+}
+
+/// Pure helper behind `max_lookback_hours()`, extracted so the clamp can be
+/// unit-tested without mutating process-global env state.
+fn parse_max_lookback_hours(raw: Option<&str>) -> i32 {
+    raw.and_then(|s| s.parse::<i32>().ok())
         .unwrap_or(24 * 7)
+        .clamp(1, 8760)
 }
 
 /// Recent-traces query shared by the HTTP handler and the MCP `search_traces`
@@ -262,7 +270,15 @@ pub async fn query_logs(pool: &PgPool, q: LogQuery) -> Result<Vec<LogRow>, sqlx:
            AND ($2::text IS NULL OR trace_id = $2)
            AND ($3::text IS NULL OR span_id = $3)
            AND ($4::text IS NULL OR body ILIKE '%' || $4 || '%')
-           AND ($5::timestamptz IS NULL OR time >= $5)
+           -- default to a recent window when unbounded, and clamp an explicit
+           -- `from` to the max-lookback ceiling too, so a body ILIKE search for
+           -- a rare/absent term can't full-scan the retention-deep `logs` table
+           -- to satisfy ORDER BY time DESC LIMIT (JEF-546, mirrors JEF-532's
+           -- query_traces clamp).
+           AND time >= GREATEST(
+                 COALESCE($5::timestamptz, now() - interval '24 hours'),
+                 now() - make_interval(hours => $9::int)
+               )
            AND ($6::timestamptz IS NULL OR time <= $6)
            AND ($7::jsonb IS NULL OR attributes @> $7)
          ORDER BY time DESC
@@ -276,6 +292,7 @@ pub async fn query_logs(pool: &PgPool, q: LogQuery) -> Result<Vec<LogRow>, sqlx:
     .bind(q.to)
     .bind(attr_json)
     .bind(limit)
+    .bind(max_lookback_hours())
     .fetch_all(pool)
     .instrument(tracing::info_span!("db.query"))
     .await
@@ -1362,5 +1379,30 @@ mod tests {
         let (lo, resolved_hi) = resolve_window(Some(48), 24, 24 * 7, None, Some(hi));
         assert_eq!(resolved_hi, hi);
         assert_eq!(lo, hi - Duration::hours(48));
+    }
+
+    // JEF-546: a pathologically large WATCHER_MAX_QUERY_HOURS must not resolve
+    // the ceiling to the distant past and re-open the full-scan JEF-532 closed.
+    #[test]
+    fn parse_max_lookback_hours_clamps_huge_value_to_one_year() {
+        assert_eq!(parse_max_lookback_hours(Some("999999999")), 8760);
+    }
+
+    // Zero/negative must not disable the ceiling entirely.
+    #[test]
+    fn parse_max_lookback_hours_clamps_zero_and_negative_to_one_hour() {
+        assert_eq!(parse_max_lookback_hours(Some("0")), 1);
+        assert_eq!(parse_max_lookback_hours(Some("-5")), 1);
+    }
+
+    #[test]
+    fn parse_max_lookback_hours_defaults_to_one_week_when_unset_or_invalid() {
+        assert_eq!(parse_max_lookback_hours(None), 24 * 7);
+        assert_eq!(parse_max_lookback_hours(Some("not a number")), 24 * 7);
+    }
+
+    #[test]
+    fn parse_max_lookback_hours_leaves_in_range_value_unchanged() {
+        assert_eq!(parse_max_lookback_hours(Some("48")), 48);
     }
 }
