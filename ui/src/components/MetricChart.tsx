@@ -10,6 +10,7 @@ import {
 } from "../api";
 import { formatValue } from "../format";
 import { facetLabels } from "../metricLabels";
+import { traceHref } from "../links";
 
 const RANGES: { label: string; hours: number }[] = [
   { label: "1h", hours: 1 },
@@ -358,9 +359,7 @@ function FacetView({
         firingFrom={firingFrom}
         desc={`${name} ${data.rated ? "per-second rate" : "value"}, ${rangeLabel}`}
         exemplars={exemplars.map((e) => ({ t: e.t, v: e.v, traceId: e.trace_id }))}
-        onExemplarClick={(traceId) =>
-          navigate(`/traces/${traceId}${service ? `?service=${encodeURIComponent(service)}` : ""}`)
-        }
+        onExemplarClick={(traceId) => navigate(traceHref(traceId, { service }))}
       />
     </div>
   );

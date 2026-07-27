@@ -2,6 +2,7 @@ import { Fragment, useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { listLogs, type LogRow } from "../api";
 import { firstRunHint } from "../empty";
+import { traceHref } from "../links";
 import { useControls, rangeParams } from "../timerange";
 
 function sevClass(n: number | null): string {
@@ -70,12 +71,9 @@ export default function LogView() {
     });
 
   // Preserve the service focus when drilling into a trace/span from a log row.
-  const svc = service ? `service=${encodeURIComponent(service)}` : "";
-  const traceLink = (l: LogRow) => `/traces/${l.trace_id}${svc ? `?${svc}` : ""}`;
-  const spanInTraceLink = (l: LogRow) => {
-    const parts = [l.span_id ? `span=${l.span_id}` : "", svc].filter(Boolean);
-    return `/traces/${l.trace_id}${parts.length ? `?${parts.join("&")}` : ""}`;
-  };
+  const traceLink = (l: LogRow) => traceHref(l.trace_id ?? "", { service: service || undefined });
+  const spanInTraceLink = (l: LogRow) =>
+    traceHref(l.trace_id ?? "", { spanId: l.span_id, service: service || undefined });
 
   const emptyMessage = spanFilter
     ? "No logs recorded for this span."
@@ -172,7 +170,7 @@ export default function LogView() {
                     <td>{l.service ?? "—"}</td>
                     <td className="mono">
                       {l.trace_id ? (
-                        <Link className="xlink" to={`/traces/${l.trace_id}`} title={l.trace_id}>
+                        <Link className="xlink" to={traceHref(l.trace_id)} title={l.trace_id}>
                           {l.trace_id.slice(0, 8)}
                         </Link>
                       ) : (

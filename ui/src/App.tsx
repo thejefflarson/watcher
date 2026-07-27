@@ -18,6 +18,7 @@ import Services from "./components/Services";
 import Alerts from "./components/Alerts";
 import { listAlerts, listServices } from "./api";
 import { useControls, rangeParams, RANGES, INTERVALS } from "./timerange";
+import { traceHref } from "./links";
 
 const TABS: { to: string; label: string }[] = [
   { to: "/traces", label: "Traces" },
@@ -57,7 +58,7 @@ function TracesRoute() {
   const { service } = useControls();
   // Keep the focus in the URL through the drill-in so the header + tabs still show it.
   // A real <Link> per row (primary cell) makes rows keyboard-operable + open-in-new-tab.
-  return <TraceList to={(id) => `/traces/${id}${serviceSearch(service)}`} />;
+  return <TraceList to={(id) => traceHref(id, { service })} />;
 }
 
 function TraceRoute() {
