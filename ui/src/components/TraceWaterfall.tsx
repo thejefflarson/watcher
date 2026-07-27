@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { getTrace, type SpanRow } from "../api";
 import { rowKeyActivate } from "../a11y";
+import { logsHref } from "../links";
 import { fmtDuration } from "./TraceList";
 
 export interface Row {
@@ -145,10 +146,7 @@ function SpanDetail({ span, onClose }: { span: SpanRow; onClose: () => void }) {
         <strong className="mono">{span.name}</strong>
         {/* Cross-signal drill: this span's logs (trace_id + span_id), or the
             whole service's logs (which also sets the global service focus). */}
-        <Link
-          className="xlink"
-          to={`/logs?trace_id=${span.trace_id}&span_id=${span.span_id}`}
-        >
+        <Link className="xlink" to={logsHref(span.trace_id, span.span_id)}>
           logs for this span ↗
         </Link>
         {span.service && (
@@ -379,7 +377,7 @@ export default function TraceWaterfall({
       <h2>
         {spans[0].service ?? "trace"} · <code>{traceId.slice(0, 16)}…</code> ·{" "}
         {fmtDuration(totalMs)} ·{" "}
-        <Link className="xlink" to={`/logs?trace_id=${traceId}`}>
+        <Link className="xlink" to={logsHref(traceId)}>
           logs ↗
         </Link>
         {errorSpans.length > 0 && (
