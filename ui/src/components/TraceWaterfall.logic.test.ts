@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { SpanRow } from "../api";
+import { fmtDuration } from "./TraceList";
 import {
   barGeometry,
   buildOrder,
   computeCriticalPath,
   epochMicros,
+  traceDurationMs,
   withAncestors,
 } from "./TraceWaterfall";
 
@@ -46,6 +48,20 @@ describe("barGeometry", () => {
     const s = span({ span_id: "a", start_time: "2026-07-01T00:00:00.000000Z", end_time: "2026-07-01T00:00:00.000000Z" });
     const { width } = barGeometry(s, t0, 500_000);
     expect(width).toBe(0.4);
+  });
+});
+
+describe("traceDurationMs", () => {
+  it("converts the trace's µs window to ms, matching what fmtDuration expects", () => {
+    // JEF-533: the header passed the µs delta straight into fmtDuration
+    // (which expects ms), overstating a 480ms trace as "480.00s" — ~1000×.
+    const total = 480_000; // 480ms in micros, same basis as `total` in the component
+    const ms = traceDurationMs(total);
+    expect(ms).toBe(480);
+    expect(fmtDuration(ms)).toBe("480.0ms");
+    // The pre-fix bug: feeding the µs delta straight into fmtDuration would
+    // render as seconds, ~1000× the true duration.
+    expect(fmtDuration(total)).toBe("480.00s");
   });
 });
 
