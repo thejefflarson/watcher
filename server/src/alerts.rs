@@ -614,6 +614,27 @@ async fn fire(
     notify(client, webhook, mailer, rule, "firing", value).await;
 }
 
+/// Ceiling on each sink's *total* delivery time inside `notify()`. This is
+/// distinct from — and layered on top of — each sink's own per-operation
+/// bound (the reqwest client's `.timeout(10s)` and `Mailer`'s
+/// `.timeout(Some(10s))`, both from JEF-497): lettre's SMTP timeout only
+/// bounds each individual network operation in the conversation (connect,
+/// EHLO, MAIL, RCPT, DATA, body, QUIT, ...), not the conversation as a whole.
+/// A relay that's slow-but-responsive at every step can still sum well past
+/// that per-step bound — this is what left `alert.notify` spans at ~12s even
+/// after JEF-497 (error_count=0: it was delivering, just slowly). Wrapping
+/// each sink's whole send in this timeout bounds its total regardless of how
+/// many round trips the underlying protocol takes. For the webhook this is
+/// redundant with reqwest's own total timeout (defense-in-depth, per the
+/// ticket); for SMTP it's the actual fix.
+const NOTIFY_SINK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Log and notify a firing/resolved transition on every configured sink.
+/// Webhook and email are independent — either, both, or neither may be
+/// configured — so they run *concurrently*, each individually wrapped in
+/// [`NOTIFY_SINK_TIMEOUT`], rather than sequentially: with both sinks wired
+/// up, that bounds `notify()`'s total latency to max(sink), not their sum,
+/// and a slow/dead sink can't delay or skip the other (fail-open, logged).
 #[tracing::instrument(name = "alert.notify", skip_all, fields(rule = %rule.name, state))]
 async fn notify(
     client: &reqwest::Client,
@@ -623,50 +644,81 @@ async fn notify(
     state: &str,
     value: Option<f64>,
 ) {
-    // Webhook and email are independent sinks — either, both, or neither may be
-    // configured, and a failure in one must not skip the other.
-    if let Some(url) = webhook {
-        let payload = WebhookPayload {
-            rule: &rule.name,
-            metric: &rule.metric,
-            service: rule.service.as_deref(),
-            state,
-            value,
-            threshold: rule.threshold,
-            comparator: &rule.comparator,
-        };
-        // Propagate this span's context to the receiver.
-        let mut headers = reqwest::header::HeaderMap::new();
-        let cx = tracing::Span::current().context();
-        opentelemetry::global::get_text_map_propagator(|p| {
-            p.inject_context(&cx, &mut HeaderInjector(&mut headers))
-        });
-        if let Err(e) = client
-            .post(url)
-            .headers(headers)
-            .json(&payload)
-            .send()
-            .await
-        {
-            tracing::warn!("alert webhook POST failed: {e}");
-        }
-    }
+    tokio::join!(
+        notify_webhook(client, webhook, rule, state, value),
+        notify_email(mailer, rule, state, value),
+    );
+}
 
-    if let Some(mailer) = mailer {
-        let subject = email_subject(&rule.name, state);
-        let body = email_body(rule, state, value);
-        if let Err(e) = mailer.send(&subject, body).await {
-            tracing::warn!("alert email send failed: {e}");
-        }
+/// Run one sink's send bounded by [`NOTIFY_SINK_TIMEOUT`], logging (and
+/// swallowing) a failure or timeout under `label` rather than propagating it.
+/// Shared by the webhook and email sinks so both log the same way and a
+/// slow/dead one can't affect the other.
+async fn deliver<T, E: std::fmt::Display>(
+    label: &str,
+    send: impl std::future::Future<Output = Result<T, E>>,
+) {
+    match tokio::time::timeout(NOTIFY_SINK_TIMEOUT, send).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!("alert {label} failed: {e}"),
+        Err(_) => tracing::warn!("alert {label} timed out after {NOTIFY_SINK_TIMEOUT:?}"),
     }
+}
+
+/// POST the transition to the configured webhook, if any. Bounded end-to-end
+/// by [`NOTIFY_SINK_TIMEOUT`]; a failure or timeout is logged, never propagated.
+async fn notify_webhook(
+    client: &reqwest::Client,
+    webhook: Option<&str>,
+    rule: &AlertRule,
+    state: &str,
+    value: Option<f64>,
+) {
+    let Some(url) = webhook else {
+        return;
+    };
+    let payload = WebhookPayload {
+        rule: &rule.name,
+        metric: &rule.metric,
+        service: rule.service.as_deref(),
+        state,
+        value,
+        threshold: rule.threshold,
+        comparator: &rule.comparator,
+    };
+    // Propagate this span's context to the receiver.
+    let mut headers = reqwest::header::HeaderMap::new();
+    let cx = tracing::Span::current().context();
+    opentelemetry::global::get_text_map_propagator(|p| {
+        p.inject_context(&cx, &mut HeaderInjector(&mut headers))
+    });
+    deliver(
+        "webhook POST",
+        client.post(url).headers(headers).json(&payload).send(),
+    )
+    .await;
+}
+
+/// Email the transition via `mailer`, if configured. Bounded end-to-end by
+/// [`NOTIFY_SINK_TIMEOUT`] — the whole SMTP conversation, not just each
+/// round trip within it; a failure or timeout is logged, never propagated.
+async fn notify_email(mailer: Option<&Mailer>, rule: &AlertRule, state: &str, value: Option<f64>) {
+    let Some(mailer) = mailer else {
+        return;
+    };
+    let subject = email_subject(&rule.name, state);
+    let body = email_body(rule, state, value);
+    deliver("email send", mailer.send(&subject, body)).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         agg_expr, breached, build_webhook_client, email_body, email_subject, eval_sql, notify,
-        validate, AlertRule, RuleConfig, MAX_FOR_SECS,
+        validate, AlertRule, Mailer, RuleConfig, MAX_FOR_SECS, NOTIFY_SINK_TIMEOUT,
     };
+    use lettre::{AsyncSmtpTransport, Tokio1Executor};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     #[test]
     fn config_parses_with_defaults() {
@@ -925,6 +977,127 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(15),
             "notify() should give up on a hung webhook within the bounded timeout, took {elapsed:?}"
+        );
+    }
+
+    // Sleep `delay`, then write `resp`. Propagates a broken pipe (the client gave
+    // up — its total timeout fired and it dropped the connection) via `?`.
+    async fn reply_after_delay(
+        write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+        delay: std::time::Duration,
+        resp: &[u8],
+    ) -> std::io::Result<()> {
+        tokio::time::sleep(delay).await;
+        write_half.write_all(resp).await
+    }
+
+    // Read one line, erroring on EOF (the client gave up) so callers can `?` it
+    // like any other I/O failure rather than pattern-matching `Ok(0)` themselves.
+    async fn read_line(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        line: &mut String,
+    ) -> std::io::Result<()> {
+        line.clear();
+        match reader.read_line(line).await? {
+            0 => Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "client closed the connection",
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    // A fake SMTP relay that is slow but never hangs: it answers every step of the
+    // conversation (greeting, EHLO, MAIL, RCPT, DATA, body) after `step_delay`,
+    // never leaving a single read/write outstanding for long. This is exactly the
+    // JEF-537 scenario — lettre's per-operation SMTP timeout never trips because
+    // no single step is slow, but the *sum* of six such steps blows past the
+    // total notify budget. Uses `builder_dangerous` (plaintext, no STARTTLS/AUTH)
+    // so the conversation is short enough to hand-roll deterministically. Any I/O
+    // error (most likely the client giving up once its own timeout fires) just
+    // ends the conversation — there's nothing left to serve.
+    async fn slow_smtp_conversation(
+        listener: tokio::net::TcpListener,
+        step_delay: std::time::Duration,
+    ) {
+        let _: std::io::Result<()> = async {
+            let (sock, _) = listener.accept().await?;
+            let (read_half, mut write_half) = sock.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+
+            reply_after_delay(&mut write_half, step_delay, b"220 mock.smtp ESMTP\r\n").await?; // greeting
+            read_line(&mut reader, &mut line).await?; // EHLO
+            reply_after_delay(&mut write_half, step_delay, b"250 mock.smtp\r\n").await?;
+            read_line(&mut reader, &mut line).await?; // MAIL FROM
+            reply_after_delay(&mut write_half, step_delay, b"250 OK\r\n").await?;
+            read_line(&mut reader, &mut line).await?; // RCPT TO
+            reply_after_delay(&mut write_half, step_delay, b"250 OK\r\n").await?;
+            read_line(&mut reader, &mut line).await?; // DATA
+            reply_after_delay(
+                &mut write_half,
+                step_delay,
+                b"354 End data with <CR><LF>.<CR><LF>\r\n",
+            )
+            .await?;
+            loop {
+                // Message body, terminated by a lone "." line per RFC 5321.
+                read_line(&mut reader, &mut line).await?;
+                if line == ".\r\n" || line == ".\n" {
+                    break;
+                }
+            }
+            reply_after_delay(&mut write_half, step_delay, b"250 OK: queued\r\n").await
+        }
+        .await;
+    }
+
+    // The SMTP-specific regression this ticket fixes: a relay that answers every
+    // step of the conversation promptly (so lettre's per-operation timeout never
+    // trips) but whose six-step conversation sums to well past the total notify
+    // budget. `notify()` must still return within ~NOTIFY_SINK_TIMEOUT, not the
+    // conversation's natural ~18s completion.
+    #[tokio::test]
+    async fn notify_bounds_a_slow_but_responsive_smtp_relay_to_the_total_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // 6 steps * 3s = ~18s to naturally complete — comfortably past the 10s
+        // total-notify ceiling, while each individual step is far under it too
+        // (so a per-operation-only timeout, like lettre's, would never trip).
+        tokio::spawn(slow_smtp_conversation(
+            listener,
+            std::time::Duration::from_secs(3),
+        ));
+
+        let transport = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous("127.0.0.1")
+            .port(addr.port())
+            .build();
+        let mailer = Mailer {
+            transport,
+            from: "alerts@example.com".parse().unwrap(),
+            to: "oncall@example.com".parse().unwrap(),
+        };
+        let rule = rule();
+
+        let start = std::time::Instant::now();
+        // No webhook — this exercises the SMTP sink in isolation.
+        notify(
+            &reqwest::Client::new(),
+            None,
+            Some(&mailer),
+            &rule,
+            "firing",
+            Some(87.5),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        // Bounded by the total-notify timeout plus scheduling slack, and well
+        // under the conversation's natural ~18s completion — proof the fix bounds
+        // the *whole* SMTP send, not just each of its individual round trips.
+        assert!(
+            elapsed < std::time::Duration::from_secs(13),
+            "notify() should bound a slow-but-responsive SMTP relay to ~{NOTIFY_SINK_TIMEOUT:?}, took {elapsed:?}",
         );
     }
 
