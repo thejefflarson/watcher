@@ -82,6 +82,7 @@ last rollup bucket, so it stays continuous after pruning.
 | `WATCHER_RETENTION_METRICS_DAYS` | — | per-table override of `WATCHER_RETENTION_DAYS` for `metric_series_rollups`; unset falls back to the default |
 | `WATCHER_METRICS_RAW_DAYS` | `2` | prune age for raw metric points (rollups keep history); `0` = same as retention |
 | `WATCHER_ROLLUP_BUCKET_SECS` | `300` | downsample bucket width; `0` disables rollups |
+| `WATCHER_MAX_QUERY_HOURS` | `168` (7d) | max look-back for `/api/traces` and `/api/services`; an explicit `from` is clamped to this ceiling, not honored verbatim (JEF-532) |
 | `WATCHER_ALERT_INTERVAL_SECS` | `30` | how often alert rules are evaluated (min 5) |
 | `WATCHER_ALERT_WEBHOOK` | — | optional URL to POST on alert fire/resolve |
 | `WATCHER_ALERT_SMTP_HOST` | — | SMTP relay host; setting it enables emailing alert fire/resolve (STARTTLS) |

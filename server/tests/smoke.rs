@@ -2810,6 +2810,72 @@ async fn service_red_aggregates() {
     assert!((s["p50_ms"].as_f64().unwrap() - 25.0).abs() < 1e-6);
 }
 
+// JEF-532: an explicit `from` far beyond the max-lookback ceiling must not
+// defeat it — the effective floor is clamped, not honored verbatim, so a
+// full scan of the retention-deep `spans` table can't be forced.
+#[tokio::test]
+#[serial]
+async fn traces_from_beyond_max_lookback_is_clamped() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let day = 86_400.0;
+    // Lower the ceiling to 2 days so the test doesn't need to insert 7 days of
+    // data; #[serial] keeps this process-global env change from racing other
+    // tests.
+    std::env::set_var("WATCHER_MAX_QUERY_HOURS", "48");
+    insert_span_at(&pool, "svc", "recent", "r1", 3600.0).await; // 1h ago
+    insert_span_at(&pool, "svc", "old", "o1", 10.0 * day).await; // 10 days ago
+    let router = app(pool);
+
+    // Ask for a window starting 30 days ago — far past the 48h ceiling.
+    let from = (chrono::Utc::now() - chrono::Duration::days(30))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let (status, traces) = get_json(&router, &format!("/api/traces?from={from}")).await;
+    std::env::remove_var("WATCHER_MAX_QUERY_HOURS");
+
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<_> = traces
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["trace_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["recent"],
+        "the 10-day-old trace is outside the max-lookback ceiling and must stay \
+         excluded even though `from` asked for 30 days back"
+    );
+}
+
+// Same clamp, for /api/services' independent COALESCE(from, ...) guard.
+#[tokio::test]
+#[serial]
+async fn services_from_beyond_max_lookback_is_clamped() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let day = 86_400.0;
+    std::env::set_var("WATCHER_MAX_QUERY_HOURS", "48");
+    insert_span_at(&pool, "svc", "recent", "r1", 3600.0).await; // 1h ago
+    insert_span_at(&pool, "svc", "old", "o1", 10.0 * day).await; // 10 days ago
+    let router = app(pool);
+
+    let from = (chrono::Utc::now() - chrono::Duration::days(30))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let (status, svcs) = get_json(&router, &format!("/api/services?from={from}")).await;
+    std::env::remove_var("WATCHER_MAX_QUERY_HOURS");
+
+    assert_eq!(status, StatusCode::OK);
+    let arr = svcs.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(
+        arr[0]["spans"], 1,
+        "only the span inside the max-lookback ceiling should be counted"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn logs_attribute_filter() {
