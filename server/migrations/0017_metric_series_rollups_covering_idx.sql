@@ -1,0 +1,55 @@
+-- Covering index for the wide-window metric read path (JEF-548). The
+-- series/facet/histogram/hist_facet queries in api.rs (query_metric_series,
+-- metric_facet, metric_histogram, metric_hist_facet) all filter
+-- `metric_series_rollups` on `name = $1 AND bucket BETWEEN $lo AND $hi` — a
+-- window that can be up to 90 days wide (`resolve_window`'s `max_hours`). The
+-- old `metric_series_rollups_name_bucket_idx (name, bucket DESC)` let Postgres
+-- find the matching rows via the index, but still had to fetch each matching
+-- row's heap tuple for the columns the SELECT actually needs (service, kind,
+-- unit, is_monotonic, attrs, count, sum, avg, max, bucket_bounds,
+-- bucket_counts — between them, every column these four queries select).
+-- For a high-cardinality metric over a wide window that's up to hundreds of
+-- thousands of heap fetches; confirmed locally with `EXPLAIN (ANALYZE,
+-- BUFFERS)` against ~2.6M synthetic rows (one metric, 100 series, 5-minute
+-- buckets over 90 days): the old index produced a Bitmap Heap Scan with
+-- `Heap Blocks: exact=57603` (57,603 random heap-page reads); with this
+-- covering index the same query plans as an `Index Only Scan` with
+-- `Heap Fetches: 0`. On the fast, warm-cache disk in that environment the
+-- wall-clock difference was modest, but each of those 57,603 heap reads is a
+-- random I/O — on the slow disk this runs against in production (a
+-- Raspberry Pi / network-attached Postgres volume), that's the ~20-70s
+-- idle-bound `db.query` spans this ticket traced.
+--
+-- INCLUDEing every column the four hot read queries select turns their
+-- lookups into index-only scans (subject to the visibility map being current,
+-- which autovacuum keeps true for this table). `min` is left out: no read
+-- query selects it.
+--
+-- Plain (non-CONCURRENTLY) CREATE/DROP INDEX, deliberately: `sqlx::migrate!`
+-- holds a session-level advisory lock for the whole migration run, and
+-- ingest continuously upserts this table, so a `CONCURRENTLY` build (which
+-- waits out every other in-flight transaction on the table) can deadlock
+-- against that lock — and since migrations run on every pod boot, that's a
+-- deploy-safety bug, not just a slow build. A plain `CREATE INDEX` runs
+-- inside the migrator's own transaction instead: no advisory-lock deadlock,
+-- no risk of an INVALID index left behind by an interrupted CONCURRENTLY
+-- build. The cost is a `SHARE` lock that briefly blocks *writes* (ingest's
+-- rollup upserts) to this table while the index builds — reads are
+-- unaffected. Measured locally: ~4.1s to build over 2.6M rows (100 series,
+-- 5-minute buckets, 90 days), comfortably inside the 60s `statement_timeout`
+-- and a one-time-per-deploy stall ingest's queuing tolerates.
+--
+-- This index's leading columns (name, bucket) are a superset of the old
+-- index's, so it serves every access pattern the old one did — including the
+-- `ORDER BY bucket DESC LIMIT 1` latest-row lookup in metric_facet's meta
+-- query, which just becomes a backward scan of the new (ASC-declared) index —
+-- so the old index is redundant once this one exists. It's dropped rather
+-- than kept alongside: the extra index would double the per-row index
+-- maintenance cost on every ingest-time rollup upsert (each upsert touches
+-- count/sum/avg/max, which both indexes would need to keep in sync) for no
+-- read benefit.
+CREATE INDEX IF NOT EXISTS metric_series_rollups_name_bucket_covering_idx
+    ON metric_series_rollups (name, bucket)
+    INCLUDE (service, kind, unit, is_monotonic, count, sum, avg, max, attrs, bucket_bounds, bucket_counts);
+
+DROP INDEX IF EXISTS metric_series_rollups_name_bucket_idx;
