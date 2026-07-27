@@ -23,6 +23,13 @@ export function epochMicros(iso: string): number {
   return ms * 1000 + subMs;
 }
 
+// `total` (the trace's [t0, t1] window, see below) is a microsecond delta;
+// `fmtDuration` expects ms. Extracted as a pure function so the header's
+// µs→ms conversion is testable in isolation from the render path.
+export function traceDurationMs(total: number): number {
+  return total / 1000;
+}
+
 // Left/width as percentages of the trace's [t0, t0+total] window. Shared by the
 // bars AND the minimap so the two stay pixel-for-pixel consistent — a span at a
 // given x in one reads at the same x in the other.
@@ -339,9 +346,9 @@ export default function TraceWaterfall({
 
   const criticalPath = computeCriticalPath(spans);
   const criticalPathOn = criticalPathOverride ?? spans.length > 15;
-  // `total` above is a microsecond delta (see epochMicros); convert to ms to
-  // pair sensibly with `criticalPath.criticalMs`, which is already in ms.
-  const totalMs = total / 1000;
+  // The header and the critical-path note both need ms, to pair sensibly with
+  // `fmtDuration` and `criticalPath.criticalMs`.
+  const totalMs = traceDurationMs(total);
 
   const q = filterText.trim().toLowerCase();
   const filterActive = q !== "" || errorsOnly;
@@ -371,7 +378,7 @@ export default function TraceWaterfall({
       </button>
       <h2>
         {spans[0].service ?? "trace"} · <code>{traceId.slice(0, 16)}…</code> ·{" "}
-        {fmtDuration(total)} ·{" "}
+        {fmtDuration(totalMs)} ·{" "}
         <Link className="xlink" to={`/logs?trace_id=${traceId}`}>
           logs ↗
         </Link>
