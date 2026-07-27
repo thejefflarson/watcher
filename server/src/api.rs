@@ -86,6 +86,21 @@ pub async fn list_traces(
     Ok(Json(query_traces(&pool, q).await.map_err(internal)?))
 }
 
+/// Hard ceiling (hours) on how far back a `spans`-table query may reach, even
+/// when the caller passes an explicit `from` (JEF-532). Without this, the
+/// `COALESCE($n, now() - interval '24 hours')` default-window floor below only
+/// applies when `from` is unset — an arbitrarily-far-past explicit `from`
+/// would defeat it and full-scan the retention-deep `spans` table. Defaults to
+/// the same 7-day ceiling most metric endpoints use (`resolve_window`'s
+/// `max_hours` for facet/histogram); override with `WATCHER_MAX_QUERY_HOURS`.
+fn max_lookback_hours() -> i32 {
+    std::env::var("WATCHER_MAX_QUERY_HOURS")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .filter(|h| *h > 0)
+        .unwrap_or(24 * 7)
+}
+
 /// Recent-traces query shared by the HTTP handler and the MCP `search_traces`
 /// tool. Applies the same limit clamp + default 24h window.
 pub async fn query_traces(pool: &PgPool, q: TraceQuery) -> Result<Vec<TraceSummary>, sqlx::Error> {
@@ -116,7 +131,13 @@ pub async fn query_traces(pool: &PgPool, q: TraceQuery) -> Result<Vec<TraceSumma
          WHERE ($1::text IS NULL OR service = $1)
            -- default to a recent window when unbounded so this can't turn into a
            -- full-table GROUP BY (which times out); the UI always passes a range.
-           AND start_time >= COALESCE($2::timestamptz, now() - interval '24 hours')
+           -- GREATEST clamps an explicit `from` to the max-lookback ceiling too,
+           -- so it can't out-scan the default window (JEF-532). Computed here
+           -- (rather than in Rust) so it's atomic with the same `now()`.
+           AND start_time >= GREATEST(
+                 COALESCE($2::timestamptz, now() - interval '24 hours'),
+                 now() - make_interval(hours => $9::int)
+               )
            AND ($3::timestamptz IS NULL OR start_time <= $3)
            AND ($6::jsonb IS NULL
                 OR trace_id IN (SELECT trace_id FROM spans WHERE attributes @> $6))
@@ -137,6 +158,7 @@ pub async fn query_traces(pool: &PgPool, q: TraceQuery) -> Result<Vec<TraceSumma
     .bind(attr_json)
     .bind(q.errors_only)
     .bind(q.min_duration_ms)
+    .bind(max_lookback_hours())
     .fetch_all(pool)
     .instrument(tracing::info_span!("db.query"))
     .await
@@ -380,6 +402,12 @@ fn rollup_bucket_secs() -> f64 {
 /// the `hours`-relative bound anchored on the *other* end (so `to` alone still
 /// yields an `hours`-wide window ending at `to`, not at the real "now"). With
 /// neither given, it's `hours` back from now — the original behavior.
+///
+/// The relative-hours path was already capped to `max_hours` (via `.clamp`
+/// above); the absolute `from`/`to` path was not, so an over-wide explicit
+/// window could out-scan it (JEF-532). Clamp the resolved span to the same
+/// `max_hours` ceiling regardless of which path produced it, so an absolute
+/// window can never load more than a relative one could.
 fn resolve_window(
     hours: Option<i32>,
     default_hours: i32,
@@ -391,7 +419,12 @@ fn resolve_window(
     let lo = from.unwrap_or_else(|| {
         hi - Duration::hours(hours.unwrap_or(default_hours).clamp(1, max_hours) as i64)
     });
-    (lo, hi)
+    let max_span = Duration::hours(max_hours as i64);
+    if hi - lo > max_span {
+        (hi - max_span, hi)
+    } else {
+        (lo, hi)
+    }
 }
 
 #[derive(Deserialize)]
@@ -1042,13 +1075,19 @@ pub async fn query_service_red(pool: &PgPool, q: RedQuery) -> Result<Vec<Service
          WHERE service IS NOT NULL
            -- default to a recent window when unbounded so the per-service
            -- percentile aggregate can't full-scan the spans table and time out.
-           AND start_time >= COALESCE($1::timestamptz, now() - interval '24 hours')
+           -- GREATEST clamps an explicit `from` to the max-lookback ceiling too,
+           -- so it can't out-scan the default window (JEF-532).
+           AND start_time >= GREATEST(
+                 COALESCE($1::timestamptz, now() - interval '24 hours'),
+                 now() - make_interval(hours => $3::int)
+               )
            AND ($2::timestamptz IS NULL OR start_time <= $2)
          GROUP BY service
          ORDER BY spans DESC",
     )
     .bind(q.from)
     .bind(q.to)
+    .bind(max_lookback_hours())
     .fetch_all(pool)
     .instrument(tracing::info_span!("db.query"))
     .await
@@ -1284,5 +1323,44 @@ mod tests {
             logged.contains("ERROR") && logged.contains("decode blew up: unexpected null"),
             "the 500 was not logged; captured: {logged:?}"
         );
+    }
+
+    // JEF-532: an explicit `from`/`to` bypassed the relative-hours `max_hours`
+    // clamp entirely — this proves the absolute path is now capped to the same
+    // ceiling.
+    #[test]
+    fn resolve_window_clamps_over_wide_absolute_span_to_max_hours() {
+        let hi = Utc::now();
+        let from = hi - Duration::days(30);
+        let (lo, resolved_hi) = resolve_window(None, 24, 24 * 7, Some(from), Some(hi));
+        assert_eq!(resolved_hi, hi);
+        assert_eq!(
+            lo,
+            hi - Duration::hours(24 * 7),
+            "a 30-day span should be clamped down to the 7-day max_hours ceiling"
+        );
+    }
+
+    #[test]
+    fn resolve_window_leaves_absolute_span_within_max_hours_unchanged() {
+        let hi = Utc::now();
+        let from = hi - Duration::hours(3);
+        let (lo, resolved_hi) = resolve_window(None, 24, 24 * 7, Some(from), Some(hi));
+        assert_eq!(resolved_hi, hi);
+        assert_eq!(
+            lo, from,
+            "a span already within max_hours must pass through untouched"
+        );
+    }
+
+    // No regression: the pre-existing relative `hours` path already clamped via
+    // `.clamp(1, max_hours)` before this fix, and must resolve to exactly the
+    // same window now that the absolute path is also clamped.
+    #[test]
+    fn resolve_window_relative_hours_path_is_unaffected() {
+        let hi = Utc::now();
+        let (lo, resolved_hi) = resolve_window(Some(48), 24, 24 * 7, None, Some(hi));
+        assert_eq!(resolved_hi, hi);
+        assert_eq!(lo, hi - Duration::hours(48));
     }
 }
