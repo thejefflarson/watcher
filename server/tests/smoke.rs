@@ -364,7 +364,10 @@ async fn ingest_and_query_a_log() {
             }),
             scope_logs: vec![ScopeLogs {
                 log_records: vec![LogRecord {
-                    time_unix_nano: 1_000_000_000,
+                    // Real "now" rather than a fixed epoch value: /api/logs floors
+                    // to a recent default window (JEF-546), so a fake 1970
+                    // timestamp would fall outside it and never come back.
+                    time_unix_nano: now_nanos(),
                     severity_number: 9, // INFO
                     severity_text: "INFO".to_string(),
                     body: Some(AnyValue {
@@ -425,9 +428,13 @@ async fn ingest_a_log_batch_persists_every_row_in_one_call() {
 
     const N: usize = 250;
     let drops_before = selfmon::DROP_INSERT.load(std::sync::atomic::Ordering::Relaxed);
+    // Real "now" rather than a fixed epoch value: /api/logs floors to a recent
+    // default window (JEF-546), so fake 1970 timestamps would fall outside it
+    // and never come back via the `/api/logs?service=batcher` check below.
+    let base_nanos = now_nanos();
     let records: Vec<LogRecord> = (0..N)
         .map(|i| LogRecord {
-            time_unix_nano: 1_000_000_000 + i as u64,
+            time_unix_nano: base_nanos + i as u64,
             severity_number: 9,
             severity_text: "INFO".to_string(),
             trace_id: vec![(i % 251) as u8 + 1; 16],
@@ -2873,6 +2880,46 @@ async fn services_from_beyond_max_lookback_is_clamped() {
     assert_eq!(
         arr[0]["spans"], 1,
         "only the span inside the max-lookback ceiling should be counted"
+    );
+}
+
+// JEF-546: same clamp as JEF-532's query_traces, extended to /api/logs — an
+// explicit `from` far beyond the max-lookback ceiling must not defeat it, and
+// with no `from` at all a full scan (e.g. an ILIKE search for a rare/absent
+// term) must not walk the whole retention window either.
+#[tokio::test]
+#[serial]
+async fn logs_from_beyond_max_lookback_is_clamped() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let day = 86_400.0;
+    // Lower the ceiling to 2 days so the test doesn't need to insert 7 days of
+    // data; #[serial] keeps this process-global env change from racing other
+    // tests.
+    std::env::set_var("WATCHER_MAX_QUERY_HOURS", "48");
+    insert_log_at(&pool, "recent", 3600.0).await; // 1h ago
+    insert_log_at(&pool, "old", 10.0 * day).await; // 10 days ago
+    let router = app(pool);
+
+    // Ask for a window starting 30 days ago — far past the 48h ceiling.
+    let from = (chrono::Utc::now() - chrono::Duration::days(30))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let (status, logs) = get_json(&router, &format!("/api/logs?from={from}")).await;
+    std::env::remove_var("WATCHER_MAX_QUERY_HOURS");
+
+    assert_eq!(status, StatusCode::OK);
+    let services: Vec<_> = logs
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["service"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        services,
+        vec!["recent"],
+        "the 10-day-old log is outside the max-lookback ceiling and must stay \
+         excluded even though `from` asked for 30 days back"
     );
 }
 
