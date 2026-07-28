@@ -71,6 +71,24 @@ fn migrate_connect_options(url: &str) -> anyhow::Result<PgConnectOptions> {
         .options([("lock_timeout", "3s"), ("statement_timeout", "0")]))
 }
 
+/// Connect options for the online-DDL lane (ADR 0021, JEF-580): a dedicated
+/// connection, not the query pool, so a `CREATE`/`DROP INDEX CONCURRENTLY` build
+/// that runs for minutes on a big table is never cancelled by the pool's 60s
+/// `statement_timeout` (exactly the failure a plain, transactional `CREATE INDEX`
+/// hit on migration 0017). `lock_timeout=3s` matches [`migrate_connect_options`]:
+/// a build that can't get the lock it needs (e.g. blocked behind a long-running
+/// transaction) aborts fast rather than queuing ahead of ingest.
+/// `maintenance_work_mem` is capped explicitly rather than inherited from the
+/// server-wide default, which stays conservative for a Raspberry Pi's limited RAM;
+/// an index build can afford more without raising that default for every backend.
+pub fn online_ddl_connect_options(url: &str) -> anyhow::Result<PgConnectOptions> {
+    Ok(PgConnectOptions::from_str(url)?.options([
+        ("lock_timeout", "3s"),
+        ("statement_timeout", "0"),
+        ("maintenance_work_mem", "64MB"),
+    ]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{migrate_connect_options, PgConnection};

@@ -5,6 +5,7 @@ pub mod db;
 pub mod grpc;
 pub mod mcp;
 pub mod mcp_auth;
+pub mod online_ddl;
 pub mod otlp;
 pub mod retention;
 pub mod selflog;
