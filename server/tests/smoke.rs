@@ -272,7 +272,7 @@ fn kv(key: &str, value: &str) -> KeyValue {
 async fn pool_or_skip() -> Option<sqlx::PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
     let pool = db::connect(&url).await.expect("connect");
-    db::migrate(&pool).await.expect("migrate");
+    db::migrate(&url).await.expect("migrate");
     sqlx::query("TRUNCATE spans, logs, metrics, metric_series_rollups, alert_rules, alert_events")
         .execute(&pool)
         .await

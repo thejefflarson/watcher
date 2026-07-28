@@ -1240,7 +1240,7 @@ mod tests {
     async fn pool_or_skip() -> Option<PgPool> {
         let url = std::env::var("DATABASE_URL").ok()?;
         let pool = crate::db::connect(&url).await.expect("connect");
-        crate::db::migrate(&pool).await.expect("migrate");
+        crate::db::migrate(&url).await.expect("migrate");
         Some(pool)
     }
 
