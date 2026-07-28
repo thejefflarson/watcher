@@ -34,22 +34,41 @@ RUN set -eux; ver=0.16.0; \
     case "$(uname -m)" in x86_64) a=x86_64 ;; aarch64) a=aarch64 ;; *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;; esac; \
     wget -qO- "https://github.com/mozilla/sccache/releases/download/v${ver}/sccache-v${ver}-${a}-unknown-linux-musl.tar.gz" \
       | tar -xz -C /usr/local/bin --strip-components=1 "sccache-v${ver}-${a}-unknown-linux-musl/sccache"
-ENV RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0 \
-    SCCACHE_REDIS=redis://sccache-redis.dev.svc.cluster.local:6379
+ENV RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0
+COPY scripts/start-sccache-docker.sh ./scripts/
 COPY server/Cargo.toml server/Cargo.lock ./
 COPY server/build.rs ./build.rs
 COPY server/migrations ./migrations
 COPY server/src ./src
 COPY --from=ui /ui/dist /ui/dist
-# sccache is a HARD GATE — no local fallback; if it can't reach Redis the build
-# fails. SCCACHE_SERVER_PORT is randomised per build because BuildKit sandboxes
-# share a network namespace, so concurrent builds would collide on sccache's fixed
-# default port 4226 ("Address in use").
+# sccache backend = the shared Cloudflare R2 bucket (cluster repo: charts/sccache,
+# ADR-0020, JEF-584), replacing the in-cluster Redis this used to hardcode. The config
+# and the bucket-scoped token arrive as BuildKit build SECRETS — never ENV or a
+# build-arg, both of which persist in `docker history` on every image we push to ghcr.
+#
+# It is also no longer a HARD GATE. Redis was an in-cluster Service reachable with no
+# credentials, so "can't reach it" really did mean "this builder is misconfigured" and
+# failing was the honest signal. R2 is a remote bucket behind a rotatable token, where a
+# transient blip or a missing `sccache-r2` Secret would fail a build for a reason that
+# has nothing to do with the code — while degrading costs one cold compile, exactly what
+# a cache miss already costs. scripts/start-sccache-docker.sh probes, retries, then
+# degrades to a local disk cache. See its header, and its --selftest fixtures.
+#
+# SCCACHE_SERVER_PORT is randomised per build because BuildKit sandboxes share a
+# network namespace, so concurrent builds would collide on sccache's fixed default
+# port 4226 ("Address in use").
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=secret,id=AWS_ACCESS_KEY_ID \
+    --mount=type=secret,id=AWS_SECRET_ACCESS_KEY \
+    --mount=type=secret,id=SCCACHE_BUCKET \
+    --mount=type=secret,id=SCCACHE_ENDPOINT \
+    --mount=type=secret,id=SCCACHE_REGION \
+    --mount=type=secret,id=SCCACHE_S3_KEY_PREFIX \
+    --mount=type=secret,id=SCCACHE_S3_USE_SSL \
     set -e; \
     export SCCACHE_SERVER_PORT=$(awk 'BEGIN{srand(); print int(20000+rand()*40000)}'); \
-    timeout 10 sccache --start-server; \
+    sh scripts/start-sccache-docker.sh; \
     cargo build --release --locked; \
     sccache --show-stats
 

@@ -170,6 +170,23 @@ jobs:
           # so a cold node skips it. mode=max also caches intermediate (build-stage)
           # layers, which is what carries the cook layer — at the cost of a larger
           # WAN transfer (see JEF-87 / measure in JEF-82).
+          # sccache's R2 backend for the in-image cargo build (JEF-584, ADR-0020).
+          # `secret-envs` (key=envname) reads these straight out of the RUNNER POD's
+          # env, where the `sccache-r2` Secret is injected via envFrom (cluster repo:
+          # charts/actions/runners/values-watcher.yaml) — the repo has no Actions secret
+          # for R2, and this needs no lift step or on-disk secret file. Secrets, not
+          # build-args: a build-arg persists in `docker history` on every pushed image.
+          # Unset (e.g. the Secret is missing) -> the mounts are empty and
+          # scripts/start-sccache-docker.sh degrades to a local disk cache rather than
+          # failing the build.
+          secret-envs: |
+            AWS_ACCESS_KEY_ID=AWS_ACCESS_KEY_ID
+            AWS_SECRET_ACCESS_KEY=AWS_SECRET_ACCESS_KEY
+            SCCACHE_BUCKET=SCCACHE_BUCKET
+            SCCACHE_ENDPOINT=SCCACHE_ENDPOINT
+            SCCACHE_REGION=SCCACHE_REGION
+            SCCACHE_S3_KEY_PREFIX=SCCACHE_S3_KEY_PREFIX
+            SCCACHE_S3_USE_SSL=SCCACHE_S3_USE_SSL
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: true
