@@ -130,8 +130,10 @@ async fn main() -> anyhow::Result<()> {
             to: std::env::var("WATCHER_ALERT_SMTP_TO").unwrap_or_default(),
         });
 
+    // Migrate on its own connection (independent lock_timeout/statement_timeout,
+    // see db::migrate) before opening the query pool's connections.
+    db::migrate(&database_url).await?;
     let pool = db::connect(&database_url).await?;
-    db::migrate(&pool).await?;
 
     // Alert rules are declarative: WATCHER_ALERTS_CONFIG points at a JSON file
     // (rendered from the chart's values) that is the source of truth. Reconcile

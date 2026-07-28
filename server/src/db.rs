@@ -1,4 +1,5 @@
-use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions};
+use sqlx::Connection;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -36,7 +37,102 @@ pub async fn connect(url: &str) -> anyhow::Result<PgPool> {
     Ok(pool)
 }
 
-pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
-    sqlx::migrate!("./migrations").run(pool).await?;
+/// Run pending migrations on a single dedicated connection — deliberately
+/// NOT the query pool from [`connect`] above, so a migration never inherits
+/// that pool's 60s `statement_timeout` or waits behind ingest traffic for a
+/// lock. (JEF-580: migration 0017's `CREATE INDEX` ran on the shared pool,
+/// inherited the 60s bound, and was killed mid-run — crashlooping the pod.)
+///
+/// * `lock_timeout=3s`: a migration that can't acquire the lock it needs
+///   (e.g. blocked behind a long-running transaction on the target table)
+///   aborts fast and fails startup loudly, instead of queuing ahead of
+///   ingest and head-of-line-blocking that table for as long as the
+///   competing lock is held.
+/// * `statement_timeout=0` (unbounded), decoupled from the query pool's 60s:
+///   a legitimate transactional migration on a large table shouldn't be
+///   capped at the app's query-latency bound. The policy (ADR 0021) is that
+///   heavy/locking DDL — anything that needs `CREATE INDEX CONCURRENTLY` or
+///   similarly can't run inside a migration's transaction — belongs in the
+///   separate online-DDL lane, not here, so what runs via `sqlx::migrate!`
+///   is expected to stay short regardless of the unbounded timeout.
+///
+/// Migrations apply serially at startup, so one connection — not a pool —
+/// is all this needs.
+pub async fn migrate(url: &str) -> anyhow::Result<()> {
+    let mut conn = PgConnection::connect_with(&migrate_connect_options(url)?).await?;
+    sqlx::migrate!("./migrations").run(&mut conn).await?;
     Ok(())
+}
+
+/// The connect options [`migrate`] runs on — split out so a test can open a
+/// connection with these exact settings without going through a real migration.
+fn migrate_connect_options(url: &str) -> anyhow::Result<PgConnectOptions> {
+    Ok(PgConnectOptions::from_str(url)?
+        .options([("lock_timeout", "3s"), ("statement_timeout", "0")]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{migrate_connect_options, PgConnection};
+    use sqlx::Connection;
+    use std::time::{Duration, Instant};
+
+    /// JEF-580/590: a migration that can't get the lock it needs must abort within
+    /// `lock_timeout`, not queue behind the holder and head-of-line-block the
+    /// table. Proven at the connection level per the ticket (no real migration
+    /// file needed): a competing transaction takes an ACCESS EXCLUSIVE lock on a
+    /// throwaway table, and a trivial DDL statement on a connection configured
+    /// exactly like `migrate`'s must fail fast with a lock_timeout error rather
+    /// than hang for the test's duration.
+    #[tokio::test]
+    async fn migrate_connection_aborts_fast_on_a_held_lock() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+
+        // Holds a conflicting lock on a throwaway table until we roll it back below.
+        let mut blocker = PgConnection::connect(&url).await.expect("connect blocker");
+        sqlx::query("CREATE TABLE IF NOT EXISTS jef_590_lock_test (id int)")
+            .execute(&mut blocker)
+            .await
+            .expect("create throwaway table");
+        sqlx::query("BEGIN")
+            .execute(&mut blocker)
+            .await
+            .expect("begin");
+        sqlx::query("LOCK TABLE jef_590_lock_test IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut blocker)
+            .await
+            .expect("lock");
+
+        // A connection with exactly migrate()'s settings, attempting a trivial DDL
+        // against the table the blocker holds locked.
+        let opts = migrate_connect_options(&url).expect("connect options");
+        let mut migrate_conn = PgConnection::connect_with(&opts)
+            .await
+            .expect("connect migrate-style");
+
+        let start = Instant::now();
+        let result = sqlx::query("ALTER TABLE jef_590_lock_test ADD COLUMN probe int")
+            .execute(&mut migrate_conn)
+            .await;
+        let elapsed = start.elapsed();
+
+        // Release the lock and clean up regardless of what the assertions below find.
+        let _ = sqlx::query("ROLLBACK").execute(&mut blocker).await;
+        let _ = sqlx::query("DROP TABLE IF EXISTS jef_590_lock_test")
+            .execute(&mut blocker)
+            .await;
+
+        let err = result.expect_err("DDL against a held conflicting lock must error, not hang");
+        assert!(
+            err.to_string().to_lowercase().contains("lock timeout"),
+            "expected a lock_timeout error, got: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "must abort within lock_timeout (3s), took {elapsed:?}"
+        );
+    }
 }
