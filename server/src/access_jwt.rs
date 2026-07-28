@@ -452,6 +452,23 @@ lsCu2w3KPmCX769JvIYnwU8y
     }
 
     #[tokio::test]
+    async fn wrong_algorithm_rejected() {
+        // Classic alg-confusion attempt: sign with HS256 (e.g. treating the RSA
+        // public key material as an HMAC secret) instead of the RS256 the verifier
+        // requires. `Validation::new(Algorithm::RS256)` allowlists only RS256, so
+        // `decode` must reject this by header alone, before any signature check.
+        let v = seeded_verifier().await;
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some(TEST_KID.to_string());
+        let key = EncodingKey::from_secret(TEST_N.as_bytes());
+        let token = encode(&header, &valid_claims(), &key).unwrap();
+        assert!(matches!(
+            v.verify(&token).await,
+            Err(VerifyError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn unknown_kid_rejected() {
         let v = seeded_verifier().await;
         let mut header = Header::new(Algorithm::RS256);
