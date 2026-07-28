@@ -37,6 +37,9 @@ cd server && DATABASE_URL=postgres://watcher:watcher@localhost:5432/watcher carg
 - Rust: run `cargo fmt` + `cargo check` before committing; treat warnings as errors.
 - SQL: **runtime** sqlx queries (no compile-time DB needed). Schema lives in
   `server/migrations/`; add a new numbered file rather than editing old ones.
+  CI lints new migrations for table-locking DDL against the big telemetry
+  tables — see `server/migrations/README.md` for the rules and the
+  `-- lock-ok:<reason>` escape hatch.
 - The server builds `DATABASE_URL` itself; in Kubernetes the password comes from the
   Zalando credential secret and is composed in via `$(PGPASSWORD)` env expansion.
 - The UI calls the API **same-origin** in production (built with `VITE_API_BASE=""`

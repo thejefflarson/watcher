@@ -9,6 +9,20 @@ permissions:
   contents: read
 
 jobs:
+  migrations-lint:
+    # Guardrail (JEF-592): migration 0017 shipped a plain (non-CONCURRENTLY)
+    # CREATE INDEX on a 10.4M-row hot table with nothing flagging it as risky.
+    # This fails the build on that pattern (and a couple of other
+    # table-locking-DDL shapes) in any newly-added migration; see
+    # server/migrations/README.md for the rules and the escape hatch. No
+    # toolchain needed (just POSIX sh/awk), so it doesn't need the self-hosted
+    # runner's rust/postgres setup, but stays on the same runner pool for
+    # consistency with the rest of this workflow.
+    runs-on: watcher-runners
+    steps:
+      - uses: actions/checkout@v7
+      - run: scripts/lint-migrations.sh server/migrations
+
   server:
     # Self-hosted watcher-runners (meshed) so the cargo build uses the shared
     # in-cluster sccache redis. The runners now carry a postgres sidecar (cluster
