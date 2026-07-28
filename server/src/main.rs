@@ -7,8 +7,8 @@ use tracing_subscriber::filter::dynamic_filter_fn;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 use watcher_server::{
-    access_jwt, alerts, app_with_access, db, grpc, mcp, mcp_auth, retention, selflog, selfmon,
-    selftrace,
+    access_jwt, alerts, app_with_access, db, grpc, mcp, mcp_auth, online_ddl, retention, selflog,
+    selfmon, selftrace,
 };
 
 /// Self-instrumentation: capture watcher's own traces **in-process**, tagged
@@ -222,12 +222,26 @@ async fn main() -> anyhow::Result<()> {
         tracing::debug!("MCP server disabled (set WATCHER_MCP_ENABLED=1 to enable /mcp)");
     }
 
+    let listener = tokio::net::TcpListener::bind(&http_bind).await?;
+    tracing::info!("HTTP/OTLP + API on http://{http_bind}");
+
+    // Online-DDL lane (ADR 0021, JEF-580): spawned only now that the listener is
+    // bound and the pod is Ready, so an index build (which can take minutes on a
+    // large table) never blocks boot or /healthz. Fire-and-forget: a failure is
+    // logged, not fatal — reads fall back to whatever index already covers the
+    // query in the meantime.
+    {
+        let database_url = database_url.clone();
+        tokio::spawn(async move {
+            if let Err(e) = online_ddl::run(&database_url).await {
+                tracing::error!("online-DDL lane failed: {e:#}");
+            }
+        });
+    }
+
     let http = {
         let pool = pool.clone();
-        let bind = http_bind.clone();
         async move {
-            let listener = tokio::net::TcpListener::bind(&bind).await?;
-            tracing::info!("HTTP/OTLP + API on http://{bind}");
             axum::serve(listener, app_with_access(pool, access)).await?;
             Ok::<(), anyhow::Error>(())
         }
