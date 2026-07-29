@@ -1113,6 +1113,84 @@ async fn self_telemetry_emits_watcher_ops_metrics() {
     assert!(tbl["series_count"].as_i64().unwrap() >= 2);
 }
 
+#[tokio::test]
+#[serial]
+async fn rollup_vacuum_health_canary_emits_dead_tuple_ratio_and_optional_vm_fraction() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // Seed a row in metric_series_rollups (on-ingest per-series rollups, ADR
+    // 0020). pg_stat_user_tables' n_live_tup/n_dead_tup update as soon as the
+    // stats collector sees the DML, no VACUUM/ANALYZE needed -- but
+    // pg_visibility_map_summary's page-count denominator (pg_class.relpages)
+    // only updates on ANALYZE/VACUUM, so run one to make the VM fraction
+    // deterministic without waiting on autovacuum's naptime.
+    ingest(
+        &app(pool.clone()),
+        gauge_request("checkout.latency", 12.0, now_nanos()),
+    )
+    .await;
+    sqlx::query("ANALYZE metric_series_rollups")
+        .execute(&pool)
+        .await
+        .expect("analyze");
+
+    selfmon::emit_once(&pool).await.expect("emit");
+
+    let router = app(pool.clone());
+    let (status, metrics) = get_json(&router, "/api/metrics?service=watcher").await;
+    assert_eq!(status, StatusCode::OK);
+    let list = metrics.as_array().unwrap();
+
+    let dead_ratio = list
+        .iter()
+        .find(|m| m["name"] == "watcher.db.dead_tuple_ratio")
+        .expect("dead_tuple_ratio present once the table has tuples");
+    let ratio = dead_ratio["last_value"].as_f64().unwrap();
+    assert!((0.0..=1.0).contains(&ratio), "ratio {ratio} out of range");
+
+    // last_autovacuum stays NULL until the autovacuum daemon has actually run
+    // (a manual ANALYZE/VACUUM does not set it) -- the gauge must not fabricate
+    // a value for it rather than skip.
+    assert!(
+        !list
+            .iter()
+            .any(|m| m["name"] == "watcher.db.last_autovacuum_age_seconds"),
+        "must not report an autovacuum age before autovacuum has ever run"
+    );
+
+    // pg_visibility is an optional contrib extension (JEF-594): the app never
+    // creates it itself (it's not "trusted", so it needs superuser -- that's a
+    // cluster-ops concern, not read-only introspection), but exercise the
+    // happy path when the test DB's role can install it, so the extraction
+    // query itself is covered end to end.
+    let vm_extension_available = sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_visibility")
+        .execute(&pool)
+        .await
+        .is_ok();
+    if !vm_extension_available {
+        eprintln!("skipping vm_all_visible_fraction assertion: pg_visibility unavailable");
+        return;
+    }
+    selfmon::emit_once(&pool)
+        .await
+        .expect("emit with pg_visibility");
+    let (status, metrics) = get_json(&router, "/api/metrics?service=watcher").await;
+    assert_eq!(status, StatusCode::OK);
+    let fraction = metrics
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "watcher.db.vm_all_visible_fraction")
+        .expect("vm_all_visible_fraction present once pg_visibility is installed")["last_value"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (0.0..=1.0).contains(&fraction),
+        "fraction {fraction} out of range"
+    );
+}
+
 // --- Self-log instrumentation (JEF-452) ------------------------------------
 
 #[tokio::test]

@@ -217,6 +217,13 @@ const TRACKED_TABLES: [&str; 6] = [
     "alert_rules",
 ];
 
+/// The table the index-only-scan / visibility-map health canary (JEF-594)
+/// watches. The JEF-591 covering index only produces index-only scans while
+/// this high-churn table's visibility map stays current; if autovacuum falls
+/// behind, scans silently degrade to heap fetches and the JEF-548-class
+/// latency returns with no signal until dashboards get slow.
+const ROLLUP_TABLE: &str = "metric_series_rollups";
+
 /// Build the `watcher_*` metric points from cheap catalog/aggregate queries plus
 /// the in-process counters.
 async fn collect_metrics(pool: &PgPool) -> anyhow::Result<Vec<Metric>> {
@@ -353,7 +360,113 @@ async fn collect_metrics(pool: &PgPool) -> anyhow::Result<Vec<Metric>> {
             vec![point(v, &[], nanos)],
         ));
     }
+
+    // Index-only-scan / visibility-map health canary (JEF-594) — see
+    // `ROLLUP_TABLE` doc comment. `pg_stat_user_tables` is always available (no
+    // extension needed); the row is absent only before the catalog's stats have
+    // ever been populated for the table, which shouldn't happen post-migration
+    // but is handled the same way as the other optional gauges above.
+    let vacuum_stats: Option<(i64, i64, Option<f64>)> = sqlx::query_as(
+        "SELECT n_live_tup, n_dead_tup, extract(epoch FROM now() - last_autovacuum)::float8
+         FROM pg_stat_user_tables
+         WHERE schemaname = 'public' AND relname = $1",
+    )
+    .bind(ROLLUP_TABLE)
+    .fetch_optional(pool)
+    .await?;
+    if let Some((live, dead, autovacuum_age)) = vacuum_stats {
+        if let Some(ratio) = dead_tuple_ratio(live, dead) {
+            metrics.push(gauge(
+                "watcher.db.dead_tuple_ratio",
+                "1",
+                vec![point(ratio, &[("table", ROLLUP_TABLE)], nanos)],
+            ));
+        }
+        // NULL until the table's first autovacuum ever runs — skip rather than
+        // reporting a misleading zero (that would read as "just vacuumed").
+        if let Some(age) = autovacuum_age {
+            metrics.push(gauge(
+                "watcher.db.last_autovacuum_age_seconds",
+                "s",
+                vec![point(age, &[("table", ROLLUP_TABLE)], nanos)],
+            ));
+        }
+    }
+
+    // The all-visible fraction needs the `pg_visibility` contrib extension,
+    // which isn't guaranteed to be installed (it's not a "trusted" extension,
+    // so the app's non-superuser role can't `CREATE EXTENSION` it itself even if
+    // it wanted to — installing it is a cluster-ops action, not read-only
+    // introspection). Degrade gracefully: an undefined-function error just means
+    // the extension isn't there, so skip the gauge rather than failing the whole
+    // snapshot; the dead-tuple ratio and autovacuum age above still cover the
+    // canary on their own.
+    match rollup_vm_all_visible_fraction(pool).await {
+        Ok(Some(fraction)) => metrics.push(gauge(
+            "watcher.db.vm_all_visible_fraction",
+            "1",
+            vec![point(fraction, &[("table", ROLLUP_TABLE)], nanos)],
+        )),
+        Ok(None) => {}
+        Err(e) if is_undefined_function(&e) => log_pg_visibility_missing_once(),
+        Err(e) => tracing::warn!("self-telemetry: pg_visibility query failed: {e}"),
+    }
+
     Ok(metrics)
+}
+
+/// `numerator / denominator`, or `None` when `denominator` is zero (an empty
+/// or not-yet-analyzed table) rather than reporting a misleading 0.
+fn safe_ratio(numerator: i64, denominator: i64) -> Option<f64> {
+    (denominator > 0).then(|| numerator as f64 / denominator as f64)
+}
+
+/// Fraction of `ROLLUP_TABLE`'s tuples that are dead — the same quantity
+/// autovacuum's own dead-tuple threshold check watches.
+fn dead_tuple_ratio(n_live_tup: i64, n_dead_tup: i64) -> Option<f64> {
+    safe_ratio(n_dead_tup, n_live_tup + n_dead_tup)
+}
+
+/// Fraction of `ROLLUP_TABLE`'s pages the visibility map marks all-visible —
+/// index-only scans avoid a heap fetch only for these.
+fn vm_all_visible_fraction(all_visible: i64, relpages: i64) -> Option<f64> {
+    safe_ratio(all_visible, relpages)
+}
+
+/// `pg_visibility_map_summary` reads only the visibility-map fork (no heap
+/// I/O), so this is cheap enough for the self-telemetry interval —
+/// deliberately not `pg_visibility()`, which would read every heap page to
+/// cross-check its flag against the VM bit. Errors with SQLSTATE `42883`
+/// (undefined function) when the `pg_visibility` extension isn't installed;
+/// the caller treats that as "unavailable", not a failure.
+async fn rollup_vm_all_visible_fraction(pool: &PgPool) -> Result<Option<f64>, sqlx::Error> {
+    let (all_visible, relpages): (i64, i64) = sqlx::query_as(
+        "SELECT s.all_visible, c.relpages::int8
+         FROM pg_visibility_map_summary($1::regclass) s, pg_class c
+         WHERE c.oid = $1::regclass",
+    )
+    .bind(ROLLUP_TABLE)
+    .fetch_one(pool)
+    .await?;
+    Ok(vm_all_visible_fraction(all_visible, relpages))
+}
+
+fn is_undefined_function(err: &sqlx::Error) -> bool {
+    matches!(err, sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("42883"))
+}
+
+/// Logs the missing-extension notice once per process rather than every
+/// self-telemetry tick.
+fn log_pg_visibility_missing_once() {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            "self-telemetry: pg_visibility extension not installed -- \
+             watcher.db.vm_all_visible_fraction will not be emitted; \
+             watcher.db.dead_tuple_ratio and watcher.db.last_autovacuum_age_seconds \
+             still cover the JEF-594 canary"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -468,4 +581,32 @@ mod tests {
         };
         assert!(!stalled.healthy());
     }
+
+    #[test]
+    fn dead_tuple_ratio_divides_dead_by_total() {
+        // 20 dead out of 100 total tuples → 20%.
+        assert_eq!(dead_tuple_ratio(80, 20), Some(0.2));
+    }
+
+    #[test]
+    fn dead_tuple_ratio_none_when_table_empty() {
+        assert_eq!(dead_tuple_ratio(0, 0), None);
+    }
+
+    #[test]
+    fn vm_all_visible_fraction_divides_by_relpages() {
+        // 45 of 50 pages all-visible → 90%.
+        assert_eq!(vm_all_visible_fraction(45, 50), Some(0.9));
+    }
+
+    #[test]
+    fn vm_all_visible_fraction_none_when_no_pages() {
+        assert_eq!(vm_all_visible_fraction(0, 0), None);
+    }
+
+    // `is_undefined_function` (the SQLSTATE-42883 check) isn't unit-tested with a
+    // mock `DatabaseError` — matching `otlp::is_failover_error`, its peer
+    // SQLSTATE-classifying helper, which is likewise only exercised against a
+    // real Postgres error in an integration test rather than a hand-rolled
+    // trait impl. See `rollup_vacuum_health_canary_*` in tests/smoke.rs.
 }
