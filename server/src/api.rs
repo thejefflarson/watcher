@@ -513,17 +513,42 @@ pub async fn metric_series(
     Ok(Json(query_metric_series(&pool, q).await.map_err(internal)?))
 }
 
+/// Hard ceiling (hours) on `query_metric_series`'s window, sourced from
+/// `WATCHER_RETENTION_DAYS` (JEF-593) — the same knob `retention::prune_once`
+/// prunes `metric_series_rollups` against — rather than a hard-wired constant,
+/// so raising retention widens the queryable window without a code change.
+/// Falls back to the sibling facet/histogram/hist_facet queries' fixed
+/// `24 * 7` ceiling both when unset/unparsable and when retention is disabled
+/// (`<= 0`), since a disabled sweep prunes nothing and shouldn't be read as an
+/// unbounded scan window.
+fn metric_series_max_hours() -> i32 {
+    parse_retention_max_hours(std::env::var("WATCHER_RETENTION_DAYS").ok().as_deref())
+}
+
+/// Pure helper behind `metric_series_max_hours()`, extracted so it can be
+/// unit-tested without mutating process-global env state.
+fn parse_retention_max_hours(raw: Option<&str>) -> i32 {
+    match raw.and_then(|s| s.parse::<i32>().ok()) {
+        Some(days) if days > 0 => days * 24,
+        _ => 24 * 7,
+    }
+}
+
 /// One metric's collapsed time series, shared by the HTTP handler and the MCP
 /// `metric_series` tool. Applies the same hours clamp, and honors an absolute
-/// `from`/`to` window when given (see `SeriesQuery`). The 90-day ceiling here is
-/// deliberate (JEF-561): the covering index (JEF-548) makes the read itself
-/// cheap, and the adaptive output bucket below keeps the *result* bounded
-/// regardless of window width, so there's no remaining cost to widening it.
+/// `from`/`to` window when given (see `SeriesQuery`). The ceiling used to be a
+/// flat 90 days on the theory that the covering index (JEF-548) makes the read
+/// cheap and the adaptive output bucket below keeps the *result* bounded
+/// regardless of window width — but `metric_series_rollups` is itself pruned at
+/// `WATCHER_RETENTION_DAYS` (default 7), so anything past that structurally
+/// holds no rows: widening the scan range there was pure waste. Capped to
+/// `metric_series_max_hours()` instead (JEF-593), which tracks retention.
 pub async fn query_metric_series(
     pool: &PgPool,
     q: SeriesQuery,
 ) -> Result<Vec<SeriesPoint>, sqlx::Error> {
-    let (lo, hi, width) = resolve_window_and_width(q.hours, 24, 24 * 90, q.from, q.to);
+    let (lo, hi, width) =
+        resolve_window_and_width(q.hours, 24, metric_series_max_hours(), q.from, q.to);
     sqlx::query_as::<_, SeriesPoint>(
         "SELECT metric_bucket(bucket, $5) AS t, sum(sum) / nullif(sum(count), 0) AS v
          FROM metric_series_rollups
@@ -1464,6 +1489,56 @@ mod tests {
     #[test]
     fn parse_max_lookback_hours_leaves_in_range_value_unchanged() {
         assert_eq!(parse_max_lookback_hours(Some("48")), 48);
+    }
+
+    // JEF-593: at the default 7-day retention, the series ceiling must match
+    // the sibling facet/histogram/hist_facet queries' fixed `24 * 7` — the old
+    // 90-day ceiling scanned 83 days of range that retention had already
+    // pruned to nothing.
+    #[test]
+    fn parse_retention_max_hours_matches_sibling_ceiling_at_default_retention() {
+        assert_eq!(parse_retention_max_hours(None), 24 * 7);
+    }
+
+    #[test]
+    fn parse_retention_max_hours_tracks_a_non_default_retention() {
+        assert_eq!(parse_retention_max_hours(Some("3")), 24 * 3);
+        assert_eq!(parse_retention_max_hours(Some("30")), 24 * 30);
+    }
+
+    // A disabled sweep (`<= 0`) prunes nothing, but must not be read as license
+    // to scan an unbounded range — fall back to the sibling ceiling instead.
+    #[test]
+    fn parse_retention_max_hours_falls_back_to_sibling_ceiling_when_retention_disabled() {
+        assert_eq!(parse_retention_max_hours(Some("0")), 24 * 7);
+        assert_eq!(parse_retention_max_hours(Some("-1")), 24 * 7);
+    }
+
+    #[test]
+    fn parse_retention_max_hours_falls_back_to_sibling_ceiling_when_invalid() {
+        assert_eq!(parse_retention_max_hours(Some("not a number")), 24 * 7);
+    }
+
+    // Acceptance criterion: a >retention window request is clamped to the
+    // retention bound, exactly like JEF-532's absolute-window clamp test above
+    // — but driven by the retention-derived ceiling instead of a literal.
+    #[test]
+    fn resolve_window_clamps_series_window_to_retention_ceiling() {
+        let hi = Utc::now();
+        let from = hi - Duration::days(90);
+        let (lo, resolved_hi) = resolve_window(
+            None,
+            24,
+            parse_retention_max_hours(None),
+            Some(from),
+            Some(hi),
+        );
+        assert_eq!(resolved_hi, hi);
+        assert_eq!(
+            lo,
+            hi - Duration::hours(24 * 7),
+            "a 90-day span should be clamped down to the 7-day retention ceiling"
+        );
     }
 
     // JEF-561: a narrow window (well under TARGET_POINTS * base) must collapse
