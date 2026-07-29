@@ -740,16 +740,17 @@ async fn metric_series_honors_absolute_from_to_window() {
     assert_eq!(buckets[0]["counts"], serde_json::json!([0, 5, 0]));
 }
 
-/// The series endpoint's window can be up to 90 days wide (`resolve_window`'s
-/// `max_hours` for `/api/metrics/series`, JEF-548) — this is the query whose
-/// wide-window rollup scan was traced holding a pool connection for tens of
-/// seconds (the fix: a covering index on `metric_series_rollups`, migration
-/// 0017). This doesn't benchmark the index directly (no way to force a plan
-/// choice through the HTTP API), but it does pin the behavior the index must
-/// not change: a request at the 90-day ceiling returns exactly the points
-/// inside that window — none dropped, none leaked in from just outside it —
-/// so a future change to the index or the query can't silently narrow or
-/// widen what's returned.
+/// The series endpoint's window is capped at the retention-derived ceiling
+/// (`resolve_window`'s `max_hours` for `/api/metrics/series` — `24 * 7` at the
+/// default `WATCHER_RETENTION_DAYS`, JEF-593; previously a flat 90 days,
+/// JEF-548). Originally the query whose wide-window rollup scan was traced
+/// holding a pool connection for tens of seconds (the fix: a covering index on
+/// `metric_series_rollups`, migration 0017). This doesn't benchmark the index
+/// directly (no way to force a plan choice through the HTTP API), but it does
+/// pin the behavior the index must not change: a request at (or past) the
+/// 7-day ceiling returns exactly the points inside that window — none
+/// dropped, none leaked in from just outside it — so a future change to the
+/// index or the query can't silently narrow or widen what's returned.
 #[tokio::test]
 #[serial]
 async fn metric_series_wide_window_returns_bounded_correct_points() {
@@ -758,13 +759,14 @@ async fn metric_series_wide_window_returns_bounded_correct_points() {
         return;
     };
     let day = 86_400.0;
-    insert_rollup_at(&pool, "wide.metric", 89.0 * day).await;
-    insert_rollup_at(&pool, "wide.metric", 45.0 * day).await;
-    insert_rollup_at(&pool, "wide.metric", 10.0 * day).await;
-    // Just past the 90-day ceiling: must be excluded, not silently included.
-    insert_rollup_at(&pool, "wide.metric", 91.0 * day).await;
+    insert_rollup_at(&pool, "wide.metric", 6.0 * day).await;
+    insert_rollup_at(&pool, "wide.metric", 3.0 * day).await;
+    insert_rollup_at(&pool, "wide.metric", 1.0 * day).await;
+    // Just past the 7-day ceiling: must be excluded, not silently included.
+    insert_rollup_at(&pool, "wide.metric", 8.0 * day).await;
 
     let router = app(pool);
+    // Requests far past the ceiling (2160h = 90d) must still clamp to it.
     let (status, series) =
         get_json(&router, "/api/metrics/series?name=wide.metric&hours=2160").await;
     assert_eq!(status, StatusCode::OK);
@@ -772,26 +774,27 @@ async fn metric_series_wide_window_returns_bounded_correct_points() {
     assert_eq!(
         arr.len(),
         3,
-        "the 91-day-old point is outside the 90-day window, series = {arr:?}"
+        "the 8-day-old point is outside the 7-day window, series = {arr:?}"
     );
     for point in arr {
         assert_eq!(point["v"], 1.0);
     }
-    // Ascending by time — oldest (89d) first, newest (10d) last.
+    // Ascending by time — oldest (6d) first, newest (1d) last.
     let times: Vec<&str> = arr.iter().map(|p| p["t"].as_str().unwrap()).collect();
     let mut sorted = times.clone();
     sorted.sort();
     assert_eq!(times, sorted, "points must be ordered t ASC");
 }
 
-/// JEF-561: at the 90-day ceiling the adaptive output bucket widens from the
-/// base 300s rollup bucket to `300 * ceil((2160h in secs / 300) / 1000) = 7800s`
-/// (see `output_bucket_secs`'s unit tests for that math) — a chart gets ~1000
-/// points instead of ~26k. This pins that the widening re-aggregates rollup
-/// rows *correctly*: two rows placed well inside the same 7800s output bucket
-/// must collapse into one point whose value is the count-weighted average of
-/// both (not a plain average), while a row a full bucket-width away stays its
-/// own point, unmerged.
+/// JEF-561/JEF-593: at the (now retention-derived) 7-day ceiling the adaptive
+/// output bucket widens from the base 300s rollup bucket to
+/// `300 * ceil((168h in secs / 300) / 1000) = 900s` (see `output_bucket_secs`'s
+/// unit tests for that math) — a chart gets bounded output instead of one
+/// point per raw rollup bucket. This pins that the widening re-aggregates
+/// rollup rows *correctly*: two rows placed well inside the same 900s output
+/// bucket must collapse into one point whose value is the count-weighted
+/// average of both (not a plain average), while a row a full bucket-width
+/// away stays its own point, unmerged.
 #[tokio::test]
 #[serial]
 async fn metric_series_wide_window_reaggregates_merged_buckets_correctly() {
@@ -799,11 +802,11 @@ async fn metric_series_wide_window_reaggregates_merged_buckets_correctly() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    const WIDTH: f64 = 7800.0;
+    const WIDTH: f64 = 900.0;
     let now_epoch = chrono::Utc::now().timestamp() as f64;
-    // A bucket safely inside the 90-day window (well clear of "now" and of the
-    // 91-day exclusion edge exercised by the sibling test above).
-    let bucket_start = ((now_epoch - 5.0 * 86_400.0) / WIDTH).floor() * WIDTH;
+    // A bucket safely inside the 7-day window (well clear of "now" and of the
+    // ceiling edge exercised by the sibling test above).
+    let bucket_start = ((now_epoch - 3.5 * 86_400.0) / WIDTH).floor() * WIDTH;
     let secs_ago_at = |frac: f64| now_epoch - (bucket_start + WIDTH * frac);
 
     // Two rows well inside the same output bucket (30%/60% across it — a wide
