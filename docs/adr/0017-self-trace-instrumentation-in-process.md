@@ -12,12 +12,12 @@ watcher self-instruments its own **metrics** (ADR 0014) and **logs** (ADR 0016)
 original network path: an `opentelemetry-otlp` batch `SpanExporter` POSTing OTLP over
 HTTP back to watcher's own `:4318/v1/traces`.
 
-That path was **dead** (JEF-462). The batch processor had wedged into a shut-down
+That path was **dead**. The batch processor had wedged into a shut-down
 state and logged "Spans are being emitted even after Shutdown ... Spans will not be
 exported" on every span. Evidence from prod: **0** watcher spans in the `spans` table
 ever, while self-metrics and self-logs (in-process) worked; and ~74.8k of the ~75.1k
 self-log rows were *that one warning* — the broken exporter flooding the `logs` table
-via the JEF-452 self-log capture. Consequences: watcher never appeared in the Services
+via the self-log capture. Consequences: watcher never appeared in the Services
 pulldown (`/api/services` reads `spans`), no self-traces to correlate, and ~75k junk
 rows.
 

@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-07-22
 - Related: [0013](0013-auth-at-the-edge.md) (edge auth + origin verify), [0018](0018-read-only-mcp-server-in-process.md) (the read-only MCP server)
-- Revises: the initial JEF-472 design recorded in this ADR (raw-`Bearer` JWT validation + self-served OAuth metadata), superseded by JEF-493.
+- Revises: the initial design recorded in this ADR (raw-`Bearer` JWT validation + self-served OAuth metadata), superseded by the spike finding below.
 
 ## Context
 
@@ -20,19 +20,19 @@ the client obtains a token from an authorization server and presents it; the res
 server validates it. The open question was *who is the authorization server* and *what
 does the origin actually receive*.
 
-**Initial design (JEF-472, now revised).** The first cut had watcher itself act as the
+**Initial design (now revised).** The first cut had watcher itself act as the
 OAuth-aware resource server: it validated the raw `Authorization: Bearer <token>` as a
 Cloudflare Access **OIDC** JWT and *self-served* the RFC 9728 protected-resource
 metadata (`/.well-known/oauth-protected-resource`) pointing clients at the Access OIDC
 authorization server.
 
-**Spike finding (JEF-493).** The mechanism Cloudflare actually provides for this is
+**Spike finding.** The mechanism Cloudflare actually provides for this is
 Access **Managed OAuth**: Cloudflare is the OAuth authorization server the client needs
 (including the dynamic client registration — DCR — that claude.ai's connector performs),
 it issues the client an **opaque** access token, resolves that token at its **edge**,
 and forwards the origin the standard **`Cf-Access-Jwt-Assertion`** JWT — the *same*
-header, issuer, and team JWKS that `/api` already validates (JEF-473). Under this model
-the JEF-472 design is wrong in two ways: the origin would receive an *opaque* token in
+header, issuer, and team JWKS that `/api` already validates (ADR 0013). Under this model
+the initial design above is wrong in two ways: the origin would receive an *opaque* token in
 `Authorization: Bearer` (not a JWT — it would fail JWT validation), and OAuth
 discovery/metadata is owned by Cloudflare, not the origin.
 
@@ -43,7 +43,7 @@ discovery/metadata is owned by Cloudflare, not the origin.
   edge sets after resolving the client's opaque Managed-OAuth token — via the shared
   [`access_jwt::Verifier`](../../server/src/access_jwt.rs) (RS256 via the team's JWKS,
   `iss` = team domain, `aud`, and expiry). This is the **same** assertion model as
-  JEF-473's `/api` `access_guard`; the header-extraction + verify step is factored into
+  ADR 0013's `/api` `access_guard`; the header-extraction + verify step is factored into
   one shared `check_access_assertion` helper both guards call. The origin only ever
   **validates**, never mints (the [0013](0013-auth-at-the-edge.md) invariant), and never
   parses the opaque OAuth token.

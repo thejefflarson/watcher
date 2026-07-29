@@ -111,8 +111,8 @@ export interface SeriesPoint {
 }
 
 // `from`/`to` (RFC3339) render an exact absolute window instead of the
-// hours-back-from-now default — e.g. "metrics around this trace"
-// (JEF-433). Either may be omitted; an omitted end falls back to the
+// hours-back-from-now default — e.g. "metrics around this trace".
+// Either may be omitted; an omitted end falls back to the
 // hours-relative bound.
 export const getMetricSeries = (p: {
   name: string;
@@ -152,7 +152,7 @@ export interface FacetResponse {
 export const getMetricFacet = (p: { name: string; hours?: number; from?: string; to?: string }) =>
   get<FacetResponse>(`/api/metrics/facet?${qs(p)}`);
 
-// Raw points that carry a sampled trace exemplar (JEF-433) — a chart overlays
+// Raw points that carry a sampled trace exemplar — a chart overlays
 // these as markers linking to the exact trace. Only ever covers the raw-metric
 // retention window (a few hours); older points never have exemplars, by design
 // (rollups aggregate them away). Correlational, not causal.

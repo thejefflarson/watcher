@@ -1,4 +1,4 @@
-//! watcher self-monitoring (JEF-425): operational gauges + counters about
+//! watcher self-monitoring (ADR 0014): operational gauges + counters about
 //! watcher's own health, plus the deep `/healthz` computation.
 //!
 //! The ops metrics are handed straight to [`crate::otlp::store_metrics`] rather
@@ -217,11 +217,11 @@ const TRACKED_TABLES: [&str; 6] = [
     "alert_rules",
 ];
 
-/// The table the index-only-scan / visibility-map health canary (JEF-594)
-/// watches. The JEF-591 covering index only produces index-only scans while
-/// this high-churn table's visibility map stays current; if autovacuum falls
-/// behind, scans silently degrade to heap fetches and the JEF-548-class
-/// latency returns with no signal until dashboards get slow.
+/// The table the index-only-scan / visibility-map health canary watches. The
+/// covering index only produces index-only scans while this high-churn
+/// table's visibility map stays current; if autovacuum falls behind, scans
+/// silently degrade to heap fetches and the same class of latency regression
+/// returns with no signal until dashboards get slow.
 const ROLLUP_TABLE: &str = "metric_series_rollups";
 
 /// Build the `watcher_*` metric points from cheap catalog/aggregate queries plus
@@ -361,7 +361,7 @@ async fn collect_metrics(pool: &PgPool) -> anyhow::Result<Vec<Metric>> {
         ));
     }
 
-    // Index-only-scan / visibility-map health canary (JEF-594) — see
+    // Index-only-scan / visibility-map health canary — see
     // `ROLLUP_TABLE` doc comment. `pg_stat_user_tables` is always available (no
     // extension needed); the row is absent only before the catalog's stats have
     // ever been populated for the table, which shouldn't happen post-migration
@@ -464,7 +464,7 @@ fn log_pg_visibility_missing_once() {
             "self-telemetry: pg_visibility extension not installed -- \
              watcher.db.vm_all_visible_fraction will not be emitted; \
              watcher.db.dead_tuple_ratio and watcher.db.last_autovacuum_age_seconds \
-             still cover the JEF-594 canary"
+             still cover the index-only-scan health canary"
         );
     }
 }

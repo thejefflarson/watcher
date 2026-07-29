@@ -339,7 +339,7 @@ tr.clickable:hover td {
 }
 
 /* Error spans carry the red into the label too, not just the bar — legible
-   at a glance without hunting across the row (JEF-432). */
+   at a glance without hunting across the row. */
 .bar-label.err {
   color: var(--error);
 }
@@ -494,7 +494,7 @@ a.xlink:hover,
   font-size: 10px;
 }
 
-/* Exemplar markers (JEF-433): a hollow ring, ink on hover/focus — data-colored
+/* Exemplar markers: a hollow ring, ink on hover/focus — data-colored
    like everything else in the chart, not a decorative accent. */
 .exemplar-dot {
   fill: var(--bg);
@@ -609,7 +609,7 @@ button.range.active {
   padding: 0.2rem 0;
 }
 
-/* JEF-430 — alerts view: firing badge, clickable rules, breach strip. */
+/* Alerts view: firing badge, clickable rules, breach strip. */
 
 /* Nav firing count: colored text (not a pill), per ADR 0009. */
 .firing-count {
@@ -624,7 +624,7 @@ button.range.active {
 }
 
 /* Rules deep-link to their metric chart via a primary-cell <Link className="rowlink">
-   (JEF-443, matching TraceList/Services/MetricList); the row hover-scent comes from
+   (matching TraceList/Services/MetricList); the row hover-scent comes from
    the shared tr.clickable rule. */
 
 /* Per-rule breach small-multiple: red ticks on a hairline baseline. */
@@ -644,7 +644,7 @@ button.range.active {
   white-space: nowrap;
   border: 0;
 }
-/* ── JEF-431: accessibility floor ──────────────────────────────────────────
+/* ── Accessibility floor ────────────────────────────────────────────────────
    Keyboard-operable rows/nodes, one ink focus ring, a polite status line. This
    block is grouped + appended so it 3-way-merges cleanly alongside other work. */
 

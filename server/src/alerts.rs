@@ -314,7 +314,7 @@ fn agg_expr(agg: &str) -> &'static str {
 /// a per-second rate *before* aggregating, reset-safe like `/api/metrics/facet`:
 /// a level that drops (counter reset) yields 0 for that interval, never a spike.
 ///
-/// `agg == "increase"` is a third, self-contained shape (JEF-463): "how much did
+/// `agg == "increase"` is a third, self-contained shape: "how much did
 /// this monotonic counter go up within the window", e.g. "container restarted >N
 /// times in the last 10m" rather than `max` of its lifetime total (which never
 /// resolves once a pod has ever restarted a lot). It reuses the same per-series
@@ -328,7 +328,7 @@ fn agg_expr(agg: &str) -> &'static str {
 /// it's what "increase" means, so `agg_expr` (avg/max/min/sum/last) never applies.
 fn eval_sql(agg: &str, rate: bool) -> String {
     // Residual JSONB predicates ride on top of the (name, time) index narrowing;
-    // a NULL operand disables its clause so pre-JEF-426 rules are unaffected.
+    // a NULL operand disables its clause so rules that predate this feature are unaffected.
     let filtered = "SELECT time, service, attributes, value
              FROM metrics
              WHERE name = $1
@@ -617,16 +617,17 @@ async fn fire(
 /// Ceiling on each sink's *total* delivery time inside `notify()`. This is
 /// distinct from — and layered on top of — each sink's own per-operation
 /// bound (the reqwest client's `.timeout(10s)` and `Mailer`'s
-/// `.timeout(Some(10s))`, both from JEF-497): lettre's SMTP timeout only
+/// `.timeout(Some(10s))`): lettre's SMTP timeout only
 /// bounds each individual network operation in the conversation (connect,
 /// EHLO, MAIL, RCPT, DATA, body, QUIT, ...), not the conversation as a whole.
 /// A relay that's slow-but-responsive at every step can still sum well past
 /// that per-step bound — this is what left `alert.notify` spans at ~12s even
-/// after JEF-497 (error_count=0: it was delivering, just slowly). Wrapping
+/// with that per-operation bound in place (error_count=0: it was delivering,
+/// just slowly). Wrapping
 /// each sink's whole send in this timeout bounds its total regardless of how
 /// many round trips the underlying protocol takes. For the webhook this is
-/// redundant with reqwest's own total timeout (defense-in-depth, per the
-/// ticket); for SMTP it's the actual fix.
+/// redundant with reqwest's own total timeout (defense-in-depth); for SMTP
+/// it's the actual fix.
 const NOTIFY_SINK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Log and notify a firing/resolved transition on every configured sink.
@@ -776,7 +777,7 @@ mod tests {
 
     #[test]
     fn validate_accepts_increase_agg() {
-        // JEF-463: "restarts increased by >N in window_secs" — a rule keying on
+        // "restarts increased by >N in window_secs" — a rule keying on
         // window delta rather than lifetime level must validate like any other agg.
         assert!(validate(&cfg("crashlooping", "gt", "increase")).is_ok());
     }
@@ -903,7 +904,7 @@ mod tests {
 
     #[test]
     fn config_defaults_new_fields_to_none() {
-        // A pre-JEF-426 rule (none of the new keys) parses with them all absent.
+        // An older rule config (none of the new keys) parses with them all absent.
         let r = &serde_json::from_str::<Vec<RuleConfig>>(
             r#"[{"name":"r","metric":"m","comparator":"gt","threshold":1}]"#,
         )
@@ -1010,8 +1011,8 @@ mod tests {
     // A fake SMTP relay that is slow but never hangs: it answers every step of the
     // conversation (greeting, EHLO, MAIL, RCPT, DATA, body) after `step_delay`,
     // never leaving a single read/write outstanding for long. This is exactly the
-    // JEF-537 scenario — lettre's per-operation SMTP timeout never trips because
-    // no single step is slow, but the *sum* of six such steps blows past the
+    // scenario `NOTIFY_SINK_TIMEOUT` guards against — lettre's per-operation SMTP
+    // timeout never trips because no single step is slow, but the *sum* of six such steps blows past the
     // total notify budget. Uses `builder_dangerous` (plaintext, no STARTTLS/AUTH)
     // so the conversation is short enough to hand-roll deterministically. Any I/O
     // error (most likely the client giving up once its own timeout fires) just
@@ -1115,7 +1116,7 @@ mod tests {
 
     #[test]
     fn eval_sql_increase_sums_reset_safe_positive_steps() {
-        // JEF-463: window-increase of a monotonic counter, not its lifetime `max`.
+        // Window-increase of a monotonic counter, not its lifetime `max`.
         // `rate` is irrelevant to this agg — pass both to confirm it's ignored.
         for rate in [false, true] {
             let sql = eval_sql("increase", rate);

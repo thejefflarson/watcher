@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   migrations-lint:
-    # Guardrail (JEF-592): migration 0017 shipped a plain (non-CONCURRENTLY)
+    # Guardrail: migration 0017 shipped a plain (non-CONCURRENTLY)
     # CREATE INDEX on a 10.4M-row hot table with nothing flagging it as risky.
     # This fails the build on that pattern (and a couple of other
     # table-locking-DDL shapes) in any newly-added migration; see
@@ -37,7 +37,7 @@ jobs:
       # Secret via envFrom, so none of it belongs in this workflow and no credential is
       # committed here.
       #
-      # The redis backend is deliberately NOT set here any more (JEF-564): sccache selects
+      # The redis backend is deliberately NOT set here any more: sccache selects
       # ONE backend from its env, so setting both would make which one you get an
       # implementation detail of sccache's precedence -- the R2 cutover could read as done
       # while every build still went to redis. If the pod env is missing, sccache degrades
@@ -98,10 +98,10 @@ jobs:
           cache: npm
           cache-dependency-path: ui/package-lock.json
       - run: npm ci
-      # Accessibility floor (JEF-431): eslint-plugin-jsx-a11y gates keyboard-
+      # Accessibility floor: eslint-plugin-jsx-a11y gates keyboard-
       # operable rows, labeled charts, and no silent-live tables from regressing.
       - run: npm run lint
-      # Runtime a11y route-smoke (JEF-442) runs inside `npm test`: each top-level
+      # Runtime a11y route-smoke runs inside `npm test`: each top-level
       # route is mounted (jsdom, API mocked) and scanned by axe-core, failing on
       # serious/critical structural violations. Complements the static lint above —
       # it catches ARIA that only resolves against the rendered tree.
@@ -183,8 +183,8 @@ jobs:
           # cargo-chef the dep-compile layer cache-hits here until Cargo.lock moves,
           # so a cold node skips it. mode=max also caches intermediate (build-stage)
           # layers, which is what carries the cook layer — at the cost of a larger
-          # WAN transfer (see JEF-87 / measure in JEF-82).
-          # sccache's R2 backend for the in-image cargo build (JEF-584, ADR-0020).
+          # WAN transfer (measured in practice against the alternative).
+          # sccache's R2 backend for the in-image cargo build (ADR-0020).
           # `secret-envs` (key=envname) reads these straight out of the RUNNER POD's
           # env, where the `sccache-r2` Secret is injected via envFrom (cluster repo:
           # charts/actions/runners/values-watcher.yaml) — the repo has no Actions secret

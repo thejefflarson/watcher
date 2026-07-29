@@ -7,7 +7,7 @@
 ## Context
 
 watcher had no visibility into its own health. A silently stalled retention sweep let
-the `metrics` table grow to tens of GB un-paged (JEF-425). We want watcher's own
+the `metrics` table grow to tens of GB un-paged. We want watcher's own
 operational signals (ingest throughput, drop counts, per-table on-disk bytes,
 retention recency, rollup lag, pool utilisation) to be visible and alertable — using
 the machinery watcher already has, on a Raspberry Pi, in a single binary.

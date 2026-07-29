@@ -23,7 +23,7 @@ export default function TraceList({ to }: { to: (traceId: string) => string }) {
   const [errorsOnly, setErrorsOnly] = useState(false);
   const [minDuration, setMinDuration] = useState("");
   // An absolute `?from=&to=` (e.g. a metric chart's "traces in this window" deep
-  // link, JEF-433) overrides the picker's relative range so a chart's exact
+  // link) overrides the picker's relative range so a chart's exact
   // moment is reachable even for a window the picker's presets can't express.
   const [urlParams] = useSearchParams();
   const absFrom = urlParams.get("from");

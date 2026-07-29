@@ -7,7 +7,7 @@ export const shortKey = (k: string) => k.replace(/^k8s\./, "");
 // (e.g. system.cpu.load_average, k8s.container.restarts) carries both the collector
 // agent's identity AND the node/container it describes; label by the latter. Without
 // this ordering the first ≤3 varying keys could pick an agent key ahead of the node,
-// mislabeling every series by the reporting agent instead of the node (JEF-494).
+// mislabeling every series by the reporting agent instead of the node.
 const IDENTITY_PRIORITY = [
   "k8s.node.name",
   "host.name",

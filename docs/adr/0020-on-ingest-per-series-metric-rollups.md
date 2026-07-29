@@ -29,8 +29,8 @@ writes the raw point — there is no background sweep and no `rollup.rs`.
   via `ON CONFLICT (name, series_key, bucket) DO UPDATE`, accumulating
   `count`/`sum`/`min`/`max`/`avg` (and, for histograms, `bucket_bounds` /
   `bucket_counts`, summed element-wise by the `array_sum` aggregate from
-  `array_add`). The whole batch write goes through `write_with_failover_retry`
-  (JEF-496), so a Patroni failover retries the statement on a fresh connection.
+  `array_add`). The whole batch write goes through `write_with_failover_retry`,
+  so a Patroni failover retries the statement on a fresh connection.
 - **Series identity is preserved, not collapsed.** `series_key` is
   `metric_series_key(service, attrs)` — `md5(coalesce(service,'') || '|' ||
   attrs::text)` (`0009_metric_sql_helpers.sql`) — a stable hash of the service plus
@@ -80,7 +80,7 @@ current, still-filling bucket.
   highest-volume table (see `retention.rs`'s batched delete, added after it once
   grew to tens of GB unpruned).
 - The extra aggregation work (`GROUP BY` + upsert) now happens inline on every
-  ingest batch rather than off-peak; batching (JEF-495) and the fixed lock order
+  ingest batch rather than off-peak; batching and the fixed lock order
   keep it from becoming an ingest bottleneck, but it does mean ingest latency and
   rollup-write cost are coupled.
 - Still the same trend-off as [0011](0011-metric-rollups.md): history beyond the

@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-05-30
-- Amended: 2026-07-21 (JEF-473 — add origin-side Access JWT verification)
+- Amended: 2026-07-21 (add origin-side Access JWT verification)
 - Supersedes: [0008](0008-optional-bearer-auth.md)
 
 ## Context
@@ -39,7 +39,7 @@ the chart's token Secret are all gone.
 - For environments without Cloudflare, equivalent edge auth (Traefik forwardAuth +
   an SSO proxy) is the substitute; the app deliberately holds no auth of its own.
 
-## Amendment — origin-side Access JWT verification (JEF-473, 2026-07-21)
+## Amendment — origin-side Access JWT verification (2026-07-21)
 
 Edge-only auth trusts that every request to `/api` and the UI arrived through Access.
 An Access-policy slip, a tunnel/ingress misconfig, or direct in-cluster access to the

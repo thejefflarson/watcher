@@ -16,9 +16,9 @@ advisory lock for the whole run. That makes it the wrong place for heavy or
 non-transactional DDL, and we hit **both** failure modes on `metric_series_rollups`
 (~10.4M rows / 5.8 GB in production):
 
-- **JEF-548 (first attempt):** `CREATE INDEX CONCURRENTLY` cannot run inside a
+- **First attempt:** `CREATE INDEX CONCURRENTLY` cannot run inside a
   transaction and deadlocked against the migrator's advisory lock.
-- **JEF-580 (second attempt):** a plain, transactional `CREATE INDEX` took a `SHARE`
+- **Second attempt:** a plain, transactional `CREATE INDEX` took a `SHARE`
   lock on the table and ran past the pool's 60 s `statement_timeout`, so every boot's
   migration was cancelled → CrashLoopBackOff, and each attempt re-locked the table and
   stalled cluster-wide OTLP ingest for ~25 minutes until the index was built by hand

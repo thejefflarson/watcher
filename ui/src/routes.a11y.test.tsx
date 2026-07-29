@@ -1,6 +1,6 @@
-// Runtime a11y route-smoke (JEF-442).
+// Runtime a11y route-smoke.
 //
-// JEF-431 gave us the STATIC a11y floor (eslint-plugin-jsx-a11y). This is the
+// The eslint config gives us the STATIC a11y floor (eslint-plugin-jsx-a11y). This is the
 // RUNTIME counterpart: mount each top-level route with a mocked API so it renders
 // its loaded state, then run axe-core over the rendered tree. Static linting can't
 // see ARIA that only resolves against the live tree, focus/role structure of a
@@ -17,7 +17,7 @@
 //
 // The assertion is on axe violations by IMPACT, never on specific role/element
 // markup, so it stays green regardless of in-flight row-markup changes (e.g.
-// JEF-443's Alerts row rework).
+// the Alerts row rework).
 import { describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
@@ -275,9 +275,9 @@ describe("runtime axe route smoke", () => {
   it("service map has no serious/critical a11y violations", async () => {
     const { container } = render(renderAt("/map"));
     // The map is an <svg role="group"> labelled with the node/edge/call counts —
-    // a grouping, NOT role="img", so its focusable node-buttons (JEF-431) are
+    // a grouping, NOT role="img", so its focusable node-buttons are
     // legitimately interactive children. This resolves the pre-existing
-    // `nested-interactive` violation that role="img" caused (JEF-455), so the
+    // `nested-interactive` violation that role="img" caused, so the
     // rule is now enforced here too — no per-route waiver.
     await screen.findByRole("group", { name: /Service map/ });
     await expectNoBlockingViolations(container);
@@ -286,8 +286,8 @@ describe("runtime axe route smoke", () => {
   it("alerts has no serious/critical a11y violations", async () => {
     const { container } = render(renderAt("/alerts"));
     // Alerts renders two tables (rules + recent events); wait for them, then
-    // assert on axe impact — not on the row markup. JEF-443 reworks these rows in
-    // parallel, so this must pass whichever version of Alerts.tsx is on main.
+    // assert on axe impact — not on the row markup, so this passes regardless
+    // of markup changes to Alerts.tsx.
     await screen.findAllByRole("table");
     await expectNoBlockingViolations(container);
   });

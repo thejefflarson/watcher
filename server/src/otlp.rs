@@ -164,7 +164,7 @@ pub async fn store_traces(pool: &PgPool, req: ExportTraceServiceRequest) -> u64 
 pub async fn store_logs(pool: &PgPool, req: ExportLogsServiceRequest) -> u64 {
     // Decode the whole request into rows first, then write them in batched
     // statements (one per chunk) instead of one INSERT round-trip per record —
-    // the per-row loop was the source of the ~30s ingest p99 (JEF-495).
+    // the per-row loop was the source of the ~30s ingest p99.
     let mut rows: Vec<LogRow> = Vec::new();
     for rl in &req.resource_logs {
         // Keep resource attributes (k8s.pod.name / node / container, …) so logs
@@ -205,8 +205,8 @@ const _: () = assert!(FAILOVER_BACKOFF.len() == FAILOVER_MAX_ATTEMPTS as usize -
 /// failover produces — worth retrying on a *fresh* connection, unlike a bad row:
 ///
 /// * `25006` read_only_sql_transaction — the pooled connection's backend was
-///   demoted to a read-only replica; the write hits a read-only node (the JEF-496
-///   symptom). A new connection re-resolves `-master` DNS to the new leader.
+///   demoted to a read-only replica; the write hits a read-only node. A new
+///   connection re-resolves `-master` DNS to the new leader.
 /// * `57P01` admin_shutdown — the old leader terminated the backend on demotion.
 ///
 /// Deliberately narrow: a constraint violation, encoding error, or any other
@@ -265,7 +265,7 @@ async fn write_with_failover_retry<D: Sync + ?Sized>(
 
 /// Write `rows` in chunks, one batched `INSERT` per chunk. Each write goes through
 /// [`write_with_failover_retry`], so a Patroni failover's read-only error is retried
-/// on a fresh connection rather than dropped (JEF-496). On a *non-failover* chunk
+/// on a fresh connection rather than dropped. On a *non-failover* chunk
 /// error, fall back to inserting each row of that chunk on its own so a single bad
 /// row can't drop the whole batch — every row that still fails is logged and counted
 /// in `DROP_INSERT`, preserving the per-row drop accounting the old loop had. If a
@@ -522,7 +522,7 @@ struct NumRow {
     unit: Option<String>,
     is_monotonic: Option<bool>,
     attrs: serde_json::Value,
-    /// One exemplar trace/span id (JEF-433), picked from the point's exemplars —
+    /// One exemplar trace/span id, picked from the point's exemplars —
     /// `None` for points that carry no sampled exemplar (the common case).
     exemplar_trace_id: Option<String>,
     exemplar_span_id: Option<String>,
@@ -539,7 +539,7 @@ struct HistRow {
     count: i64,
     bounds: Vec<f64>,
     counts: Vec<i64>,
-    /// One exemplar trace/span id (JEF-433); see `NumRow`.
+    /// One exemplar trace/span id; see `NumRow`.
     exemplar_trace_id: Option<String>,
     exemplar_span_id: Option<String>,
 }
@@ -639,7 +639,7 @@ fn num_row(
     })
 }
 
-/// Pick one exemplar to keep per data point (JEF-433): the first exemplar that
+/// Pick one exemplar to keep per data point: the first exemplar that
 /// actually carries a trace id — an exemplar's span/trace ids are optional in the
 /// OTLP spec (absent when the measurement wasn't recorded inside a sampled trace),
 /// so a point can have exemplars with no usable id. `metrics` keeps at most one
@@ -770,7 +770,7 @@ async fn flush_numbers(pool: &PgPool, rows: Vec<NumRow>) -> u64 {
         b.exemplar_trace_ids.push(r.exemplar_trace_id);
         b.exemplar_span_ids.push(r.exemplar_span_id);
     }
-    // The whole-batch write goes through failover retry (JEF-496): a Patroni failover's
+    // The whole-batch write goes through failover retry: a Patroni failover's
     // read-only error is retried on a fresh connection, not dropped. There's no per-row
     // fallback here (a metrics batch is one aggregating statement), so on a persistent
     // error — failover retries exhausted or any other DB error — the batch drops and
@@ -816,7 +816,7 @@ async fn flush_histograms(pool: &PgPool, rows: Vec<HistRow>) -> u64 {
             })
             .collect(),
     );
-    // Whole-batch write through failover retry (JEF-496); see flush_numbers for the
+    // Whole-batch write through failover retry; see flush_numbers for the
     // drop/accounting rationale. The JSONB payload + bucket width travel as borrowed
     // `data` so the retry op captures nothing.
     let b = HistBatch {
@@ -1228,7 +1228,7 @@ mod tests {
         assert_eq!(any_value_to_text(&n), "5");
     }
 
-    // --- JEF-496: read-only-failover write retry -------------------------------
+    // --- Read-only-failover write retry -----------------------------------------
     //
     // These exercise `write_with_failover_retry` against a real Postgres (CI's
     // service container; skipped when DATABASE_URL is unset). They don't rely on

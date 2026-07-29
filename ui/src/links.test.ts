@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { logsHref, traceHref } from "./links";
 
-// JEF-534: trace_id/span_id are ingested OTLP data (attacker-shapeable) and were
+// trace_id/span_id are ingested OTLP data (attacker-shapeable) and were
 // interpolated raw into these deep-links, unlike the neighboring `service` focus
 // which was already `encodeURIComponent`-ed. These tests pin the well-formed-id
 // shape (no behavior change vs. the pre-fix raw interpolation) and lock the

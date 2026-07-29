@@ -14,7 +14,7 @@ use tracing::Instrument;
 type ApiError = (StatusCode, String);
 
 /// Map an internal failure to a 500 — and always log it. This is an observability
-/// tool: a silent 5xx (as JEF-494's decode error was) is undiagnosable from
+/// tool: a silent 5xx (as a past decode error was) is undiagnosable from
 /// watcher's own logs, so every internal error is recorded at ERROR here. The
 /// active tracing span (each handler is `#[tracing::instrument]`ed) carries the
 /// route, so the log line is attributable without threading it through by hand.
@@ -27,7 +27,7 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
 /// GET /healthz — deep readiness probe: 200 only when the DB is reachable AND
 /// retention isn't stalled past the configured age; otherwise 503. This gates
 /// *readiness* (traffic), not liveness — a stalled retention or a DB outage
-/// should stop new traffic and page, not kill the process (JEF-425).
+/// should stop new traffic and page, not kill the process.
 pub async fn healthz(State(pool): State<PgPool>) -> impl IntoResponse {
     let h = crate::selfmon::health(&pool).await;
     let status = if h.healthy() {
@@ -87,13 +87,13 @@ pub async fn list_traces(
 }
 
 /// Hard ceiling (hours) on how far back a `spans`/`logs`-table query may
-/// reach, even when the caller passes an explicit `from` (JEF-532). Without
+/// reach, even when the caller passes an explicit `from`. Without
 /// this, the `COALESCE($n, now() - interval '24 hours')` default-window floor
 /// below only applies when `from` is unset — an arbitrarily-far-past explicit
 /// `from` would defeat it and full-scan the retention-deep table. Defaults to
 /// the same 7-day ceiling most metric endpoints use (`resolve_window`'s
 /// `max_hours` for facet/histogram); override with `WATCHER_MAX_QUERY_HOURS`.
-/// Clamped to `[1, 8760]` (1 hour .. 1 year, JEF-546) so a misconfigured env
+/// Clamped to `[1, 8760]` (1 hour .. 1 year) so a misconfigured env
 /// value can't disable the ceiling (0/negative) or resolve it to the distant
 /// past and re-open the full-scan it exists to prevent (an absurdly large
 /// value).
@@ -140,7 +140,7 @@ pub async fn query_traces(pool: &PgPool, q: TraceQuery) -> Result<Vec<TraceSumma
            -- default to a recent window when unbounded so this can't turn into a
            -- full-table GROUP BY (which times out); the UI always passes a range.
            -- GREATEST clamps an explicit `from` to the max-lookback ceiling too,
-           -- so it can't out-scan the default window (JEF-532). Computed here
+           -- so it can't out-scan the default window. Computed here
            -- (rather than in Rust) so it's atomic with the same `now()`.
            AND start_time >= GREATEST(
                  COALESCE($2::timestamptz, now() - interval '24 hours'),
@@ -273,8 +273,7 @@ pub async fn query_logs(pool: &PgPool, q: LogQuery) -> Result<Vec<LogRow>, sqlx:
            -- default to a recent window when unbounded, and clamp an explicit
            -- `from` to the max-lookback ceiling too, so a body ILIKE search for
            -- a rare/absent term can't full-scan the retention-deep `logs` table
-           -- to satisfy ORDER BY time DESC LIMIT (JEF-546, mirrors JEF-532's
-           -- query_traces clamp).
+           -- to satisfy ORDER BY time DESC LIMIT (mirrors query_traces' clamp above).
            AND time >= GREATEST(
                  COALESCE($5::timestamptz, now() - interval '24 hours'),
                  now() - make_interval(hours => $9::int)
@@ -414,7 +413,7 @@ fn rollup_bucket_secs() -> f64 {
 }
 
 /// Point count a chart plausibly renders usefully; wide-window rollup reads
-/// coarsen their output bucket to stay near this bound (JEF-561) rather than
+/// coarsen their output bucket to stay near this bound rather than
 /// returning one point per raw rollup bucket regardless of window width — a
 /// 90-day series at the base 5-min bucket is ~26k points.
 const TARGET_POINTS: f64 = 1000.0;
@@ -439,7 +438,7 @@ fn output_bucket_secs(span_secs: f64, base: f64) -> f64 {
 }
 
 /// `resolve_window` plus the adaptive output-bucket width for the resolved
-/// span (JEF-561) — shared by every series/facet/histogram rollup read below.
+/// span — shared by every series/facet/histogram rollup read below.
 fn resolve_window_and_width(
     hours: Option<i32>,
     default_hours: i32,
@@ -453,7 +452,7 @@ fn resolve_window_and_width(
 }
 
 /// Resolve a metric endpoint's window to concrete bounds, shared by every
-/// series/facet/histogram/exemplar query below (JEF-433). An absolute `from`/`to`
+/// series/facet/histogram/exemplar query below. An absolute `from`/`to`
 /// takes precedence; either end may be omitted, in which case it falls back to
 /// the `hours`-relative bound anchored on the *other* end (so `to` alone still
 /// yields an `hours`-wide window ending at `to`, not at the real "now"). With
@@ -461,7 +460,7 @@ fn resolve_window_and_width(
 ///
 /// The relative-hours path was already capped to `max_hours` (via `.clamp`
 /// above); the absolute `from`/`to` path was not, so an over-wide explicit
-/// window could out-scan it (JEF-532). Clamp the resolved span to the same
+/// window could out-scan it. Clamp the resolved span to the same
 /// `max_hours` ceiling regardless of which path produced it, so an absolute
 /// window can never load more than a relative one could.
 fn resolve_window(
@@ -490,7 +489,7 @@ pub struct SeriesQuery {
     pub hours: Option<i32>,
     /// Absolute window (RFC3339), taking precedence over `hours` when given —
     /// lets "metrics around this trace" render the trace's exact moment instead
-    /// of an hours-back-from-now window (JEF-433). Either end may be omitted;
+    /// of an hours-back-from-now window. Either end may be omitted;
     /// an omitted end falls back to the `hours`-relative bound.
     pub from: Option<DateTime<Utc>>,
     pub to: Option<DateTime<Utc>>,
@@ -514,7 +513,7 @@ pub async fn metric_series(
 }
 
 /// Hard ceiling (hours) on `query_metric_series`'s window, sourced from
-/// `WATCHER_RETENTION_DAYS` (JEF-593) — the same knob `retention::prune_once`
+/// `WATCHER_RETENTION_DAYS` — the same knob `retention::prune_once`
 /// prunes `metric_series_rollups` against — rather than a hard-wired constant,
 /// so raising retention widens the queryable window without a code change.
 /// Falls back to the sibling facet/histogram/hist_facet queries' fixed
@@ -537,12 +536,12 @@ fn parse_retention_max_hours(raw: Option<&str>) -> i32 {
 /// One metric's collapsed time series, shared by the HTTP handler and the MCP
 /// `metric_series` tool. Applies the same hours clamp, and honors an absolute
 /// `from`/`to` window when given (see `SeriesQuery`). The ceiling used to be a
-/// flat 90 days on the theory that the covering index (JEF-548) makes the read
+/// flat 90 days on the theory that the covering index makes the read
 /// cheap and the adaptive output bucket below keeps the *result* bounded
 /// regardless of window width — but `metric_series_rollups` is itself pruned at
 /// `WATCHER_RETENTION_DAYS` (default 7), so anything past that structurally
 /// holds no rows: widening the scan range there was pure waste. Capped to
-/// `metric_series_max_hours()` instead (JEF-593), which tracks retention.
+/// `metric_series_max_hours()` instead, which tracks retention.
 pub async fn query_metric_series(
     pool: &PgPool,
     q: SeriesQuery,
@@ -636,7 +635,7 @@ pub async fn metric_series_grouped(
     Ok(Json(rows))
 }
 
-// --- Exemplars (metric -> trace correlation, JEF-433) -----------------------
+// --- Exemplars (metric -> trace correlation) --------------------------------
 
 #[derive(Deserialize)]
 pub struct ExemplarQuery {
@@ -755,7 +754,7 @@ pub async fn metric_facet(
     // `kind` is decoded as Option: metric_series_rollups.kind is a nullable column
     // (unlike metrics.kind), so a rollup row can carry a NULL kind. Decoding it as a
     // bare String made this handler 500 with "unexpected null" for any metric whose
-    // latest meta row is such a rollup (JEF-494) — a null kind just means "unknown".
+    // latest meta row is such a rollup — a null kind just means "unknown".
     let meta: Option<(Option<String>, Option<bool>, Option<String>)> = sqlx::query_as(
         "SELECT kind, is_monotonic, unit FROM (
              (SELECT kind, is_monotonic, unit, time AS t FROM metrics
@@ -787,7 +786,7 @@ pub async fn metric_facet(
     // Per-series points straight from the downsampled rollup — index-fast, no
     // raw scan. Rollups are maintained on ingest, so the current (still-filling)
     // bucket is present, just partial. avg = bucket mean (gauges), re-aggregated
-    // as a count-weighted average across the adaptive output bucket (JEF-561, same
+    // as a count-weighted average across the adaptive output bucket (same
     // fold as `query_metric_series`); last = cumulative level (counters, for rate
     // differencing) — monotonic non-decreasing outside a reset, so the max seen
     // within the output bucket is its most recent value.
@@ -919,7 +918,7 @@ pub async fn metric_histogram(
     let (lo, hi, width) = resolve_window_and_width(q.hours, 6, 24 * 7, q.from, q.to);
 
     // Per-series rollup counts, first re-aggregated per series into the adaptive
-    // output bucket (JEF-561: `array_sum`/`min(bounds)`, the same fold ingest
+    // output bucket (`array_sum`/`min(bounds)`, the same fold ingest
     // uses to combine raw points into a rollup row — see `insert_histograms`),
     // then the Rust pass below sums across series per time bucket.
     let rows: Vec<HistRow> = sqlx::query_as(
@@ -1061,7 +1060,7 @@ pub async fn metric_hist_facet(
 ) -> Result<Json<HistFacetResponse>, ApiError> {
     let (lo, hi, width) = resolve_window_and_width(q.hours, 6, 24 * 7, q.from, q.to);
 
-    // Re-aggregated per series into the adaptive output bucket (JEF-561), same
+    // Re-aggregated per series into the adaptive output bucket, same
     // fold as `metric_histogram` above.
     let rows: Vec<HistFacetRow> = sqlx::query_as(
         "SELECT attrs, metric_bucket(bucket, $4) AS t, min(bucket_bounds) AS bounds,
@@ -1178,7 +1177,7 @@ pub async fn query_service_red(pool: &PgPool, q: RedQuery) -> Result<Vec<Service
            -- default to a recent window when unbounded so the per-service
            -- percentile aggregate can't full-scan the spans table and time out.
            -- GREATEST clamps an explicit `from` to the max-lookback ceiling too,
-           -- so it can't out-scan the default window (JEF-532).
+           -- so it can't out-scan the default window.
            AND start_time >= GREATEST(
                  COALESCE($1::timestamptz, now() - interval '24 hours'),
                  now() - make_interval(hours => $3::int)
@@ -1404,7 +1403,7 @@ mod tests {
         }
     }
 
-    // JEF-494: every 5xx must be diagnosable from watcher's own logs. `internal()`
+    // Every 5xx must be diagnosable from watcher's own logs. `internal()`
     // maps to a 500 AND logs the error at ERROR — this proves it does both.
     #[test]
     fn internal_logs_the_error_and_returns_500() {
@@ -1427,7 +1426,7 @@ mod tests {
         );
     }
 
-    // JEF-532: an explicit `from`/`to` bypassed the relative-hours `max_hours`
+    // An explicit `from`/`to` used to bypass the relative-hours `max_hours`
     // clamp entirely — this proves the absolute path is now capped to the same
     // ceiling.
     #[test]
@@ -1466,8 +1465,8 @@ mod tests {
         assert_eq!(lo, hi - Duration::hours(48));
     }
 
-    // JEF-546: a pathologically large WATCHER_MAX_QUERY_HOURS must not resolve
-    // the ceiling to the distant past and re-open the full-scan JEF-532 closed.
+    // A pathologically large WATCHER_MAX_QUERY_HOURS must not resolve
+    // the ceiling to the distant past and re-open the full-scan the clamp above closed.
     #[test]
     fn parse_max_lookback_hours_clamps_huge_value_to_one_year() {
         assert_eq!(parse_max_lookback_hours(Some("999999999")), 8760);
@@ -1491,7 +1490,7 @@ mod tests {
         assert_eq!(parse_max_lookback_hours(Some("48")), 48);
     }
 
-    // JEF-593: at the default 7-day retention, the series ceiling must match
+    // At the default 7-day retention, the series ceiling must match
     // the sibling facet/histogram/hist_facet queries' fixed `24 * 7` — the old
     // 90-day ceiling scanned 83 days of range that retention had already
     // pruned to nothing.
@@ -1520,7 +1519,7 @@ mod tests {
     }
 
     // Acceptance criterion: a >retention window request is clamped to the
-    // retention bound, exactly like JEF-532's absolute-window clamp test above
+    // retention bound, exactly like the absolute-window clamp test above
     // — but driven by the retention-derived ceiling instead of a literal.
     #[test]
     fn resolve_window_clamps_series_window_to_retention_ceiling() {
@@ -1541,7 +1540,7 @@ mod tests {
         );
     }
 
-    // JEF-561: a narrow window (well under TARGET_POINTS * base) must collapse
+    // A narrow window (well under TARGET_POINTS * base) must collapse
     // to exactly `base` — unwidened, full rollup resolution — so a short-range
     // chart's points are unaffected.
     #[test]

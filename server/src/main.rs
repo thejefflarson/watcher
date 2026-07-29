@@ -15,7 +15,7 @@ use watcher_server::{
 /// `service.name=watcher`, so they land in its own `spans` table and it shows up in
 /// its own UI. Like self-metrics (ADR 0014) and self-logs (ADR 0016), traces go
 /// straight to the ingest path ([`selftrace`]) — no network hop, no OTLP self-POST,
-/// no batch-to-self that can wedge in a shut-down state (JEF-462). Opt out with
+/// no batch-to-self that can wedge in a shut-down state. Opt out with
 /// `WATCHER_SELF_TELEMETRY=0`.
 ///
 /// Returns the provider (kept alive for the process lifetime; dropping it shuts the
@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
             .with_tracer(provider.tracer("watcher-server"))
             .with_filter(dynamic_filter_fn(|_meta, _cx| !selflog::suppressed()))
     });
-    // Self-log capture (JEF-452): a layer that mirrors watcher's own events into its
+    // Self-log capture: a layer that mirrors watcher's own events into its
     // own `logs` table. Built here, before the pool exists, so startup events buffer
     // in its channel; `main` spawns the drain task once the DB is up. The receiver
     // rides alongside the (Option) layer so both share the enabled() decision.
@@ -82,8 +82,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // Keep the tracer provider alive for the whole process (dropping it shuts the
-    // batch processor down — the very failure mode JEF-462 fixes), and take the
-    // receiver so the drain task can be spawned once the pool is up.
+    // batch processor down — the very failure mode this in-process capture avoids),
+    // and take the receiver so the drain task can be spawned once the pool is up.
     let (_self_trace_provider, selftrace_rx) = self_traces.unzip();
 
     let database_url = std::env::var("DATABASE_URL")
@@ -104,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
     // Raw metric points are aggregated into per-series rollups on ingest, so raw
     // is kept only as a short full-resolution window for inspection.
     let metrics_raw_hours = env_i32("WATCHER_METRICS_RAW_HOURS", 6);
-    // Per-signal retention windows (JEF-434): each is optional and falls back to
+    // Per-signal retention windows: each is optional and falls back to
     // WATCHER_RETENTION_DAYS above when unset, so omitting these is a no-op.
     let retention_windows = retention::Windows {
         spans_days: env_i32_opt("WATCHER_RETENTION_SPANS_DAYS"),
@@ -179,14 +179,14 @@ async fn main() -> anyhow::Result<()> {
     if let Some(rx) = selflog_rx {
         tokio::spawn(selflog::drain(pool.clone(), rx));
     }
-    // Self-traces (JEF-462): drain the buffered self-spans (exported by the in-process
+    // Self-traces: drain the buffered self-spans (exported by the in-process
     // SpanExporter installed above) into the `spans` table via the same ingest path.
     // Spawned on the main runtime so its sqlx I/O runs on the pool's own reactors.
     if let Some(rx) = selftrace_rx {
         tokio::spawn(selftrace::drain(pool.clone(), rx));
     }
 
-    // Origin-side Cloudflare Access JWT verification (JEF-473): when
+    // Origin-side Cloudflare Access JWT verification: when
     // WATCHER_ACCESS_TEAM_DOMAIN + WATCHER_ACCESS_AUD are set, the UI shell + /api
     // additionally re-verify the edge-issued Access token as defense-in-depth
     // (ADR 0013). Unset → not wired in, so local dev / non-Access deploys are
@@ -201,9 +201,9 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Read-only MCP server (JEF-471): mounted at /mcp by `app_with_access` only when
+    // Read-only MCP server (ADR 0018): mounted at /mcp by `app_with_access` only when
     // WATCHER_MCP_ENABLED is set (default OFF). Its Managed-OAuth assertion auth
-    // (JEF-493) requires WATCHER_ACCESS_TEAM_DOMAIN + WATCHER_MCP_ACCESS_AUD; with
+    // (ADR 0019) requires WATCHER_ACCESS_TEAM_DOMAIN + WATCHER_MCP_ACCESS_AUD; with
     // those unset the endpoint fails closed (is NOT served) rather than exposing read
     // access.
     if mcp::enabled() {
@@ -225,7 +225,7 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&http_bind).await?;
     tracing::info!("HTTP/OTLP + API on http://{http_bind}");
 
-    // Online-DDL lane (ADR 0021, JEF-580): spawned only now that the listener is
+    // Online-DDL lane (ADR 0021): spawned only now that the listener is
     // bound and the pod is Ready, so an index build (which can take minutes on a
     // large table) never blocks boot or /healthz. Fire-and-forget: a failure is
     // logged, not fatal — reads fall back to whatever index already covers the

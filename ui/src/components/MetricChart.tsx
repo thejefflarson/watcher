@@ -35,7 +35,7 @@ interface Series {
   points: SeriesPoint[];
 }
 
-// One raw point that carries a sampled trace exemplar (JEF-433), positioned by
+// One raw point that carries a sampled trace exemplar, positioned by
 // time + value so `Chart` can plot it as a marker on the line it belongs to.
 interface ExemplarMark {
   t: string;
@@ -304,7 +304,7 @@ function FacetView({
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Best-effort — exemplars only exist in the raw-metric window, so an empty
-  // result is the normal case, not a failure (JEF-433).
+  // result is the normal case, not a failure.
   const [exemplars, setExemplars] = useState<ExemplarPoint[]>([]);
 
   useEffect(() => {
@@ -447,7 +447,7 @@ export default function MetricChart({
   const rangeLabel = RANGES.find((r) => r.hours === hours)?.label ?? `${hours}h`;
 
   // One-action deep link to the trace list scoped to this chart's service +
-  // displayed window (JEF-433) — the window is the picker's hours-back-from-now
+  // displayed window — the window is the picker's hours-back-from-now
   // range, matching what's actually plotted. Correlational ("traces in this
   // window"), not a claim that any one of them caused what the chart shows.
   const tracesHref = useMemo(() => {
