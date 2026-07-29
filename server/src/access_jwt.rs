@@ -1,4 +1,4 @@
-//! Origin-side verification of Cloudflare Access JWTs (JEF-473).
+//! Origin-side verification of Cloudflare Access JWTs (ADR 0013).
 //!
 //! watcher's public read surface (the UI shell + `/api`) is gated at the edge by
 //! Cloudflare Access (ADR 0013). This module lets the *origin* independently verify
@@ -9,7 +9,7 @@
 //! The verifier is deliberately **transport-agnostic**: [`Verifier::verify`] takes a
 //! raw token string and checks it against the configured issuer/audience. The axum
 //! middleware in [`crate::app`] pulls the token out of the `Cf-Access-Jwt-Assertion`
-//! header; a future `/mcp` Bearer-token guard (JEF-471/472) reuses the same verifier
+//! header; the `/mcp` guard (ADR 0019) reuses the same verifier
 //! with the token taken from `Authorization: Bearer`.
 //!
 //! ## Fail-open when unconfigured / on JWKS trouble
@@ -154,7 +154,7 @@ impl Verifier {
     /// The team domain may be given with or without a scheme
     /// (`team.cloudflareaccess.com`); Cloudflare's `iss` is that host with an
     /// `https://` scheme and no trailing slash. Shared by [`from_env`](Self::from_env)
-    /// (the browser Access app) and the `/mcp` Bearer guard (JEF-472), which points at
+    /// (the browser Access app) and the `/mcp` Bearer guard (ADR 0019), which points at
     /// the same team but a **separate** Access application AUD.
     pub fn for_team(team_domain: &str, audience: impl Into<String>) -> Self {
         let host = team_domain
@@ -168,8 +168,7 @@ impl Verifier {
     }
 
     /// The expected issuer (`iss`) — the team domain as an `https://` URL. Also the
-    /// Cloudflare Access OIDC authorization-server identifier the `/mcp` resource
-    /// metadata advertises (JEF-472).
+    /// Cloudflare Access OIDC authorization-server identifier.
     pub fn issuer(&self) -> &str {
         &self.issuer
     }

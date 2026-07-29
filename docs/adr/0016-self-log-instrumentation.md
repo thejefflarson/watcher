@@ -7,12 +7,12 @@
 ## Context
 
 watcher self-instruments its own **traces** (OTLP `SpanExporter` + the
-`tracing-opentelemetry` layer) and its own **metrics** (JEF-425 / ADR 0014:
+`tracing-opentelemetry` layer) and its own **metrics** (ADR 0014:
 `selfmon` hands ops gauges/counters straight to `otlp::store_metrics`, tagged
 `service.name=watcher`). But its own **logs** only went to stdout via the `fmt`
 layer — there was no `tracing`→logs bridge, so watcher's log lines never landed in
 its own `logs` table. You could open a watcher self-trace but couldn't jump to the
-correlated self-logs (the span→logs drill, JEF-429).
+correlated self-logs (the span→logs drill).
 
 Two shapes were possible, mirroring the ADR 0014 metrics decision:
 

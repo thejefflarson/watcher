@@ -1,4 +1,4 @@
-// Accessibility floor (JEF-431). A focused gate: only the jsx-a11y ruleset runs
+// Accessibility floor. A focused gate: only the jsx-a11y ruleset runs
 // here so the dense-table interaction model can't silently regress into
 // mouse-only rows or unlabeled charts. The type-check gate stays `tsc --noEmit`;
 // this adds the a11y lint alongside it (see the ui job in ci.yml).

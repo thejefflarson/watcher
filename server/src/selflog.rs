@@ -1,4 +1,4 @@
-//! watcher self-instrumentation of its *own logs* (JEF-452): a `tracing` Layer
+//! watcher self-instrumentation of its *own logs* (ADR 0016): a `tracing` Layer
 //! that converts each event into an OTLP log record and hands it to the in-process
 //! ingest path ([`crate::otlp::store_logs`]) — the same table its UI reads — tagged
 //! `service.name=watcher`.

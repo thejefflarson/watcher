@@ -1,4 +1,4 @@
-//! In-app online (non-transactional) DDL lane (ADR 0021, JEF-580).
+//! In-app online (non-transactional) DDL lane (ADR 0021).
 //!
 //! `sqlx::migrate!` (see [`crate::db::migrate`]) wraps every migration in a
 //! transaction and holds a session-level advisory lock for the whole run — the
@@ -23,9 +23,9 @@
 //! run.
 //!
 //! A valid index isn't necessarily up to date, though: matching by name alone
-//! (JEF-580's original check) can't see a definition change, so it would treat
+//! (the original check) can't see a definition change, so it would treat
 //! an existing valid index as done forever even after `DESIRED_INDEXES` changes
-//! underneath it (JEF-591). The reconciler additionally compares a valid
+//! underneath it. The reconciler additionally compares a valid
 //! index's live `INCLUDE` columns (via `pg_index`/`pg_attribute`, not
 //! `pg_get_indexdef`'s text — see [`include_columns_drifted`]) against the
 //! desired set, and drops + rebuilds on a mismatch.
@@ -49,8 +49,8 @@ pub struct OnlineIndex {
 }
 
 /// The indexes this lane manages. `metric_series_rollups_name_bucket_covering_idx`
-/// was originally seeded (JEF-580) with the full column list migration 0017 built
-/// by hand in production; JEF-591 narrows it to the scalar-only `INCLUDE` list
+/// was originally seeded with the full column list migration 0017 built
+/// by hand in production; it was later narrowed to the scalar-only `INCLUDE` list
 /// below (dropping the heavy `attrs` JSONB and `bucket_bounds`/`bucket_counts`
 /// arrays, which only the rarer facet/histogram read paths need — the hot
 /// `query_metric_series` path only ever selects `sum`/`count`) — see
@@ -77,10 +77,9 @@ pub const DESIRED_INDEXES: &[OnlineIndex] = &[OnlineIndex {
 
 /// Session-level advisory-lock key that gates a whole lane run, so exactly one
 /// replica builds during a rollout and the others skip cleanly. Arbitrary but
-/// fixed — the bytes of "JEF_580" read as a big-endian integer — and
-/// deliberately NOT the key `sqlx::migrate!` uses (which it derives at runtime
-/// from a hash of the database name, not a static constant), so the two can
-/// never collide.
+/// fixed, and deliberately NOT the key `sqlx::migrate!` uses (which it derives
+/// at runtime from a hash of the database name, not a static constant), so the
+/// two can never collide.
 const ADVISORY_LOCK_KEY: i64 = 0x004A_4546_5F35_3830;
 
 /// Whether a desired index is missing, present and healthy, or present but left
@@ -144,7 +143,7 @@ fn desired_include_cols(idx: &OnlineIndex) -> Vec<String> {
 
 /// Whether a live, valid index named `idx.name` carries a different `INCLUDE`
 /// column set than `idx.include_cols` desires — i.e. whether the definition has
-/// drifted (e.g. JEF-591 narrowing the wide covering index migration 0017
+/// drifted (e.g. narrowing the wide covering index migration 0017
 /// built). Order-independent: only the column *set* matters.
 async fn include_columns_drifted(
     conn: &mut PgConnection,
@@ -170,7 +169,7 @@ async fn drop_index_concurrently(conn: &mut PgConnection, name: &str) -> anyhow:
 
 /// Reconciles one desired index against its current state on `conn`. Absent →
 /// build; valid and matching desired `INCLUDE` columns → no-op; valid but
-/// drifted (a definition change since it was built, e.g. JEF-591's narrowing)
+/// drifted (a definition change since it was built, e.g. the covering index's narrowing)
 /// → drop then rebuild; invalid (left by an interrupted build) → drop then
 /// rebuild. Runs entirely outside a transaction, as `CONCURRENTLY` requires.
 async fn reconcile_index(conn: &mut PgConnection, idx: &OnlineIndex) -> anyhow::Result<()> {
@@ -576,7 +575,7 @@ mod tests {
         );
         let oid_wide = relation_oid(&mut conn, name).await;
 
-        // Desired is now narrow (JEF-591-style): only column `a`.
+        // Desired is now narrow: only column `a`.
         let narrow = OnlineIndex {
             name,
             table,

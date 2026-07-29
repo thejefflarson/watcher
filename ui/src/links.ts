@@ -2,7 +2,7 @@
 // metrics). Trace/span ids come from ingested OTLP data — attacker-shapeable —
 // so every id here is either `encodeURIComponent`-ed as a path segment or set
 // via URLSearchParams: a stray `&`/`#`/`?` must stay inside its own param,
-// never land on an unexpected route or inject an extra one (JEF-534).
+// never land on an unexpected route or inject an extra one.
 
 // `/traces/:traceId`, optionally scoped to a span and/or the global service
 // focus. Used by the trace list row link, a log row's drill-in, and a metric

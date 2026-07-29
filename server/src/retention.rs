@@ -3,7 +3,7 @@
 //! because `metric_series_rollups` (maintained on ingest) preserves their
 //! downsampled per-series history.
 //!
-//! Spans, logs, and metric rollups can each be given their own window (JEF-434):
+//! Spans, logs, and metric rollups can each be given their own window:
 //! [`Windows`] carries an optional per-table override, declared via
 //! `WATCHER_RETENTION_SPANS_DAYS` / `WATCHER_RETENTION_LOGS_DAYS` /
 //! `WATCHER_RETENTION_METRICS_DAYS`. A table with no override falls back to the
@@ -11,7 +11,7 @@
 //! today's single window, so this is a no-op for anyone who doesn't set the new
 //! vars. This is deliberately per-*table*, not per-service: a per-service delete
 //! over these tables would need `ctid`-batching like `prune_raw_metrics` below to
-//! avoid the statement-timeout failure mode (JEF-425); that's a separate ticket.
+//! avoid the statement-timeout failure mode; that's a separate follow-up.
 
 use sqlx::PgPool;
 use std::time::Duration;
@@ -88,7 +88,7 @@ pub async fn prune_once(
     }
     // Record the successful sweep so self-telemetry can surface its recency and
     // /healthz can flag a stall (a silent retention stall is exactly what let the
-    // metrics table grow to tens of GB un-paged — JEF-425).
+    // metrics table grow to tens of GB un-paged).
     crate::selfmon::record_retention_success(total);
     Ok(total)
 }

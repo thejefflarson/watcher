@@ -1,4 +1,4 @@
-//! watcher self-instrumentation of its own *traces* (JEF-462): a custom
+//! watcher self-instrumentation of its own *traces* (ADR 0017): a custom
 //! [`opentelemetry_sdk::trace::SpanExporter`] that maps exported `SpanData` into the
 //! in-process trace-ingest path ([`crate::otlp::store_traces`]) — the same table its
 //! UI reads — tagged `service.name=watcher`.
@@ -8,7 +8,7 @@
 //! Traces were the last one still on the fragile OTLP self-export (a batch
 //! `SpanExporter` POSTing to `localhost:4318`); that path had wedged into a
 //! shut-down state and never landed a single watcher span while flooding the `logs`
-//! table with "Spans are being emitted even after Shutdown" warnings (JEF-462).
+//! table with "Spans are being emitted even after Shutdown" warnings.
 //! Going in-process removes the network hop, the self-POST, and the batch-to-self
 //! that could shut down — the exporter just enqueues converted spans for a drain
 //! task that stores them on the main runtime.

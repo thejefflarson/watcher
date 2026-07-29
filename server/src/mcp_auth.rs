@@ -1,17 +1,17 @@
-//! Cloudflare Access **Managed OAuth** auth for the `/mcp` endpoint (JEF-493).
+//! Cloudflare Access **Managed OAuth** auth for the `/mcp` endpoint (ADR 0019).
 //!
-//! `/mcp` (the read-only MCP server, JEF-471/ADR 0018) mounts *outside* the browser
+//! `/mcp` (the read-only MCP server, ADR 0018) mounts *outside* the browser
 //! edge auth that fronts the UI/`/api`: an MCP client is not a browser and carries no
 //! Access cookie. The chosen production mechanism is Cloudflare Access **Managed
 //! OAuth**: Cloudflare is the OAuth authorization server the MCP client (claude.ai's
 //! remote connector) registers with (DCR) and obtains an **opaque** token from;
 //! Cloudflare resolves that token at its edge and forwards the origin the standard
 //! **`Cf-Access-Jwt-Assertion`** JWT — the *same* header/issuer/team-JWKS that `/api`
-//! validates (JEF-473). So the origin only ever **validates** that assertion — it
+//! validates (ADR 0013). So the origin only ever **validates** that assertion — it
 //! never mints one (ADR 0013), never parses the opaque `Authorization: Bearer`, and
 //! never self-serves OAuth metadata (Cloudflare owns discovery).
 //!
-//! This supersedes JEF-472's design, which validated the raw `Authorization: Bearer`
+//! This supersedes the initial design, which validated the raw `Authorization: Bearer`
 //! as a JWT (now the *opaque* Managed-OAuth token → would be rejected) and self-served
 //! `/.well-known/oauth-protected-resource`. See ADR 0019.
 //!
@@ -39,7 +39,7 @@ use crate::Assertion;
 /// `WATCHER_ACCESS_AUD` so a browser-scoped assertion can't be replayed at `/mcp`.
 const MCP_AUD_ENV: &str = "WATCHER_MCP_ACCESS_AUD";
 
-/// The Cloudflare Access team domain, shared with the browser guard (JEF-473).
+/// The Cloudflare Access team domain, shared with the browser guard (ADR 0013).
 const TEAM_DOMAIN_ENV: &str = "WATCHER_ACCESS_TEAM_DOMAIN";
 
 /// Opt-in toggle: emit a bare `WWW-Authenticate: Bearer` challenge on a `401`.

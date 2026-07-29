@@ -11,8 +11,7 @@ watcher already exposes its telemetry through a same-origin query API (`/api/...
 consumed by the embedded UI. LLM agents (Claude Code, MCP Inspector, …) increasingly
 speak the **Model Context Protocol** (MCP): given an MCP endpoint they can search
 traces, read logs/metrics, and inspect services/alerts as tools. We want watcher to
-be that endpoint without standing up a second process or duplicating query logic
-(JEF-471).
+be that endpoint without standing up a second process or duplicating query logic.
 
 Two shapes were possible:
 
@@ -50,8 +49,8 @@ mature.
 - **Opt-in, default OFF, unauthenticated for now.** `/mcp` mounts only when
   `WATCHER_MCP_ENABLED` is truthy. It is deliberately mounted *outside* the edge
   auth that fronts the UI/`/api` (Cloudflare Access, ADR 0013): an MCP client is not a
-  browser and carries no Access cookie. Its own auth is a **separate** ticket
-  (JEF-472); until that lands the endpoint must not be exposed, so it defaults off and
+  browser and carries no Access cookie. Its own auth is a **separate** effort
+  (see ADR 0019); until that lands the endpoint must not be exposed, so it defaults off and
   the flag's doc comment says so. The transport's default loopback-only Host allow-list
   (a DNS-rebinding guard aimed at locally-run servers reached by a browser) is disabled
   here, since watcher's MCP is a server-to-server endpoint reached through a public
@@ -65,7 +64,7 @@ mature.
 - Query behavior stays identical across the HTTP and MCP surfaces because they share
   the `query_*` functions; a future change to a clamp or window applies to both.
 - The endpoint is inert until an operator sets `WATCHER_MCP_ENABLED` **and** (once
-  JEF-472 lands) configures its auth. Enabling it before then exposes read access to
+  ADR 0019's auth lands) configures its auth. Enabling it before then exposes read access to
   anyone who can reach the host — the flag default and the ADR make that ordering
   explicit, mirroring the "create the Access app first" runbook rule of ADR 0013.
 - `rmcp` (and, for tests, its client + `reqwest` 0.13) enters the dependency tree; the

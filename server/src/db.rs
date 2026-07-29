@@ -12,7 +12,7 @@ pub async fn connect(url: &str) -> anyhow::Result<PgPool> {
     let opts = PgConnectOptions::from_str(url)?.options([("statement_timeout", "60s")]);
     let pool = PgPoolOptions::new()
         .max_connections(10)
-        // Defense-in-depth for a Patroni/postgres-operator failover (JEF-496). When
+        // Defense-in-depth for a Patroni/postgres-operator failover. When
         // the leader is demoted, the pool keeps live connections to what is now a
         // read-only replica; writes on them fail with SQLSTATE 25006 until the
         // connections recycle and the `-master` DNS re-resolves to the new leader.
@@ -40,8 +40,9 @@ pub async fn connect(url: &str) -> anyhow::Result<PgPool> {
 /// Run pending migrations on a single dedicated connection — deliberately
 /// NOT the query pool from [`connect`] above, so a migration never inherits
 /// that pool's 60s `statement_timeout` or waits behind ingest traffic for a
-/// lock. (JEF-580: migration 0017's `CREATE INDEX` ran on the shared pool,
-/// inherited the 60s bound, and was killed mid-run — crashlooping the pod.)
+/// lock. (Migration 0017's `CREATE INDEX` ran on the shared pool,
+/// inherited the 60s bound, and was killed mid-run — crashlooping the pod;
+/// see ADR 0021.)
 ///
 /// * `lock_timeout=3s`: a migration that can't acquire the lock it needs
 ///   (e.g. blocked behind a long-running transaction on the target table)
@@ -71,7 +72,7 @@ fn migrate_connect_options(url: &str) -> anyhow::Result<PgConnectOptions> {
         .options([("lock_timeout", "3s"), ("statement_timeout", "0")]))
 }
 
-/// Connect options for the online-DDL lane (ADR 0021, JEF-580): a dedicated
+/// Connect options for the online-DDL lane (ADR 0021): a dedicated
 /// connection, not the query pool, so a `CREATE`/`DROP INDEX CONCURRENTLY` build
 /// that runs for minutes on a big table is never cancelled by the pool's 60s
 /// `statement_timeout` (exactly the failure a plain, transactional `CREATE INDEX`
@@ -95,9 +96,9 @@ mod tests {
     use sqlx::Connection;
     use std::time::{Duration, Instant};
 
-    /// JEF-580/590: a migration that can't get the lock it needs must abort within
+    /// A migration that can't get the lock it needs must abort within
     /// `lock_timeout`, not queue behind the holder and head-of-line-block the
-    /// table. Proven at the connection level per the ticket (no real migration
+    /// table. Proven at the connection level (no real migration
     /// file needed): a competing transaction takes an ACCESS EXCLUSIVE lock on a
     /// throwaway table, and a trivial DDL statement on a connection configured
     /// exactly like `migrate`'s must fail fast with a lock_timeout error rather

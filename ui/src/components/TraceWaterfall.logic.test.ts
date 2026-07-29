@@ -53,7 +53,7 @@ describe("barGeometry", () => {
 
 describe("traceDurationMs", () => {
   it("converts the trace's µs window to ms, matching what fmtDuration expects", () => {
-    // JEF-533: the header passed the µs delta straight into fmtDuration
+    // The header used to pass the µs delta straight into fmtDuration
     // (which expects ms), overstating a 480ms trace as "480.00s" — ~1000×.
     const total = 480_000; // 480ms in micros, same basis as `total` in the component
     const ms = traceDurationMs(total);

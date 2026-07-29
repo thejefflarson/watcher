@@ -1,5 +1,5 @@
 #!/bin/sh
-# CI guardrail (JEF-592): fail the build on migration DDL that can stall the big
+# CI guardrail: fail the build on migration DDL that can stall the big
 # telemetry tables (spans, logs, metric_series_rollups) at deploy time.
 #
 # Migration 0017 shipped a plain (non-CONCURRENTLY) `CREATE INDEX` on

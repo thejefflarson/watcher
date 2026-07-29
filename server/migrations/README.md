@@ -16,7 +16,7 @@ one of them briefly blocks writes to that table — fine for a genuinely small o
 brand-new table, a real stall risk once one of these three has millions of rows
 (see `0017_metric_series_rollups_covering_idx.sql`, which hit exactly this).
 Online/heavy DDL against `spans`, `logs`, or `metric_series_rollups` belongs in
-the JEF-580 online-DDL lane (ADR 0021) — run out-of-band from `sqlx::migrate!`'s
+the online-DDL lane (ADR 0021) — run out-of-band from `sqlx::migrate!`'s
 advisory lock, not a boot migration.
 
 ## `-- no-transaction` migrations: one statement per file
@@ -26,7 +26,7 @@ transaction (needed for `CREATE INDEX CONCURRENTLY`, which cannot run inside
 one). It only supports **one statement per no-transaction file** — split a
 multi-step no-transaction change across several numbered migrations instead.
 
-## CI lint: `scripts/lint-migrations.sh` (JEF-592)
+## CI lint: `scripts/lint-migrations.sh`
 
 CI runs `scripts/lint-migrations.sh` against every file in this directory and
 fails the build on:

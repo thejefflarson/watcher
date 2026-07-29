@@ -32,9 +32,9 @@ use crate::access_jwt::{Verifier, VerifyError};
 use crate::mcp_auth::McpAuth;
 
 /// The header Cloudflare Access sets on requests that cleared its edge policy,
-/// carrying the signed identity JWT the origin re-verifies (JEF-473). Under
+/// carrying the signed identity JWT the origin re-verifies (ADR 0013). Under
 /// Managed OAuth this is also what the edge forwards after resolving an MCP
-/// client's opaque OAuth token (JEF-493), so `/api` and `/mcp` verify the same
+/// client's opaque OAuth token (ADR 0019), so `/api` and `/mcp` verify the same
 /// header. Cloudflare strips any client-supplied `Cf-Access-*` header, so the
 /// origin can trust it as edge-set.
 const ACCESS_JWT_HEADER: &str = "Cf-Access-Jwt-Assertion";
@@ -58,7 +58,7 @@ pub(crate) enum Assertion {
 
 /// Verify a request's `Cf-Access-Jwt-Assertion` header against `verifier`. The
 /// single place the header name and the `VerifyError` → outcome mapping live, so
-/// the `/api` and `/mcp` guards share exactly one verification path (JEF-493).
+/// the `/api` and `/mcp` guards share exactly one verification path (ADR 0019).
 pub(crate) async fn check_access_assertion(
     verifier: &Verifier,
     headers: &axum::http::HeaderMap,
@@ -165,7 +165,7 @@ async fn ui_handler(uri: Uri) -> Response {
 }
 
 /// Middleware that re-verifies the Cloudflare Access JWT on the read surface
-/// (JEF-473). Origin-side defense-in-depth on top of the edge Access policy: a
+/// (ADR 0013). Origin-side defense-in-depth on top of the edge Access policy: a
 /// request missing or carrying an invalid `Cf-Access-Jwt-Assertion` is rejected
 /// `401` before reaching a handler. Wired **only** onto the UI shell + `/api`
 /// (never `/v1` ingest or `/healthz`) and only when Access is configured — see
@@ -203,13 +203,13 @@ pub fn app(pool: PgPool) -> Router {
 }
 
 /// Build the HTTP router, optionally enforcing Cloudflare Access JWT verification
-/// (JEF-473) on the read surface; MCP auth is taken from the environment.
+/// (ADR 0013) on the read surface; MCP auth is taken from the environment.
 pub fn app_with_access(pool: PgPool, access: Option<Arc<Verifier>>) -> Router {
     app_with_auth(pool, access, McpAuth::from_env())
 }
 
 /// Build the HTTP router, optionally enforcing Cloudflare Access JWT verification
-/// (JEF-473) on the read surface and Managed-OAuth assertion auth (JEF-493) on `/mcp`.
+/// (ADR 0013) on the read surface and Managed-OAuth assertion auth (ADR 0019) on `/mcp`.
 ///
 /// The server holds no app-layer auth by default — auth lives at the edge
 /// (Cloudflare Access for the public read surface) and ingest is only reachable
@@ -278,10 +278,10 @@ pub fn app_with_auth(
         .merge(ingest)
         .merge(guarded);
 
-    // Read-only MCP server (JEF-471), opt-in via WATCHER_MCP_ENABLED (default OFF).
+    // Read-only MCP server (ADR 0018), opt-in via WATCHER_MCP_ENABLED (default OFF).
     // Nested as its own tower service *outside* the `/api` router — and therefore
     // outside the browser Access guard above, since an MCP client is not a browser
-    // and carries no Access cookie. Under Cloudflare Managed OAuth (JEF-493) the edge
+    // and carries no Access cookie. Under Cloudflare Managed OAuth (ADR 0019) the edge
     // resolves the client's opaque OAuth token and forwards a `Cf-Access-Jwt-Assertion`;
     // `mcp_auth::assertion_guard` validates that assertion (its own AUD, fail-closed).
     // Cloudflare owns OAuth discovery, so no `.well-known` metadata is self-served.

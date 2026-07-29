@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { AlertRule } from "../api";
 import { chartHref } from "./Alerts";
 
-// The rules-table primary cell is a <Link to={chartHref(...)}> (JEF-443). These
+// The rules-table primary cell is a <Link to={chartHref(...)}>. These
 // tests lock the exact deep-link target — same chart + threshold/firing overlay
 // params the whole-row navigation built before — so the row-interaction refactor
 // can't silently move where a rule points.

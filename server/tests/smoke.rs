@@ -155,7 +155,7 @@ fn one_number(
     metric_request(name, service, data)
 }
 
-/// One gauge point carrying a single OTLP exemplar (JEF-433), so ingest's
+/// One gauge point carrying a single OTLP exemplar, so ingest's
 /// `first_exemplar` decode path has something to pick up. `trace_id`/`span_id`
 /// are raw bytes — hex-encode the return value to compare against the API.
 fn gauge_with_exemplar(
@@ -365,7 +365,7 @@ async fn ingest_and_query_a_log() {
             scope_logs: vec![ScopeLogs {
                 log_records: vec![LogRecord {
                     // Real "now" rather than a fixed epoch value: /api/logs floors
-                    // to a recent default window (JEF-546), so a fake 1970
+                    // to a recent default window, so a fake 1970
                     // timestamp would fall outside it and never come back.
                     time_unix_nano: now_nanos(),
                     severity_number: 9, // INFO
@@ -418,7 +418,7 @@ async fn ingest_and_query_a_log() {
 #[tokio::test]
 #[serial]
 async fn ingest_a_log_batch_persists_every_row_in_one_call() {
-    // JEF-495: store_logs batches a whole request into chunked INSERTs. A single
+    // store_logs batches a whole request into chunked INSERTs. A single
     // multi-record request must land every row (identical column values) and not
     // touch DROP_INSERT.
     let Some(pool) = pool_or_skip().await else {
@@ -429,7 +429,7 @@ async fn ingest_a_log_batch_persists_every_row_in_one_call() {
     const N: usize = 250;
     let drops_before = selfmon::DROP_INSERT.load(std::sync::atomic::Ordering::Relaxed);
     // Real "now" rather than a fixed epoch value: /api/logs floors to a recent
-    // default window (JEF-546), so fake 1970 timestamps would fall outside it
+    // default window, so fake 1970 timestamps would fall outside it
     // and never come back via the `/api/logs?service=batcher` check below.
     let base_nanos = now_nanos();
     let records: Vec<LogRecord> = (0..N)
@@ -488,7 +488,7 @@ async fn ingest_a_log_batch_persists_every_row_in_one_call() {
 #[tokio::test]
 #[serial]
 async fn ingest_a_span_batch_persists_and_dedupes_in_one_call() {
-    // JEF-495: store_traces batches too. Distinct spans all land; an intra-batch
+    // store_traces batches too. Distinct spans all land; an intra-batch
     // duplicate (same trace_id/span_id) is collapsed by ON CONFLICT DO NOTHING,
     // exactly as the old per-row insert did.
     let Some(pool) = pool_or_skip().await else {
@@ -678,7 +678,7 @@ async fn metric_series_honors_absolute_from_to_window() {
     assert_eq!(arr[0]["v"], 0.9);
 
     // Same window via facet and histogram — both must render the exact absolute
-    // range too, not just `series` (JEF-433).
+    // range too, not just `series`.
     ingest(
         &router,
         one_number("reqs", None, "api", None, 0.9, nanos_ago(5400)),
@@ -742,8 +742,8 @@ async fn metric_series_honors_absolute_from_to_window() {
 
 /// The series endpoint's window is capped at the retention-derived ceiling
 /// (`resolve_window`'s `max_hours` for `/api/metrics/series` — `24 * 7` at the
-/// default `WATCHER_RETENTION_DAYS`, JEF-593; previously a flat 90 days,
-/// JEF-548). Originally the query whose wide-window rollup scan was traced
+/// default `WATCHER_RETENTION_DAYS`; previously a flat 90 days).
+/// Originally the query whose wide-window rollup scan was traced
 /// holding a pool connection for tens of seconds (the fix: a covering index on
 /// `metric_series_rollups`, migration 0017). This doesn't benchmark the index
 /// directly (no way to force a plan choice through the HTTP API), but it does
@@ -786,7 +786,7 @@ async fn metric_series_wide_window_returns_bounded_correct_points() {
     assert_eq!(times, sorted, "points must be ordered t ASC");
 }
 
-/// JEF-561/JEF-593: at the (now retention-derived) 7-day ceiling the adaptive
+/// At the (now retention-derived) 7-day ceiling the adaptive
 /// output bucket widens from the base 300s rollup bucket to
 /// `300 * ceil((168h in secs / 300) / 1000) = 900s` (see `output_bucket_secs`'s
 /// unit tests for that math) — a chart gets bounded output instead of one
@@ -841,7 +841,7 @@ async fn metric_series_wide_window_reaggregates_merged_buckets_correctly() {
     assert_eq!(arr[1]["v"], 4.25);
 }
 
-/// JEF-561: a narrow window (well under `TARGET_POINTS * base`) must keep the
+/// A narrow window (well under `TARGET_POINTS * base`) must keep the
 /// base 5-min rollup resolution unchanged — two points a couple of buckets
 /// apart must stay distinct, not fold into a coarser bucket.
 #[tokio::test]
@@ -1028,7 +1028,7 @@ async fn ui_fallback_does_not_shadow_api() {
     }
 }
 
-// --- Self-monitoring + deep /healthz (JEF-425) -----------------------------
+// --- Self-monitoring + deep /healthz (ADR 0014) -----------------------------
 
 #[tokio::test]
 #[serial]
@@ -1162,7 +1162,7 @@ async fn rollup_vacuum_health_canary_emits_dead_tuple_ratio_and_optional_vm_frac
         "must not report an autovacuum age before autovacuum has ever run"
     );
 
-    // pg_visibility is an optional contrib extension (JEF-594): the app never
+    // pg_visibility is an optional contrib extension: the app never
     // creates it itself (it's not "trusted", so it needs superuser -- that's a
     // cluster-ops concern, not read-only introspection), but exercise the
     // happy path when the test DB's role can install it, so the extraction
@@ -1194,7 +1194,7 @@ async fn rollup_vacuum_health_canary_emits_dead_tuple_ratio_and_optional_vm_frac
     );
 }
 
-// --- Self-log instrumentation (JEF-452) ------------------------------------
+// --- Self-log instrumentation (ADR 0016) ------------------------------------
 
 #[tokio::test]
 #[serial]
@@ -1273,7 +1273,7 @@ async fn self_logs_correlate_with_current_span() {
         return;
     };
     // With the otel layer in the stack, an event inside a span must carry that span's
-    // trace/span ids so self-logs link to self-traces (the span→logs drill, JEF-429).
+    // trace/span ids so self-logs link to self-traces (the span→logs drill).
     let (layer, mut rx) = selflog::channel_layer();
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
     let otel_layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("test"));
@@ -1320,7 +1320,7 @@ async fn self_logs_correlate_with_current_span() {
     assert!(outside["span_id"].is_null());
 }
 
-// --- Self-trace instrumentation (JEF-462) ----------------------------------
+// --- Self-trace instrumentation (ADR 0017) ----------------------------------
 
 #[tokio::test]
 #[serial]
@@ -1353,7 +1353,7 @@ async fn self_traces_land_in_spans_and_appear_in_services() {
         tracing::info!("handling watcher request");
     });
     // Flush the batch processor so the ended span reaches the exporter's channel. A
-    // shut-down processor (the JEF-462 bug) would export nothing.
+    // shut-down processor (the original network-self-export bug) would export nothing.
     provider.force_flush().expect("force_flush");
 
     // Drain into the DB while the subscriber is still active: storing self-spans runs
@@ -1458,7 +1458,7 @@ async fn insert_rollup_at(pool: &sqlx::PgPool, name: &str, secs_ago: f64) {
 }
 
 /// Like `insert_rollup_at`, but with an explicit `count`/`sum` so a test can
-/// pin the exact count-weighted average a re-aggregated (JEF-561) output
+/// pin the exact count-weighted average a re-aggregated output
 /// bucket must produce.
 async fn insert_rollup_with(pool: &sqlx::PgPool, name: &str, secs_ago: f64, count: i64, sum: f64) {
     sqlx::query(
@@ -1478,7 +1478,7 @@ async fn insert_rollup_with(pool: &sqlx::PgPool, name: &str, secs_ago: f64, coun
 
 /// A raw histogram rollup row (same `series_key` for every call with the same
 /// `name`, so multiple rows are one series) — lets a test pin exact
-/// `bucket_counts` a re-aggregated (JEF-561) output bucket's `array_sum` must
+/// `bucket_counts` a re-aggregated output bucket's `array_sum` must
 /// produce.
 async fn insert_hist_rollup_with(
     pool: &sqlx::PgPool,
@@ -1888,7 +1888,7 @@ async fn metric_histogram_interpolates_percentiles() {
     assert_eq!(b["counts"], serde_json::json!([0, 100, 0, 0]));
 }
 
-/// JEF-561: `metric_histogram` now pre-aggregates each series into the
+/// `metric_histogram` pre-aggregates each series into the
 /// adaptive output bucket in SQL (`array_sum(bucket_counts)`, the same fold
 /// `insert_histograms` uses on ingest) before the Rust pass sums across
 /// series. `hours=100` puts the span at 360,000s, so the adaptive width there
@@ -2221,7 +2221,7 @@ async fn retention_prunes_raw_metrics_before_rollups() {
     assert_eq!(count(&pool, "metric_series_rollups").await, 1);
 }
 
-/// Per-table windows (JEF-434): spans get a short window, logs a long one, and
+/// Per-table windows: spans get a short window, logs a long one, and
 /// metric rollups fall back to the global default (no override at all) — each
 /// table must prune to its own cutoff, not the global one.
 #[tokio::test]
@@ -3106,7 +3106,7 @@ async fn service_red_aggregates() {
     assert!((s["p50_ms"].as_f64().unwrap() - 25.0).abs() < 1e-6);
 }
 
-// JEF-532: an explicit `from` far beyond the max-lookback ceiling must not
+// An explicit `from` far beyond the max-lookback ceiling must not
 // defeat it — the effective floor is clamped, not honored verbatim, so a
 // full scan of the retention-deep `spans` table can't be forced.
 #[tokio::test]
@@ -3172,7 +3172,7 @@ async fn services_from_beyond_max_lookback_is_clamped() {
     );
 }
 
-// JEF-546: same clamp as JEF-532's query_traces, extended to /api/logs — an
+// Same clamp as query_traces' above, extended to /api/logs — an
 // explicit `from` far beyond the max-lookback ceiling must not defeat it, and
 // with no `from` at all a full scan (e.g. an ILIKE search for a rare/absent
 // term) must not walk the whole retention window either.
@@ -3239,7 +3239,7 @@ async fn logs_attribute_filter() {
     assert_eq!(all.as_array().unwrap().len(), 2);
 }
 
-// --- Origin-side Cloudflare Access JWT verification (JEF-473) ---------------
+// --- Origin-side Cloudflare Access JWT verification (ADR 0013) ---------------
 //
 // The middleware guards the UI shell + /api when Access is configured, and never
 // guards /v1 ingest or /healthz. These prove the route policy end-to-end using a
@@ -3428,11 +3428,11 @@ async fn access_unconfigured_leaves_api_open() {
     );
 }
 
-// --- MCP server + auth (JEF-471 / JEF-493) ---------------------------------
+// --- MCP server + auth (ADR 0018 / ADR 0019) --------------------------------
 //
 // Under Cloudflare Managed OAuth the edge resolves the MCP client's opaque OAuth
 // token and forwards the origin the standard `Cf-Access-Jwt-Assertion` JWT — the
-// SAME header `/api` validates (JEF-473), but minted for a DEDICATED Access app
+// SAME header `/api` validates (ADR 0013), but minted for a DEDICATED Access app
 // (its own AUD, distinct from the browser app's) and validated by the shared
 // `access_jwt::Verifier`. These tests reuse the browser-auth test key/JWKS but sign
 // with the MCP AUD, and prove the 401/200 matrix (fail-closed) and the fail-closed
@@ -3679,7 +3679,7 @@ async fn mcp_lists_tools_and_calls_read_queries() {
     server.abort();
 }
 
-// Regression for JEF-494: a faceted gauge whose latest meta row is a rollup with a
+// Regression: a faceted gauge whose latest meta row is a rollup with a
 // NULL `kind` (metric_series_rollups.kind is nullable) must return 200, not 500. The
 // meta query used to decode `kind` as a bare String, so "unexpected null" surfaced as
 // an unlogged 500 — breaking the chart page for e.g. k8s.container.restarts.

@@ -22,7 +22,7 @@ RUN VITE_API_BASE="" npm run build
 # chef's `cook` leaves the shared target dir in a state where those extern `.rmeta`
 # files don't survive into the final `cargo build`, so sccache fatals ("Failed to
 # open file for hashing: …/lib*.rmeta: No such file or directory") and aborts
-# (JEF-389, confirmed real and backend-independent). Collapsed to one build stage:
+# (confirmed real and backend-independent). Collapsed to one build stage:
 # COPY source, one `cargo build`. Migrations are embedded via sqlx::migrate! and
 # the UI via rust-embed, so the runtime image needs only the binary + CA certs.
 FROM rust:1-bookworm AS build
@@ -42,7 +42,7 @@ COPY server/migrations ./migrations
 COPY server/src ./src
 COPY --from=ui /ui/dist /ui/dist
 # sccache backend = the shared Cloudflare R2 bucket (cluster repo: charts/sccache,
-# ADR-0020, JEF-584), replacing the in-cluster Redis this used to hardcode. The config
+# ADR-0020), replacing the in-cluster Redis this used to hardcode. The config
 # and the bucket-scoped token arrive as BuildKit build SECRETS — never ENV or a
 # build-arg, both of which persist in `docker history` on every image we push to ghcr.
 #

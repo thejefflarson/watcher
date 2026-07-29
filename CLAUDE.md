@@ -67,7 +67,7 @@ digest and rolls it. ARM images are required for Raspberry Pi nodes (CI builds t
 
 Traces, logs, metrics (latest-value table **and** time-series charts), OTLP HTTP +
 gRPC, service map, retention (global default + optional per-table
-spans/logs/metrics windows, JEF-434), metric downsampling/rollups, threshold
+spans/logs/metrics windows), metric downsampling/rollups, threshold
 alerting (rules + events + email/webhook). Alert rules are **declarative**: a JSON
 config (rendered from the chart's `server.alerts` values, env
 `WATCHER_ALERTS_CONFIG`) is reconciled into the DB on startup and the

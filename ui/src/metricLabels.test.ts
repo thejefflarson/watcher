@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { facetLabels } from "./metricLabels";
 
-// JEF-494: node/host metrics carry both the reporting agent's identity and the
+// Node/host metrics carry both the reporting agent's identity and the
 // node/container they describe. Series must be labeled by the node/container, not
 // the agent, and uid/id-style keys stay suppressed.
 describe("facetLabels", () => {
