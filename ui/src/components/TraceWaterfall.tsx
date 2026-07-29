@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router";
 import { getTrace, type SpanRow } from "../api";
 import { rowKeyActivate } from "../a11y";
 import { logsHref } from "../links";

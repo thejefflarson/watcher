@@ -7,7 +7,7 @@ import {
   useNavigate,
   useParams,
   useSearchParams,
-} from "react-router-dom";
+} from "react-router";
 import TraceList from "./components/TraceList";
 import TraceWaterfall from "./components/TraceWaterfall";
 import LogView from "./components/LogView";
