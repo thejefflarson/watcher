@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router";
 
 // Relative ranges. `ms: 0` means unbounded ("all").
 export const RANGES: { key: string; label: string; ms: number }[] = [

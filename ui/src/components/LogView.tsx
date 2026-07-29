@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router";
 import { listLogs, type LogRow } from "../api";
 import { firstRunHint } from "../empty";
 import { traceHref } from "../links";

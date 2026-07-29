@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router";
 import { listTraces, type TraceSummary } from "../api";
 import { useControls, rangeParams } from "../timerange";
 import { useSort } from "../sort";
