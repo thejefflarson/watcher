@@ -45,11 +45,11 @@ opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 tracing-opentelemetry = "0.33"
 lettre = { version = "0.11.22", default-features = false, features = ["builder", "smtp-transport", "hostname", "tokio1-rustls-tls"] }
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
-rmcp = { version = "2.2.0", features = ["transport-streamable-http-server"] }
+rmcp = { version = "3.0.1", features = ["transport-streamable-http-server"] }
 schemars = "1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 serial_test = "4.0.1"
-rmcp = { version = "2.2.0", features = ["client", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "3.0.1", features = ["client", "transport-streamable-http-client-reqwest"] }
