@@ -2291,6 +2291,97 @@ async fn retention_raw_metrics_drains_in_batches() {
     assert_eq!(count(&pool, "metrics").await, 1);
 }
 
+/// The history tables (spans/logs/metric_series_rollups) must drain a backlog
+/// across MULTIPLE statements, exactly like raw metrics.
+///
+/// This is the regression test for the bug that made retention permanently
+/// stall: those deletes were issued as ONE unbatched `DELETE ... WHERE time <
+/// cutoff`. Against a real backlog that exceeds the connection's
+/// statement_timeout it is cancelled, rolls back completely, deletes nothing,
+/// and the next sweep faces a larger backlog. On 2026-08-25 `logs` held 11.5M
+/// expired rows and retention had never completed a single sweep.
+///
+/// The old shape passes the existing `retention_prunes_old_rows` test, because
+/// two rows per table always fit in one statement. `batch = 1` is what actually
+/// exercises the loop.
+#[tokio::test]
+#[serial]
+async fn retention_history_tables_drain_in_batches() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let day = 86_400.0;
+    for _ in 0..3 {
+        insert_log_at(&pool, "svc", 10.0 * day).await;
+    }
+    insert_log_at(&pool, "svc", 1.0 * day).await;
+
+    let pruned = watcher_server::retention::prune_batched(&pool, "logs", "time", "days", 7, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        pruned, 3,
+        "backlog must drain across batches, not stop after one"
+    );
+    assert_eq!(count(&pool, "logs").await, 1, "in-window row must survive");
+}
+
+/// One failing table must not starve the tables after it in the sweep.
+///
+/// The loop used `?`, so the first failure aborted the whole sweep — and
+/// `metric_series_rollups` is ordered AFTER `logs`, so once the `logs` delete
+/// began timing out hourly, the rollups table was never swept again and grew to
+/// 20 GB. Here a BEFORE DELETE trigger makes `spans` (the FIRST table) fail;
+/// `logs` comes after it and must still be pruned.
+#[tokio::test]
+#[serial]
+async fn retention_one_failing_table_does_not_starve_the_rest() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let day = 86_400.0;
+    insert_span_at(&pool, "svc", "old", "o", 10.0 * day).await;
+    insert_log_at(&pool, "svc", 10.0 * day).await;
+
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION retention_test_boom() RETURNS trigger AS $$
+         BEGIN RAISE EXCEPTION 'induced failure'; END; $$ LANGUAGE plpgsql",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER retention_test_boom BEFORE DELETE ON spans
+         FOR EACH STATEMENT EXECUTE FUNCTION retention_test_boom()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let res = watcher_server::retention::prune_once(
+        &pool,
+        7,
+        0,
+        watcher_server::retention::Windows::default(),
+    )
+    .await;
+
+    sqlx::query("DROP TRIGGER IF EXISTS retention_test_boom ON spans")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // The sweep as a whole must still report failure — a partial sweep leaves a
+    // table growing, so /healthz has to keep reporting the stall.
+    assert!(res.is_err(), "a failed table must fail the sweep");
+    // ...but the tables after the failing one must have been pruned anyway.
+    assert_eq!(
+        count(&pool, "logs").await,
+        0,
+        "logs is ordered after spans and must still be pruned when spans fails"
+    );
+}
+
 // --- Alerts ----------------------------------------------------------------
 
 /// Apply declared rules through the real reconcile path. Rules are declarative

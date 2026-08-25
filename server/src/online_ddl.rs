@@ -57,23 +57,42 @@ pub struct OnlineIndex {
 /// `include_columns_drifted`, which makes the lane detect and rebuild that
 /// narrowing against the wide index migration 0017 built, rather than treating
 /// the existing valid-and-same-name index as done forever.
-pub const DESIRED_INDEXES: &[OnlineIndex] = &[OnlineIndex {
-    name: "metric_series_rollups_name_bucket_covering_idx",
-    table: "metric_series_rollups",
-    include_cols: &[
-        "service",
-        "kind",
-        "unit",
-        "is_monotonic",
-        "count",
-        "sum",
-        "avg",
-        "max",
-    ],
-    create_sql: "CREATE INDEX CONCURRENTLY metric_series_rollups_name_bucket_covering_idx \
+pub const DESIRED_INDEXES: &[OnlineIndex] = &[
+    OnlineIndex {
+        name: "metric_series_rollups_name_bucket_covering_idx",
+        table: "metric_series_rollups",
+        include_cols: &[
+            "service",
+            "kind",
+            "unit",
+            "is_monotonic",
+            "count",
+            "sum",
+            "avg",
+            "max",
+        ],
+        create_sql: "CREATE INDEX CONCURRENTLY metric_series_rollups_name_bucket_covering_idx \
                  ON metric_series_rollups (name, bucket) \
                  INCLUDE (service, kind, unit, is_monotonic, count, sum, avg, max)",
-}];
+    },
+    OnlineIndex {
+        // Freshness probe support. `selfmon` runs
+        //   SELECT extract(epoch FROM now() - max(bucket)) FROM metric_series_rollups
+        // once a minute. Both other indexes on this table lead with `name`, so a bare
+        // `max(bucket)` with no `name` predicate can use neither and Postgres falls
+        // back to a full scan. Measured 2026-08-25 in production: a Parallel Seq Scan
+        // over 14.8M rows, 966k buffer reads, ~2.9s EVERY MINUTE. With this index the
+        // same query is an Index Only Scan reading one row — 0.142ms.
+        //
+        // `bucket DESC` so the backward scan `max()` wants is the index's natural
+        // order. No INCLUDE: the query selects nothing but `bucket`.
+        name: "metric_series_rollups_bucket_idx",
+        table: "metric_series_rollups",
+        include_cols: &[],
+        create_sql: "CREATE INDEX CONCURRENTLY metric_series_rollups_bucket_idx \
+                 ON metric_series_rollups (bucket DESC)",
+    },
+];
 
 /// Session-level advisory-lock key that gates a whole lane run, so exactly one
 /// replica builds during a rollout and the others skip cleanly. Arbitrary but
