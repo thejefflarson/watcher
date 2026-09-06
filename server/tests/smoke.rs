@@ -20,6 +20,8 @@ use opentelemetry_proto::tonic::{
 use prost::Message;
 use serde_json::json;
 use serial_test::serial;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 use tracing_subscriber::layer::SubscriberExt;
@@ -1191,6 +1193,103 @@ async fn rollup_vacuum_health_canary_emits_dead_tuple_ratio_and_optional_vm_frac
     assert!(
         (0.0..=1.0).contains(&fraction),
         "fraction {fraction} out of range"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn rollup_vacuum_health_canary_pg_visibility_permission_denied_stops_probing() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+
+    // Same optional-extension precondition as the happy-path test above.
+    let vm_extension_available = sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_visibility")
+        .execute(&pool)
+        .await
+        .is_ok();
+    if !vm_extension_available {
+        eprintln!("skipping permission-denied test: pg_visibility unavailable");
+        return;
+    }
+
+    // Reproduce the real SQLSTATE 42501 the watcher app role hits in production:
+    // `pg_visibility_map_summary`'s installer REVOKEs EXECUTE from PUBLIC and GRANTs
+    // it only to superuser / the `pg_stat_scan_tables` role. `pool_or_skip`'s
+    // connection is a superuser (the docker-entrypoint POSTGRES_USER), which bypasses
+    // that ACL check entirely, so exercising the real error needs a genuinely
+    // restricted login role rather than a mocked `DatabaseError` -- see the note at
+    // the bottom of `selfmon.rs`'s test module.
+    const ROLE: &str = "selfmon_permission_denied_test";
+    // DROP ROLE fails while any GRANT still names the role, so strip a stale
+    // role's grants first -- `.ok()` because DROP OWNED BY itself errors when the
+    // role doesn't exist yet (the common case).
+    let _ = sqlx::query("DROP OWNED BY selfmon_permission_denied_test")
+        .execute(&pool)
+        .await;
+    sqlx::query("DROP ROLE IF EXISTS selfmon_permission_denied_test")
+        .execute(&pool)
+        .await
+        .expect("drop stale test role");
+    sqlx::query(
+        "CREATE ROLE selfmon_permission_denied_test LOGIN PASSWORD 'selfmon-test' NOSUPERUSER",
+    )
+    .execute(&pool)
+    .await
+    .expect("create restricted test role");
+    // Baseline SELECT on every table so the *other* `collect_metrics` queries
+    // (table_bytes, oldest-raw-metric age, rollup lag, ...) succeed normally --
+    // this test isolates the pg_visibility permission specifically, not general
+    // table access.
+    sqlx::query("GRANT SELECT ON ALL TABLES IN SCHEMA public TO selfmon_permission_denied_test")
+        .execute(&pool)
+        .await
+        .expect("grant baseline table access");
+
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL (checked by pool_or_skip)");
+    let opts = PgConnectOptions::from_str(&url)
+        .expect("parse DATABASE_URL")
+        .username(ROLE)
+        .password("selfmon-test");
+    let restricted_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .expect("connect as the restricted role");
+
+    // Two self-telemetry ticks: the first hits the real permission-denied error and
+    // must gate the probe (`PG_VISIBILITY_PERMISSION_DENIED` in selfmon.rs); the
+    // second must not even attempt the query again. Both must still succeed
+    // end-to-end -- a cosmetic probe failure must never fail self-telemetry.
+    selfmon::emit_once(&restricted_pool)
+        .await
+        .expect("emit succeeds despite the pg_visibility permission error");
+    selfmon::emit_once(&restricted_pool)
+        .await
+        .expect("second emit still succeeds; the probe must not retry a denied query");
+
+    restricted_pool.close().await;
+    // DROP ROLE fails while any GRANT still names the role (our baseline SELECT
+    // above), even with no live connections -- strip those first.
+    sqlx::query("DROP OWNED BY selfmon_permission_denied_test")
+        .execute(&pool)
+        .await
+        .expect("drop owned-by test role");
+    sqlx::query("DROP ROLE selfmon_permission_denied_test")
+        .execute(&pool)
+        .await
+        .expect("drop test role");
+
+    let router = app(pool.clone());
+    let (status, metrics) = get_json(&router, "/api/metrics?service=watcher").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !metrics
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["name"] == "watcher.db.vm_all_visible_fraction"),
+        "a permission-denied role must never emit vm_all_visible_fraction"
     );
 }
 
