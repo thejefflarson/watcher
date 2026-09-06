@@ -401,15 +401,22 @@ async fn collect_metrics(pool: &PgPool) -> anyhow::Result<Vec<Metric>> {
     // the extension isn't there, so skip the gauge rather than failing the whole
     // snapshot; the dead-tuple ratio and autovacuum age above still cover the
     // canary on their own.
-    match rollup_vm_all_visible_fraction(pool).await {
-        Ok(Some(fraction)) => metrics.push(gauge(
-            "watcher.db.vm_all_visible_fraction",
-            "1",
-            vec![point(fraction, &[("table", ROLLUP_TABLE)], nanos)],
-        )),
-        Ok(None) => {}
-        Err(e) if is_undefined_function(&e) => log_pg_visibility_missing_once(),
-        Err(e) => tracing::warn!("self-telemetry: pg_visibility query failed: {e}"),
+    // Permission-denied is terminal, not transient: the app role either has
+    // pg_stat_scan_tables or it doesn't, and this app-side code has no way to grant
+    // itself the missing privilege. Once denied, skip the query entirely on later
+    // ticks rather than paying for a call that can never succeed.
+    if !PG_VISIBILITY_PERMISSION_DENIED.load(Ordering::Relaxed) {
+        match rollup_vm_all_visible_fraction(pool).await {
+            Ok(Some(fraction)) => metrics.push(gauge(
+                "watcher.db.vm_all_visible_fraction",
+                "1",
+                vec![point(fraction, &[("table", ROLLUP_TABLE)], nanos)],
+            )),
+            Ok(None) => {}
+            Err(e) if is_undefined_function(&e) => log_pg_visibility_missing_once(),
+            Err(e) if is_permission_denied(&e) => log_pg_visibility_denied_once(),
+            Err(e) => tracing::warn!("self-telemetry: pg_visibility query failed: {e}"),
+        }
     }
 
     Ok(metrics)
@@ -463,6 +470,35 @@ fn log_pg_visibility_missing_once() {
         tracing::info!(
             "self-telemetry: pg_visibility extension not installed -- \
              watcher.db.vm_all_visible_fraction will not be emitted; \
+             watcher.db.dead_tuple_ratio and watcher.db.last_autovacuum_age_seconds \
+             still cover the index-only-scan health canary"
+        );
+    }
+}
+
+/// `pg_visibility_map_summary` is restricted to superusers and roles granted
+/// `pg_stat_scan_tables`; SQLSTATE `42501` (insufficient_privilege) is Postgres'
+/// code for that, more robust than matching the error message text.
+fn is_permission_denied(err: &sqlx::Error) -> bool {
+    matches!(err, sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("42501"))
+}
+
+/// Set once `is_permission_denied` fires, gating the query itself (see the check
+/// around the `match` in `collect_metrics`) rather than only muting the log line --
+/// unlike a missing extension, a denied role can't become permitted without a
+/// cluster-ops grant this process will never see take effect mid-run, so nothing is
+/// gained by re-querying every tick.
+static PG_VISIBILITY_PERMISSION_DENIED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Logs the permission-denied notice once per process, then flips
+/// `PG_VISIBILITY_PERMISSION_DENIED` so the probe stops running.
+fn log_pg_visibility_denied_once() {
+    if !PG_VISIBILITY_PERMISSION_DENIED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "self-telemetry: pg_visibility query permission denied -- the watcher app role \
+             lacks pg_stat_scan_tables (and isn't superuser); watcher.db.vm_all_visible_fraction \
+             will not be emitted and this probe will not run again this process; \
              watcher.db.dead_tuple_ratio and watcher.db.last_autovacuum_age_seconds \
              still cover the index-only-scan health canary"
         );
@@ -604,9 +640,31 @@ mod tests {
         assert_eq!(vm_all_visible_fraction(0, 0), None);
     }
 
-    // `is_undefined_function` (the SQLSTATE-42883 check) isn't unit-tested with a
-    // mock `DatabaseError` — matching `otlp::is_failover_error`, its peer
-    // SQLSTATE-classifying helper, which is likewise only exercised against a
-    // real Postgres error in an integration test rather than a hand-rolled
-    // trait impl. See `rollup_vacuum_health_canary_*` in tests/smoke.rs.
+    #[test]
+    fn pg_visibility_denied_logs_once_and_gates_future_probes() {
+        // This static is process-wide, so run the flip and both assertions in one
+        // test rather than splitting them across tests that could interleave.
+        assert!(
+            !PG_VISIBILITY_PERMISSION_DENIED.load(Ordering::Relaxed),
+            "must start ungated"
+        );
+        log_pg_visibility_denied_once();
+        assert!(
+            PG_VISIBILITY_PERMISSION_DENIED.load(Ordering::Relaxed),
+            "the first denial must flip the gate that `collect_metrics` checks \
+             before running the query again"
+        );
+        // A repeat call (e.g. a second self-telemetry tick landing before the gate
+        // is checked) must not un-flip anything or panic -- `swap` is idempotent.
+        log_pg_visibility_denied_once();
+        assert!(PG_VISIBILITY_PERMISSION_DENIED.load(Ordering::Relaxed));
+    }
+
+    // `is_undefined_function` and `is_permission_denied` (the SQLSTATE-42883 /
+    // 42501 checks) aren't unit-tested with a mock `DatabaseError` — matching
+    // `otlp::is_failover_error`, their peer SQLSTATE-classifying helper, which is
+    // likewise only exercised against a real Postgres error in an integration test
+    // rather than a hand-rolled trait impl. See `rollup_vacuum_health_canary_*`
+    // and `rollup_vacuum_health_canary_pg_visibility_permission_denied_*` in
+    // tests/smoke.rs.
 }
