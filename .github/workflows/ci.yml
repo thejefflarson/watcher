@@ -19,8 +19,14 @@ jobs:
     # runner's rust/postgres setup, but stays on the same runner pool for
     # consistency with the rest of this workflow.
     runs-on: watcher-runners
+    # The runners are self-hosted and persistent, so never execute code from a
+    # forked pull request on them — that would be arbitrary code execution on
+    # the build infrastructure. Push events and same-repo PRs are fine.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: scripts/lint-migrations.sh server/migrations
 
   server:
@@ -29,6 +35,12 @@ jobs:
     # repo: charts/actions/runners/values-watcher.yaml) reachable at localhost:5432,
     # so the ARC-can't-run-a-service-container reason for staying hosted is gone.
     runs-on: watcher-runners
+    # The runners are self-hosted and persistent, so never execute code from a
+    # forked pull request on them — that would be arbitrary code execution on
+    # the build infrastructure. Push events and same-repo PRs are fine.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     env:
       DATABASE_URL: postgres://watcher:watcher@localhost:5432/watcher
       # sccache -> the shared Cloudflare R2 bucket (cluster repo: charts/sccache,
@@ -49,11 +61,12 @@ jobs:
       run:
         working-directory: server
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-targets: false
           workspaces: server
@@ -95,12 +108,18 @@ jobs:
 
   ui:
     runs-on: watcher-runners
+    # The runners are self-hosted and persistent, so never execute code from a
+    # forked pull request on them — that would be arbitrary code execution on
+    # the build infrastructure. Push events and same-repo PRs are fine.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     defaults:
       run:
         working-directory: ui
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
@@ -138,7 +157,7 @@ jobs:
       id-token: write # keyless cosign signing (OIDC token -> Sigstore Fulcio)
       attestations: write # Sigstore-signed SLSA build-provenance attestation (protector verifies it)
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Connect to BuildKit (mTLS, native per-arch)
         # Two native builders share one CA (cluster: charts/actions/buildkit +
         # values-arm64.yaml): amd64 on `buildkit` (node-3), arm64 on `buildkit-arm64`
