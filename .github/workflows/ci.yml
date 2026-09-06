@@ -65,6 +65,14 @@ jobs:
         # cache, but not the binary, so a plain binstall skips and sccache is absent
         # from PATH (RUSTC_WRAPPER then fails). Force a real install every run.
         run: cargo binstall --no-confirm --force sccache
+      # Fail-soft sccache backend: prefer the shared R2 bucket, degrade to a LOCAL
+      # disk cache if it's unreachable instead of hard-failing on "Timed out waiting
+      # for server startup" (sccache's S3 backend is EAGER). GITHUB_ENV can't unset a
+      # var, so the fallback exports an EMPTY SCCACHE_BUCKET alongside SCCACHE_DIR —
+      # see the measurements in the script. Invoked by absolute path: this job's
+      # `defaults.run.working-directory` is `server`, not the repo root.
+      - name: Start sccache (fail-soft to local disk if R2 is down)
+        run: bash "${GITHUB_WORKSPACE}/.github/scripts/start-sccache.sh"
       # The postgres sidecar boots in parallel with the runner container; block until
       # it accepts TCP before building/testing. bash /dev/tcp avoids needing a client.
       - name: Wait for postgres sidecar
