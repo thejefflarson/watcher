@@ -19,7 +19,7 @@ sqlx = { version = "0.9", default-features = false, features = [
 ] }
 prost = "0.14"
 tonic = "0.14"
-opentelemetry-proto = { version = "0.32", default-features = false, features = [
+opentelemetry-proto = { version = "0.33", default-features = false, features = [
     "gen-tonic",
     "trace",
     "logs",
@@ -40,9 +40,9 @@ reqwest = { version = "0.12", default-features = false, features = [
     "json",
 ] }
 flate2 = "1.1.9"
-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-tracing-opentelemetry = "0.33"
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+tracing-opentelemetry = "0.34"
 lettre = { version = "0.11.22", default-features = false, features = ["builder", "smtp-transport", "hostname", "tokio1-rustls-tls"] }
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 rmcp = { version = "3.0.1", features = ["transport-streamable-http-server"] }
