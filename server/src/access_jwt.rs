@@ -12,6 +12,13 @@
 //! header; the `/mcp` guard (ADR 0019) reuses the same verifier
 //! with the token taken from `Authorization: Bearer`.
 //!
+//! The same verifier also backs **internal** Kubernetes ServiceAccount-token auth on
+//! `/api` (ADR 0020): [`Verifier::for_cluster`] points it at the cluster's OIDC issuer
+//! and JWKS, trusting the cluster CA and presenting watcher's own projected SA token to
+//! read the discovery endpoint. Because `verify()` is issuer/audience-agnostic, the
+//! RS256 signature + `iss` + `aud` + `exp` checks are identical to the Cloudflare path;
+//! only the key source differs.
+//!
 //! ## Fail-open when unconfigured / on JWKS trouble
 //!
 //! - **Unconfigured** (`WATCHER_ACCESS_TEAM_DOMAIN` / `WATCHER_ACCESS_AUD` unset):
@@ -107,6 +114,13 @@ pub struct Verifier {
     audience: String,
     /// Where the signing keys live, e.g. `<issuer>/cdn-cgi/access/certs`.
     certs_url: String,
+    /// When `Some`, the JWKS endpoint itself requires authentication: read this file
+    /// **fresh on every fetch** (projected SA tokens rotate) and send its contents as
+    /// `Authorization: Bearer`. The Kubernetes OIDC discovery endpoint
+    /// (`/openid/v1/jwks`) is gated behind `system:service-account-issuer-discovery`,
+    /// so reading it needs watcher's own SA token (ADR 0020). `None` for the Cloudflare
+    /// path, whose certs endpoint is public.
+    fetch_token_path: Option<String>,
     http: reqwest::Client,
     cache: Arc<RwLock<Option<KeyCache>>>,
 }
@@ -140,12 +154,41 @@ impl Verifier {
             issuer: issuer.into(),
             certs_url: certs_url.into(),
             audience: audience.into(),
+            fetch_token_path: None,
             http: reqwest::Client::builder()
                 .timeout(FETCH_TIMEOUT)
                 .build()
                 .expect("reqwest client"),
             cache: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Construct a verifier for an in-cluster Kubernetes OIDC issuer (ADR 0020).
+    ///
+    /// Unlike the Cloudflare path, the cluster's JWKS endpoint
+    /// (`<issuer>/openid/v1/jwks`) is itself authenticated — the
+    /// `system:service-account-issuer-discovery` role is bound to
+    /// `system:serviceaccounts`, so the fetch must present a ServiceAccount token
+    /// (`token_path`, read fresh each fetch) and trust the cluster CA (`ca_pem`).
+    pub fn for_cluster(
+        issuer: impl Into<String>,
+        certs_url: impl Into<String>,
+        audience: impl Into<String>,
+        token_path: String,
+        ca_pem: &[u8],
+    ) -> anyhow::Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(FETCH_TIMEOUT)
+            .add_root_certificate(reqwest::Certificate::from_pem(ca_pem)?)
+            .build()?;
+        Ok(Verifier {
+            issuer: issuer.into(),
+            certs_url: certs_url.into(),
+            audience: audience.into(),
+            fetch_token_path: Some(token_path),
+            http,
+            cache: Arc::new(RwLock::new(None)),
+        })
     }
 
     /// Build a verifier from a Cloudflare Access **team domain** and an expected
@@ -173,6 +216,13 @@ impl Verifier {
         &self.issuer
     }
 
+    /// The expected audience (`aud`). Surfaced so the binary can log which audience a
+    /// configured verifier requires (the browser AUD, the MCP AUD, or `watcher` for
+    /// the internal SA-token path).
+    pub fn audience(&self) -> &str {
+        &self.audience
+    }
+
     /// Build a verifier from the environment, or `None` when Access verification is
     /// not configured (so enforcement is simply not wired in — see the module docs).
     ///
@@ -189,6 +239,40 @@ impl Verifier {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())?;
         Some(Self::for_team(&team, audience))
+    }
+
+    /// Build the **internal** Kubernetes SA-token verifier from the environment, or
+    /// `Ok(None)` when internal auth is not configured (ADR 0020). Enabled only when
+    /// `WATCHER_INTERNAL_AUD` is set and non-empty — mirroring [`from_env`](Self::from_env),
+    /// so an unset deployment simply doesn't wire the internal path in.
+    ///
+    /// Defaults match an in-pod projected SA token mounted at the standard location:
+    /// - issuer: `WATCHER_INTERNAL_ISSUER` || `https://kubernetes.default.svc.cluster.local`
+    /// - JWKS:   `WATCHER_INTERNAL_JWKS_URL` || `<issuer>/openid/v1/jwks`
+    /// - token:  `WATCHER_INTERNAL_TOKEN_PATH` || `/var/run/secrets/kubernetes.io/serviceaccount/token`
+    /// - CA:     `WATCHER_INTERNAL_CA_PATH` || `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt`
+    ///
+    /// Returns `Err` only on a genuine misconfiguration (the CA file can't be read),
+    /// so the caller can log it and fail closed rather than silently admit nothing.
+    pub fn from_cluster_env() -> anyhow::Result<Option<Self>> {
+        use anyhow::Context as _;
+        let Some(audience) = env_nonempty("WATCHER_INTERNAL_AUD") else {
+            return Ok(None);
+        };
+        let issuer = env_nonempty("WATCHER_INTERNAL_ISSUER")
+            .unwrap_or_else(|| "https://kubernetes.default.svc.cluster.local".to_string());
+        let certs_url = env_nonempty("WATCHER_INTERNAL_JWKS_URL").unwrap_or_else(|| {
+            "https://kubernetes.default.svc.cluster.local/openid/v1/jwks".to_string()
+        });
+        let token_path = env_nonempty("WATCHER_INTERNAL_TOKEN_PATH")
+            .unwrap_or_else(|| "/var/run/secrets/kubernetes.io/serviceaccount/token".to_string());
+        let ca_path = env_nonempty("WATCHER_INTERNAL_CA_PATH")
+            .unwrap_or_else(|| "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt".to_string());
+        let ca_pem = std::fs::read(&ca_path)
+            .with_context(|| format!("reading internal-auth CA {ca_path}"))?;
+        Ok(Some(Self::for_cluster(
+            issuer, certs_url, audience, token_path, &ca_pem,
+        )?))
     }
 
     /// Verify a raw JWT string against the configured issuer/audience: signature
@@ -278,16 +362,18 @@ impl Verifier {
         }
     }
 
-    /// Fetch and parse the JWKS, turning each RSA entry into a decoding key.
+    /// Fetch and parse the JWKS, turning each RSA entry into a decoding key. When a
+    /// `fetch_token_path` is set (the cluster path), read that token **fresh on every
+    /// fetch** — projected SA tokens rotate, so a token cached at construction would go
+    /// stale — and present it as a bearer credential to the authenticated discovery
+    /// endpoint.
     async fn fetch_keys(&self) -> anyhow::Result<HashMap<String, DecodingKey>> {
-        let jwks: Jwks = self
-            .http
-            .get(&self.certs_url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let mut request = self.http.get(&self.certs_url);
+        if let Some(path) = &self.fetch_token_path {
+            let token = tokio::fs::read_to_string(path).await?;
+            request = request.bearer_auth(token.trim());
+        }
+        let jwks: Jwks = request.send().await?.error_for_status()?.json().await?;
 
         let mut keys = HashMap::new();
         for jwk in jwks.keys {
@@ -306,6 +392,14 @@ impl Verifier {
         }
         Ok(keys)
     }
+}
+
+/// Read an environment variable, trimmed, treating empty/unset as absent.
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -499,5 +593,189 @@ lsCu2w3KPmCX769JvIYnwU8y
             v.verify(&sign(valid_claims())).await,
             Err(VerifyError::KeysUnavailable)
         ));
+    }
+
+    // --- Internal Kubernetes SA-token verification (ADR 0020) ----------------
+    //
+    // The verify path is issuer/audience-agnostic, so a cluster-shaped token runs the
+    // identical RS256 + iss + aud + exp checks as the Cloudflare path — just with the
+    // cluster issuer and the `watcher` audience. These reuse the same test key.
+
+    const CLUSTER_ISSUER: &str = "https://kubernetes.default.svc.cluster.local";
+    const CLUSTER_AUD: &str = "watcher";
+    const FIXER_SUB: &str = "system:serviceaccount:fixer-dashboard:fixer-dashboard";
+
+    /// A cache-seeded verifier at an arbitrary issuer/audience, so `verify` runs fully
+    /// offline (the dead `certs_url` is never reached).
+    async fn seeded_verifier_at(issuer: &str, audience: &str) -> Verifier {
+        let v = Verifier::new(issuer, "http://127.0.0.1:1/certs", audience);
+        let mut keys = HashMap::new();
+        keys.insert(
+            TEST_KID.to_string(),
+            DecodingKey::from_rsa_components(TEST_N, TEST_E).unwrap(),
+        );
+        v.cache.write().await.replace(KeyCache {
+            keys,
+            fetched_at: Instant::now(),
+        });
+        v
+    }
+
+    fn cluster_claims() -> serde_json::Value {
+        json!({
+            "iss": CLUSTER_ISSUER,
+            "aud": [CLUSTER_AUD],
+            "sub": FIXER_SUB,
+            "exp": now() + 3600,
+            "iat": now(),
+        })
+    }
+
+    #[tokio::test]
+    async fn cluster_valid_sa_token_passes() {
+        let v = seeded_verifier_at(CLUSTER_ISSUER, CLUSTER_AUD).await;
+        let claims = v.verify(&sign(cluster_claims())).await.expect("valid");
+        assert_eq!(claims.sub, FIXER_SUB);
+    }
+
+    #[tokio::test]
+    async fn cluster_wrong_audience_rejected() {
+        let v = seeded_verifier_at(CLUSTER_ISSUER, CLUSTER_AUD).await;
+        let mut c = cluster_claims();
+        c["aud"] = json!(["not-watcher"]);
+        assert!(matches!(
+            v.verify(&sign(c)).await,
+            Err(VerifyError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cluster_wrong_issuer_rejected() {
+        let v = seeded_verifier_at(CLUSTER_ISSUER, CLUSTER_AUD).await;
+        let mut c = cluster_claims();
+        c["iss"] = json!("https://some-other-issuer.example");
+        assert!(matches!(
+            v.verify(&sign(c)).await,
+            Err(VerifyError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cluster_expired_rejected() {
+        let v = seeded_verifier_at(CLUSTER_ISSUER, CLUSTER_AUD).await;
+        let mut c = cluster_claims();
+        c["exp"] = json!(now() - 3600);
+        assert!(matches!(
+            v.verify(&sign(c)).await,
+            Err(VerifyError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cluster_tampered_signature_rejected() {
+        let v = seeded_verifier_at(CLUSTER_ISSUER, CLUSTER_AUD).await;
+        let mut token = sign(cluster_claims());
+        let last = token.pop().unwrap();
+        token.push(if last == 'A' { 'B' } else { 'A' });
+        assert!(matches!(
+            v.verify(&token).await,
+            Err(VerifyError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cluster_hs256_alg_confusion_rejected() {
+        // The same alg-confusion guard as the Cloudflare path: a token whose header
+        // claims HS256 must be rejected by `Validation`'s RS256 allowlist, never by
+        // treating the RSA public material as an HMAC secret.
+        let v = seeded_verifier_at(CLUSTER_ISSUER, CLUSTER_AUD).await;
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some(TEST_KID.to_string());
+        let key = EncodingKey::from_secret(TEST_N.as_bytes());
+        let token = encode(&header, &cluster_claims(), &key).unwrap();
+        assert!(matches!(
+            v.verify(&token).await,
+            Err(VerifyError::Invalid(_))
+        ));
+    }
+
+    /// A JWKS endpoint that serves the test key only when the request carries
+    /// `Authorization: Bearer <*expected.read()>`, so a test can assert the fetch both
+    /// sends the bearer and re-reads the token file fresh each call.
+    async fn spawn_jwks_requiring_bearer(expected: Arc<RwLock<String>>) -> String {
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::{routing::get, Json, Router};
+        let jwks = json!({
+            "keys": [{
+                "kid": TEST_KID, "kty": "RSA", "alg": "RS256", "use": "sig",
+                "n": TEST_N, "e": TEST_E,
+            }]
+        });
+        let app = Router::new().route(
+            "/jwks",
+            get(move |headers: HeaderMap| {
+                let expected = expected.clone();
+                let jwks = jwks.clone();
+                async move {
+                    let got = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default();
+                    if got == format!("Bearer {}", expected.read().await.as_str()) {
+                        Ok(Json(jwks))
+                    } else {
+                        Err(StatusCode::UNAUTHORIZED)
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/jwks")
+    }
+
+    #[tokio::test]
+    async fn cluster_fetch_sends_bearer_and_reads_token_fresh_each_call() {
+        let expected = Arc::new(RwLock::new("token-A".to_string()));
+        let certs_url = spawn_jwks_requiring_bearer(expected.clone()).await;
+
+        let token_file =
+            std::env::temp_dir().join(format!("watcher-sa-token-{}-{}", std::process::id(), now()));
+        // Trailing whitespace must be trimmed off before it becomes the bearer.
+        tokio::fs::write(&token_file, "  token-A\n").await.unwrap();
+
+        // Build the verifier by hand (plain-HTTP client) so the test needs no TLS: the
+        // bearer/freshness behavior under test is independent of the transport.
+        let v = Verifier {
+            issuer: CLUSTER_ISSUER.to_string(),
+            audience: CLUSTER_AUD.to_string(),
+            certs_url,
+            fetch_token_path: Some(token_file.to_string_lossy().into_owned()),
+            http: reqwest::Client::builder()
+                .timeout(FETCH_TIMEOUT)
+                .build()
+                .unwrap(),
+            cache: Arc::new(RwLock::new(None)),
+        };
+
+        // token-A on disk matches the server → fetch succeeds.
+        v.fetch_keys().await.expect("bearer token-A accepted");
+
+        // Rotate the server's expectation but leave the stale file: the fetch still
+        // reads token-A and is now rejected — proving the token is read per fetch.
+        *expected.write().await = "token-B".to_string();
+        assert!(
+            v.fetch_keys().await.is_err(),
+            "a stale token file must be rejected after rotation"
+        );
+
+        // Update the file to the new token → the next fetch re-reads it and succeeds.
+        tokio::fs::write(&token_file, "token-B").await.unwrap();
+        v.fetch_keys().await.expect("fresh token-B accepted");
+
+        let _ = tokio::fs::remove_file(&token_file).await;
     }
 }
