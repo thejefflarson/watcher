@@ -29,3 +29,5 @@ Copy [`0000-template.md`](0000-template.md) to start one.
 | [0018](0018-read-only-mcp-server-in-process.md) | Expose the read API as a read-only MCP server, in-process on `/mcp` | Accepted |
 | [0019](0019-mcp-auth-cloudflare-access-oidc.md) | Authenticate `/mcp` via Cloudflare Access Managed OAuth (validate `Cf-Access-Jwt-Assertion`) | Accepted |
 | [0020](0020-on-ingest-per-series-metric-rollups.md) | On-ingest per-series metric rollups (refines 0011) | Accepted |
+| [0021](0021-online-ddl-lane.md) | Online (non-transactional) schema changes run in an in-app DDL lane | Accepted |
+| [0022](0022-internal-serviceaccount-token-auth-on-api.md) | Accept an internal Kubernetes ServiceAccount-token on `/api` (alongside Access) | Accepted |

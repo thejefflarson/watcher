@@ -8,7 +8,7 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 use watcher_server::{
     access_jwt, alerts, app_with_access, db, grpc, mcp, mcp_auth, online_ddl, retention, selflog,
-    selfmon, selftrace,
+    selfmon, selftrace, ReadAuth,
 };
 
 /// Self-instrumentation: capture watcher's own traces **in-process**, tagged
@@ -201,6 +201,58 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Internal Kubernetes ServiceAccount-token auth for /api (ADR 0020): in-cluster
+    // callers (the fixer-dashboard) present their projected SA-token JWT on
+    // `Authorization: Bearer` instead of traversing Cloudflare Access. Enabled only when
+    // WATCHER_INTERNAL_AUD is set; a verified token is admitted only when its `sub` is in
+    // WATCHER_INTERNAL_ALLOWED_SUBS. This is pure addition — the edge path above is
+    // untouched. A misconfigured CA (or an empty allowlist) disables the path (fail
+    // closed: no internal token is admitted), never weakening the edge gate.
+    let allowed_subs: Vec<String> = std::env::var("WATCHER_INTERNAL_ALLOWED_SUBS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let internal = match access_jwt::Verifier::from_cluster_env() {
+        Ok(Some(v)) if allowed_subs.is_empty() => {
+            tracing::error!(
+                "WATCHER_INTERNAL_AUD is set but WATCHER_INTERNAL_ALLOWED_SUBS is empty; \
+                 internal SA-token auth DISABLED (fail closed — admitting no internal token). \
+                 aud={}",
+                v.audience()
+            );
+            None
+        }
+        Ok(Some(v)) => {
+            tracing::info!(
+                "internal SA-token auth enabled for /api (issuer={}, aud={}, allowed_subs={:?})",
+                v.issuer(),
+                v.audience(),
+                allowed_subs
+            );
+            Some(Arc::new(v))
+        }
+        Ok(None) => {
+            tracing::debug!(
+                "internal SA-token auth disabled (WATCHER_INTERNAL_AUD unset); edge auth only"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::error!(
+                "internal SA-token auth misconfigured ({e:#}); \
+                 DISABLED (fail closed — admitting no internal token)"
+            );
+            None
+        }
+    };
+    let read_auth = ReadAuth {
+        edge: access,
+        internal,
+        allowed_subs: Arc::new(allowed_subs),
+    };
+
     // Read-only MCP server (ADR 0018): mounted at /mcp by `app_with_access` only when
     // WATCHER_MCP_ENABLED is set (default OFF). Its Managed-OAuth assertion auth
     // (ADR 0019) requires WATCHER_ACCESS_TEAM_DOMAIN + WATCHER_MCP_ACCESS_AUD; with
@@ -242,7 +294,7 @@ async fn main() -> anyhow::Result<()> {
     let http = {
         let pool = pool.clone();
         async move {
-            axum::serve(listener, app_with_access(pool, access)).await?;
+            axum::serve(listener, app_with_access(pool, read_auth)).await?;
             Ok::<(), anyhow::Error>(())
         }
     };
