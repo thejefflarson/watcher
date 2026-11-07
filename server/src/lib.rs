@@ -73,6 +73,40 @@ pub(crate) async fn check_access_assertion(
     }
 }
 
+/// Auth state for the read surface (UI shell + `/api`), carried by [`access_guard`].
+///
+/// Two independent verifiers back the one guard (ADR 0013 + ADR 0020):
+/// - `edge`: the Cloudflare Access assertion on `Cf-Access-Jwt-Assertion`
+///   (defense-in-depth behind the edge; fails **open** on a JWKS outage).
+/// - `internal`: a Kubernetes ServiceAccount-token JWT on `Authorization: Bearer`,
+///   for in-cluster callers (the fixer-dashboard) that never traverse Cloudflare
+///   Access. A verified internal token is admitted **only** when its `sub` is in
+///   `allowed_subs`; it fails **closed** (a cluster-JWKS outage admits no internal
+///   caller — the request carries no edge header and so hits `Missing` → 401).
+///
+/// Cheaply cloneable (both verifiers behind `Arc`, the allowlist shared), as axum's
+/// `from_fn_with_state` clones the state per request.
+#[derive(Clone, Default)]
+pub struct ReadAuth {
+    /// Cloudflare Access verifier, or `None` when edge verification is unconfigured.
+    pub edge: Option<Arc<Verifier>>,
+    /// Internal Kubernetes SA-token verifier, or `None` when internal auth is off.
+    pub internal: Option<Arc<Verifier>>,
+    /// The exact `sub` claims an internal token may carry, e.g.
+    /// `system:serviceaccount:fixer-dashboard:fixer-dashboard`. Empty disables the
+    /// internal path (enforced in the binary, which refuses to wire an allowlist-less
+    /// internal verifier — fail closed).
+    pub allowed_subs: Arc<Vec<String>>,
+}
+
+impl ReadAuth {
+    /// Whether any origin-side verification is configured. When neither verifier is
+    /// set the guard is not wired at all (local dev / non-Access deploys stay open).
+    fn is_enabled(&self) -> bool {
+        self.edge.is_some() || self.internal.is_some()
+    }
+}
+
 /// Reads W3C trace-context headers off an incoming request so watcher can
 /// continue the caller's trace (e.g. traefik's) rather than starting a new one.
 struct HeaderExtractor<'a>(&'a axum::http::HeaderMap);
@@ -164,18 +198,73 @@ async fn ui_handler(uri: Uri) -> Response {
     }
 }
 
-/// Middleware that re-verifies the Cloudflare Access JWT on the read surface
-/// (ADR 0013). Origin-side defense-in-depth on top of the edge Access policy: a
-/// request missing or carrying an invalid `Cf-Access-Jwt-Assertion` is rejected
-/// `401` before reaching a handler. Wired **only** onto the UI shell + `/api`
-/// (never `/v1` ingest or `/healthz`) and only when Access is configured — see
-/// [`app_with_access`] and [`access_jwt`](crate::access_jwt).
-async fn access_guard(
-    State(verifier): State<Arc<Verifier>>,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
-    match check_access_assertion(&verifier, req.headers()).await {
+/// Pull a bearer credential off `Authorization: Bearer <token>`, if present.
+fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
+/// Middleware that guards the read surface (UI shell + `/api`) at the origin
+/// (ADR 0013 + ADR 0020). Two paths, tried in order:
+///
+/// 1. **Internal** (ADR 0020): if an internal verifier is configured and the request
+///    carries `Authorization: Bearer <SA-token>`, verify it. A valid token with an
+///    allowlisted `sub` is admitted; a valid token with a non-allowlisted `sub` is a
+///    hard `401` (a presented-but-unauthorized identity is a reject, not a fall-through).
+///    A token that fails to verify (bad/expired/unverifiable) **falls through** to the
+///    edge check — the internal path never fails *open*, so an internal caller (which
+///    sends no edge header) then hits `Missing` below and is rejected.
+/// 2. **Edge** (ADR 0013): the Cloudflare Access assertion on `Cf-Access-Jwt-Assertion`,
+///    unchanged — `Valid`/`KeysUnavailable` admit (edge fail-open preserved),
+///    `Missing`/`Invalid` reject `401`.
+///
+/// Wired **only** onto the UI shell + `/api` (never `/v1` ingest or `/healthz`) and
+/// only when at least one verifier is configured — see [`app_with_auth`]. Token
+/// contents are never logged, only the `sub`.
+async fn access_guard(State(auth): State<ReadAuth>, req: Request<Body>, next: Next) -> Response {
+    // 1. Internal Kubernetes SA-token path (ADR 0020).
+    if let Some(internal) = &auth.internal {
+        if let Some(token) = bearer_token(req.headers()) {
+            match internal.verify(token).await {
+                Ok(claims) => {
+                    if auth.allowed_subs.iter().any(|s| s == &claims.sub) {
+                        return next.run(req).await;
+                    }
+                    tracing::warn!(
+                        sub = %claims.sub,
+                        path = %req.uri().path(),
+                        "rejecting internal token: sub not in allowlist",
+                    );
+                    return (StatusCode::UNAUTHORIZED, "internal token not authorized")
+                        .into_response();
+                }
+                // Invalid / unverifiable: do NOT fail open here — fall through to the
+                // edge check, where an internal caller (no edge header) hits `Missing`.
+                Err(why) => {
+                    tracing::debug!(
+                        path = %req.uri().path(),
+                        "internal bearer did not verify ({why}); falling through to edge auth",
+                    );
+                }
+            }
+        }
+    }
+
+    // 2. Cloudflare Access edge path (ADR 0013), unchanged.
+    let Some(edge) = &auth.edge else {
+        // No edge verifier: an internal-only deployment where no valid internal token
+        // was presented. Fail closed.
+        tracing::warn!(
+            path = %req.uri().path(),
+            "rejecting request: no valid internal token and edge auth not configured",
+        );
+        return (StatusCode::UNAUTHORIZED, "missing or invalid token").into_response();
+    };
+    match check_access_assertion(edge.as_ref(), req.headers()).await {
         Assertion::Valid => next.run(req).await,
         // Cold-cache / JWKS-outage: fail open (the edge is still the gate) so a
         // Cloudflare certs blip can't take the whole read surface down.
@@ -199,13 +288,14 @@ async fn access_guard(
 /// [`app_with_access`] when Access is configured. See ADR 0013 for the edge-auth
 /// design this augments.
 pub fn app(pool: PgPool) -> Router {
-    app_with_auth(pool, None, McpAuth::from_env())
+    app_with_auth(pool, ReadAuth::default(), McpAuth::from_env())
 }
 
-/// Build the HTTP router, optionally enforcing Cloudflare Access JWT verification
-/// (ADR 0013) on the read surface; MCP auth is taken from the environment.
-pub fn app_with_access(pool: PgPool, access: Option<Arc<Verifier>>) -> Router {
-    app_with_auth(pool, access, McpAuth::from_env())
+/// Build the HTTP router, optionally enforcing origin-side read-surface auth
+/// (Cloudflare Access, ADR 0013, and/or internal SA-token, ADR 0020); MCP auth is
+/// taken from the environment.
+pub fn app_with_access(pool: PgPool, read_auth: ReadAuth) -> Router {
+    app_with_auth(pool, read_auth, McpAuth::from_env())
 }
 
 /// Build the HTTP router, optionally enforcing Cloudflare Access JWT verification
@@ -213,10 +303,11 @@ pub fn app_with_access(pool: PgPool, access: Option<Arc<Verifier>>) -> Router {
 ///
 /// The server holds no app-layer auth by default — auth lives at the edge
 /// (Cloudflare Access for the public read surface) and ingest is only reachable
-/// in-cluster (ADR 0013). When `access` is `Some`, the UI shell + `/api` are
-/// additionally guarded at the origin; `/v1` ingest and `/healthz` are **never**
-/// gated (in-cluster collectors and kubelet probes carry no token). The permissive
-/// CORS layer keeps local dev (`:5173` → `:4318`) working.
+/// in-cluster (ADR 0013). When `read_auth` configures an edge and/or internal verifier
+/// the UI shell + `/api` are additionally guarded at the origin (see [`ReadAuth`] and
+/// [`access_guard`]); `/v1` ingest and `/healthz` are **never** gated (in-cluster
+/// collectors and kubelet probes carry no token). The permissive CORS layer keeps
+/// local dev (`:5173` → `:4318`) working.
 ///
 /// `/mcp` (when `WATCHER_MCP_ENABLED`) is served **only** when `mcp_auth` is `Some`:
 /// with no auth configured it is refused rather than exposed unauthenticated (fail
@@ -224,11 +315,7 @@ pub fn app_with_access(pool: PgPool, access: Option<Arc<Verifier>>) -> Router {
 /// after resolving the MCP client's opaque Managed-OAuth token — but with a distinct
 /// AUD and failing closed. It is wired outside the browser Access guard since an MCP
 /// client is not a browser.
-pub fn app_with_auth(
-    pool: PgPool,
-    access: Option<Arc<Verifier>>,
-    mcp_auth: Option<McpAuth>,
-) -> Router {
+pub fn app_with_auth(pool: PgPool, read_auth: ReadAuth, mcp_auth: Option<McpAuth>) -> Router {
     let ingest = Router::new()
         .route("/v1/traces", post(otlp::ingest_traces))
         .route("/v1/logs", post(otlp::ingest_logs))
@@ -260,15 +347,17 @@ pub fn app_with_auth(
         // can't create a feedback loop.
         .layer(tower_http::trace::TraceLayer::new_for_http().make_span_with(otel_request_span));
 
-    // The guarded surface: `/api` plus the SPA fallback (the UI shell). When Access
-    // is configured, the JWT middleware wraps exactly these — not ingest, healthz,
-    // or /mcp.
+    // The guarded surface: `/api` plus the SPA fallback (the UI shell). When any
+    // origin-side verifier is configured, the JWT middleware wraps exactly these — not
+    // ingest, healthz, or /mcp.
     let guarded = api.fallback(ui_handler);
-    let guarded = match access {
-        Some(verifier) => {
-            guarded.layer(axum::middleware::from_fn_with_state(verifier, access_guard))
-        }
-        None => guarded,
+    let guarded = if read_auth.is_enabled() {
+        guarded.layer(axum::middleware::from_fn_with_state(
+            read_auth,
+            access_guard,
+        ))
+    } else {
+        guarded
     };
 
     let mut router = Router::new()

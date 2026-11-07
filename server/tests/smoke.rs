@@ -27,7 +27,7 @@ use tower::ServiceExt;
 use tracing_subscriber::layer::SubscriberExt;
 use watcher_server::{
     access_jwt, alerts, app, app_with_access, app_with_auth, db, mcp_auth, selflog, selfmon,
-    selftrace,
+    selftrace, ReadAuth,
 };
 
 fn now_nanos() -> u64 {
@@ -3525,6 +3525,54 @@ async fn get_status_with_token(
         .status()
 }
 
+// --- Internal Kubernetes SA-token auth on /api (ADR 0020) -------------------
+//
+// In-cluster callers (the fixer-dashboard) present their projected SA-token JWT on
+// `Authorization: Bearer` instead of traversing Cloudflare Access. The guard verifies
+// it with the SAME `access_jwt::Verifier` (RS256 + iss + aud + exp), then admits only
+// when `sub` is in the allowlist. These reuse the browser-auth test key/JWKS, signing
+// with the cluster issuer + the `watcher` audience.
+
+const INTERNAL_ISSUER: &str = "https://kubernetes.default.svc.cluster.local";
+const INTERNAL_AUD: &str = "watcher";
+const FIXER_SUB: &str = "system:serviceaccount:fixer-dashboard:fixer-dashboard";
+
+/// Sign a cluster SA-shaped JWT (cluster `iss`, `watcher` `aud`) with the test key,
+/// for an arbitrary `sub`, so the allowlist decision can be exercised both ways.
+fn internal_token(sub: &str, exp_offset: i64) -> String {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    let now = now_nanos() / 1_000_000_000;
+    let claims = json!({
+        "iss": INTERNAL_ISSUER,
+        "aud": [INTERNAL_AUD],
+        "sub": sub,
+        "exp": (now as i64 + exp_offset),
+        "iat": now,
+    });
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(ACCESS_KID.to_string());
+    let key = EncodingKey::from_rsa_pem(ACCESS_PEM.as_bytes()).unwrap();
+    encode(&header, &claims, &key).unwrap()
+}
+
+/// GET a path, optionally attaching an `Authorization: Bearer <token>` header.
+async fn get_status_with_bearer(
+    router: &axum::Router,
+    uri: &str,
+    token: Option<&str>,
+) -> StatusCode {
+    let mut builder = Request::builder().uri(uri);
+    if let Some(t) = token {
+        builder = builder.header("authorization", format!("Bearer {t}"));
+    }
+    router
+        .clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
 #[tokio::test]
 #[serial]
 async fn access_configured_gates_api_and_ui_but_not_ingest_or_health() {
@@ -3537,7 +3585,13 @@ async fn access_configured_gates_api_and_ui_but_not_ingest_or_health() {
         certs_url,
         ACCESS_AUD,
     ));
-    let router = app_with_access(pool, Some(verifier));
+    let router = app_with_access(
+        pool,
+        ReadAuth {
+            edge: Some(verifier),
+            ..Default::default()
+        },
+    );
 
     // /api with no token → 401.
     assert_eq!(
@@ -3610,11 +3664,139 @@ async fn access_unconfigured_leaves_api_open() {
         return;
     };
     // No verifier → no enforcement (local dev / non-Access deploys unchanged).
-    let router = app_with_access(pool, None);
+    let router = app_with_access(pool, ReadAuth::default());
     assert_eq!(
         get_status_with_token(&router, "/api/traces", None).await,
         StatusCode::OK,
         "unconfigured Access must not gate /api"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn internal_sa_token_gates_api_alongside_edge() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // One local JWKS serves the shared test key; both verifiers fetch from it.
+    let certs_url = spawn_jwks().await;
+    let edge = std::sync::Arc::new(access_jwt::Verifier::new(
+        ACCESS_ISSUER,
+        certs_url.clone(),
+        ACCESS_AUD,
+    ));
+    let internal = std::sync::Arc::new(access_jwt::Verifier::new(
+        INTERNAL_ISSUER,
+        certs_url,
+        INTERNAL_AUD,
+    ));
+    let router = app_with_access(
+        pool,
+        ReadAuth {
+            edge: Some(edge),
+            internal: Some(internal),
+            allowed_subs: std::sync::Arc::new(vec![FIXER_SUB.to_string()]),
+        },
+    );
+
+    // Allowlisted internal bearer → admitted (no Cloudflare Access needed).
+    let ok = internal_token(FIXER_SUB, 3600);
+    assert_eq!(
+        get_status_with_bearer(&router, "/api/traces", Some(&ok)).await,
+        StatusCode::OK,
+        "a valid internal token with an allowlisted sub must be admitted"
+    );
+
+    // Valid internal token, NON-allowlisted sub → hard 401 (a presented-but-
+    // unauthorized identity is a reject, never a fall-through to edge).
+    let other = internal_token("system:serviceaccount:default:intruder", 3600);
+    assert_eq!(
+        get_status_with_bearer(&router, "/api/traces", Some(&other)).await,
+        StatusCode::UNAUTHORIZED,
+        "a valid internal token with a non-allowlisted sub must be rejected"
+    );
+
+    // No token at all → 401 (unchanged: the edge path hits Missing).
+    assert_eq!(
+        get_status_with_bearer(&router, "/api/traces", None).await,
+        StatusCode::UNAUTHORIZED,
+        "no internal and no edge token must still 401"
+    );
+
+    // The existing edge path is untouched: a valid Cf-Access-Jwt-Assertion still works.
+    let edge_tok = access_token(ACCESS_ISSUER, ACCESS_AUD, 3600);
+    assert_eq!(
+        get_status_with_token(&router, "/api/traces", Some(&edge_tok)).await,
+        StatusCode::OK,
+        "a valid edge Access token must still be admitted"
+    );
+
+    // An unverifiable internal bearer (wrong issuer + audience for the internal
+    // verifier) falls through to the edge check rather than failing open: with a valid
+    // edge header alongside it, the request is admitted via the edge path.
+    let bad_internal = access_token(ACCESS_ISSUER, "not-watcher", 3600);
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/traces")
+                .header("authorization", format!("Bearer {bad_internal}"))
+                .header("Cf-Access-Jwt-Assertion", &edge_tok)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "an unverifiable internal bearer must fall through to a valid edge token"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn internal_only_deployment_fails_closed_without_a_valid_token() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // No edge verifier at all — an internal-only read surface.
+    let certs_url = spawn_jwks().await;
+    let internal = std::sync::Arc::new(access_jwt::Verifier::new(
+        INTERNAL_ISSUER,
+        certs_url,
+        INTERNAL_AUD,
+    ));
+    let router = app_with_access(
+        pool,
+        ReadAuth {
+            edge: None,
+            internal: Some(internal),
+            allowed_subs: std::sync::Arc::new(vec![FIXER_SUB.to_string()]),
+        },
+    );
+
+    // Allowlisted internal bearer → admitted.
+    let ok = internal_token(FIXER_SUB, 3600);
+    assert_eq!(
+        get_status_with_bearer(&router, "/api/traces", Some(&ok)).await,
+        StatusCode::OK,
+        "internal-only: an allowlisted internal token must be admitted"
+    );
+
+    // No token → 401 (fail closed: no edge to fall back to).
+    assert_eq!(
+        get_status_with_bearer(&router, "/api/traces", None).await,
+        StatusCode::UNAUTHORIZED,
+        "internal-only: a tokenless request must fail closed"
+    );
+
+    // An expired internal token → 401 (falls through, then no edge → reject).
+    let expired = internal_token(FIXER_SUB, -3600);
+    assert_eq!(
+        get_status_with_bearer(&router, "/api/traces", Some(&expired)).await,
+        StatusCode::UNAUTHORIZED,
+        "internal-only: an expired internal token must fail closed"
     );
 }
 
@@ -3642,7 +3824,7 @@ async fn mcp_app_with_auth(pool: sqlx::PgPool) -> (axum::Router, String) {
     // Enable the endpoint for this router only (default OFF). #[serial] keeps this
     // process-global env change from racing the other tests.
     std::env::set_var("WATCHER_MCP_ENABLED", "1");
-    let router = app_with_auth(pool, None, Some(auth));
+    let router = app_with_auth(pool, ReadAuth::default(), Some(auth));
     std::env::remove_var("WATCHER_MCP_ENABLED");
 
     (router, access_token(ACCESS_ISSUER, MCP_AUD, 3600))
@@ -3738,7 +3920,7 @@ async fn mcp_fails_closed_when_auth_unconfigured() {
     };
     // Enabled but NO auth wired: /mcp must not be served unauthenticated.
     std::env::set_var("WATCHER_MCP_ENABLED", "1");
-    let router = app_with_auth(pool, None, None);
+    let router = app_with_auth(pool, ReadAuth::default(), None);
     std::env::remove_var("WATCHER_MCP_ENABLED");
 
     // The MCP surface is not mounted: an unauthenticated POST to /mcp is NOT met by
