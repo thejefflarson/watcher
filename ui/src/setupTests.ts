@@ -14,12 +14,15 @@ import type { AxeMatchers } from "vitest-axe/matchers";
 expect.extend(axeMatchers);
 afterEach(cleanup);
 
-// vitest-axe 0.1.0 augments the legacy `Vi` global namespace, which vitest v4 no
+// vitest-axe 0.1.0 augments the legacy `Vi` global namespace, which vitest no
 // longer routes `expect(...)` through — so the matcher is registered at runtime
 // but untyped. Augment vitest's own `Assertion` here to type `toHaveNoViolations`.
 declare module "vitest" {
-  // `T = any` mirrors vitest's own `Assertion<T = any>` so the augmentation
-  // merges (identical type parameters). T is unused here; it belongs to the base.
-  interface Assertion<T = any> extends AxeMatchers {}
+  // The type parameters must be byte-identical to vitest's own
+  // `Assertion<R extends void | Promise<void> = void, T = unknown>`, or
+  // declaration merging fails with TS2428 ("all declarations must have identical
+  // type parameters"). Neither is used here; both belong to the base interface.
+  interface Assertion<R extends void | Promise<void> = void, T = unknown>
+    extends AxeMatchers {}
   interface AsymmetricMatchersContaining extends AxeMatchers {}
 }
