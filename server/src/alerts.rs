@@ -209,6 +209,11 @@ struct WebhookPayload<'a> {
     value: Option<f64>,
     threshold: f64,
     comparator: &'a str,
+    /// The attributes JSONB of the series that drove the breach (e.g. `k8s.node.name`,
+    /// `host.arch`), so a receiver can act on WHICH node/pod fired, not just the rule. Set
+    /// only on a firing transition; absent on resolve and when the series can't be resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attributes: Option<&'a serde_json::Value>,
 }
 
 /// SMTP settings for emailing alert transitions. All fields come from the
@@ -266,8 +271,44 @@ fn email_subject(rule_name: &str, state: &str) -> String {
     format!("[watcher] {}: {}", state.to_uppercase(), rule_name)
 }
 
+/// Render a series' attributes JSONB as a compact, sorted `k=v, k=v` line for the email, or
+/// None when it is absent or not an object. Bounded so a series with many resource
+/// attributes can't make one page unreasonably large.
+fn render_attrs(attrs: Option<&serde_json::Value>) -> Option<String> {
+    let obj = attrs?.as_object()?;
+    if obj.is_empty() {
+        return None;
+    }
+    let mut pairs: Vec<String> = obj
+        .iter()
+        .map(|(k, v)| match v {
+            serde_json::Value::String(s) => format!("{k}={s}"),
+            other => format!("{k}={other}"),
+        })
+        .collect();
+    pairs.sort();
+    let mut line = pairs.join(", ");
+    const MAX: usize = 400;
+    if line.len() > MAX {
+        // Back off to a char boundary — `String::truncate` panics mid-codepoint, and an
+        // attribute value can be non-ASCII.
+        let mut end = MAX;
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        line.truncate(end);
+        line.push_str(" …");
+    }
+    Some(line)
+}
+
 /// Human-readable email body describing the rule and the observed value.
-fn email_body(rule: &AlertRule, state: &str, value: Option<f64>) -> String {
+fn email_body(
+    rule: &AlertRule,
+    state: &str,
+    value: Option<f64>,
+    attrs: Option<&serde_json::Value>,
+) -> String {
     let scope = rule
         .service
         .as_deref()
@@ -276,12 +317,18 @@ fn email_body(rule: &AlertRule, state: &str, value: Option<f64>) -> String {
     let observed = value
         .map(|v| v.to_string())
         .unwrap_or_else(|| "no data".to_string());
+    // Name the firing series (e.g. k8s.node.name=cluster-main) when known — the whole point
+    // of the attribution query, so the operator sees WHICH node/pod, not just the rule.
+    let series = render_attrs(attrs)
+        .map(|s| format!("Series: {s}\n"))
+        .unwrap_or_default();
     format!(
         "Alert: {name}\n\
          State: {state}\n\
          Metric: {metric}{scope}\n\
          Condition: {agg}({metric}) {cmp} {threshold} over {window}s\n\
-         Observed: {observed}\n",
+         Observed: {observed}\n\
+         {series}",
         name = rule.name,
         metric = rule.metric,
         agg = rule.agg,
@@ -390,6 +437,86 @@ async fn resolve_rate(pool: &PgPool, rule: &AlertRule) -> anyhow::Result<bool> {
     .fetch_optional(pool)
     .await?;
     Ok(monotonic.unwrap_or(false))
+}
+
+/// SQL returning the `attributes` JSONB of the ONE series that most drove the breach:
+/// for a `gt` rule the series with the largest per-series aggregate, for `lt` the smallest.
+/// Mirrors [`eval_sql`]'s window / predicate / rate shape exactly, but GROUPs BY the series
+/// identity (`service, attributes`) instead of folding across series — so a firing alarm can
+/// name the node/pod. Injection-safe on the same terms as `eval_sql`: only the enum-
+/// whitelisted `agg_expr` and the comparator-derived `ASC`/`DESC` (both closed sets) are
+/// interpolated; every operand is bound ($1 metric, $2 service, $3 window, $4 match, $5 exclude).
+fn series_attrs_sql(agg: &str, rate: bool, comparator: &str) -> String {
+    let order = if comparator == "lt" { "ASC" } else { "DESC" };
+    let filtered = "SELECT time, service, attributes, value
+             FROM metrics
+             WHERE name = $1
+               AND ($2::text IS NULL OR service = $2)
+               AND ($4::jsonb IS NULL OR attributes @> $4)
+               AND ($5::jsonb IS NULL OR NOT (attributes @> $5))
+               AND value IS NOT NULL
+               AND time >= now() - make_interval(secs => $3)";
+    if agg == "increase" {
+        return format!(
+            "WITH pts AS ({filtered}),
+             steps AS (
+                 SELECT service, attributes, GREATEST(value - lag(value) OVER w, 0) AS step
+                 FROM pts
+                 WINDOW w AS (PARTITION BY service, attributes ORDER BY time)
+             )
+             SELECT attributes FROM steps WHERE step IS NOT NULL
+             GROUP BY service, attributes ORDER BY sum(step) {order} LIMIT 1"
+        );
+    }
+    if rate {
+        return format!(
+            "WITH pts AS ({filtered}),
+             rated AS (
+                 SELECT service, attributes,
+                        CASE WHEN dt > 0 AND dv >= 0 THEN dv / dt ELSE 0 END AS value
+                 FROM (
+                     SELECT service, attributes,
+                            value - lag(value) OVER w                   AS dv,
+                            extract(epoch FROM time - lag(time) OVER w) AS dt
+                     FROM pts
+                     WINDOW w AS (PARTITION BY service, attributes ORDER BY time)
+                 ) d
+                 WHERE dt IS NOT NULL
+             )
+             SELECT attributes FROM rated
+             GROUP BY service, attributes ORDER BY {} {order} LIMIT 1",
+            agg_expr(agg)
+        );
+    }
+    format!(
+        "WITH pts AS ({filtered})
+         SELECT attributes FROM pts
+         GROUP BY service, attributes ORDER BY {} {order} LIMIT 1",
+        agg_expr(agg)
+    )
+}
+
+/// The firing series' attributes, best-effort: any error or no-data yields `None` and the
+/// page still goes out (just without naming the series). Run only when a rule actually
+/// fires, never on every breach tick.
+async fn breaching_series_attrs(
+    pool: &PgPool,
+    rule: &AlertRule,
+    rate: bool,
+) -> Option<serde_json::Value> {
+    let sql = series_attrs_sql(&rule.agg, rate, &rule.comparator);
+    // AssertSqlSafe: same audit as eval_sql — only agg_expr() and the ASC/DESC literal are
+    // interpolated (both closed sets); metric/service/window/match/exclude are all bound.
+    sqlx::query_scalar::<_, serde_json::Value>(sqlx::AssertSqlSafe(sql))
+        .bind(&rule.metric)
+        .bind(&rule.service)
+        .bind(rule.window_secs as f64)
+        .bind(&rule.match_attrs)
+        .bind(&rule.exclude_attrs)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Whether `value` breaches the rule. No data in the window (`None`) never fires.
@@ -533,7 +660,8 @@ async fn evaluate(
                 .execute(pool)
                 .await?;
                 if active {
-                    fire(client, webhook, mailer, &rule, value).await;
+                    let attrs = breaching_series_attrs(pool, &rule, rate).await;
+                    fire(client, webhook, mailer, &rule, value, attrs.as_ref()).await;
                 }
             }
             // Still breaching with an open event. A pending event that has now held
@@ -548,7 +676,8 @@ async fn evaluate(
                     .bind(value)
                     .execute(pool)
                     .await?;
-                    fire(client, webhook, mailer, &rule, value).await;
+                    let attrs = breaching_series_attrs(pool, &rule, rate).await;
+                    fire(client, webhook, mailer, &rule, value, attrs.as_ref()).await;
                 }
             }
             // Recovered. A firing event resolves and notifies as before; a pending
@@ -561,7 +690,7 @@ async fn evaluate(
                         .execute(pool)
                         .await?;
                     tracing::info!("alert '{}' resolved (value {:?})", rule.name, value);
-                    notify(client, webhook, mailer, &rule, "resolved", value).await;
+                    notify(client, webhook, mailer, &rule, "resolved", value, None).await;
                 } else {
                     sqlx::query("DELETE FROM alert_events WHERE id = $1")
                         .bind(id)
@@ -602,6 +731,7 @@ async fn fire(
     mailer: Option<&Mailer>,
     rule: &AlertRule,
     value: Option<f64>,
+    attrs: Option<&serde_json::Value>,
 ) {
     tracing::warn!(
         "alert '{}' firing: {} {} {} (value {:?})",
@@ -611,7 +741,7 @@ async fn fire(
         rule.threshold,
         value
     );
-    notify(client, webhook, mailer, rule, "firing", value).await;
+    notify(client, webhook, mailer, rule, "firing", value, attrs).await;
 }
 
 /// Ceiling on each sink's *total* delivery time inside `notify()`. This is
@@ -644,10 +774,11 @@ async fn notify(
     rule: &AlertRule,
     state: &str,
     value: Option<f64>,
+    attrs: Option<&serde_json::Value>,
 ) {
     tokio::join!(
-        notify_webhook(client, webhook, rule, state, value),
-        notify_email(mailer, rule, state, value),
+        notify_webhook(client, webhook, rule, state, value, attrs),
+        notify_email(mailer, rule, state, value, attrs),
     );
 }
 
@@ -674,6 +805,7 @@ async fn notify_webhook(
     rule: &AlertRule,
     state: &str,
     value: Option<f64>,
+    attrs: Option<&serde_json::Value>,
 ) {
     let Some(url) = webhook else {
         return;
@@ -686,6 +818,7 @@ async fn notify_webhook(
         value,
         threshold: rule.threshold,
         comparator: &rule.comparator,
+        attributes: attrs,
     };
     // Propagate this span's context to the receiver.
     let mut headers = reqwest::header::HeaderMap::new();
@@ -703,12 +836,18 @@ async fn notify_webhook(
 /// Email the transition via `mailer`, if configured. Bounded end-to-end by
 /// [`NOTIFY_SINK_TIMEOUT`] — the whole SMTP conversation, not just each
 /// round trip within it; a failure or timeout is logged, never propagated.
-async fn notify_email(mailer: Option<&Mailer>, rule: &AlertRule, state: &str, value: Option<f64>) {
+async fn notify_email(
+    mailer: Option<&Mailer>,
+    rule: &AlertRule,
+    state: &str,
+    value: Option<f64>,
+    attrs: Option<&serde_json::Value>,
+) {
     let Some(mailer) = mailer else {
         return;
     };
     let subject = email_subject(&rule.name, state);
-    let body = email_body(rule, state, value);
+    let body = email_body(rule, state, value, attrs);
     deliver("email send", mailer.send(&subject, body)).await;
 }
 
@@ -716,7 +855,8 @@ async fn notify_email(mailer: Option<&Mailer>, rule: &AlertRule, state: &str, va
 mod tests {
     use super::{
         agg_expr, breached, build_webhook_client, email_body, email_subject, eval_sql, notify,
-        validate, AlertRule, Mailer, RuleConfig, MAX_FOR_SECS, NOTIFY_SINK_TIMEOUT,
+        series_attrs_sql, validate, AlertRule, Mailer, RuleConfig, MAX_FOR_SECS,
+        NOTIFY_SINK_TIMEOUT,
     };
     use lettre::{AsyncSmtpTransport, Tokio1Executor};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -839,21 +979,92 @@ mod tests {
 
     #[test]
     fn email_body_includes_condition_and_value() {
-        let b = email_body(&rule(), "firing", Some(87.5));
+        let b = email_body(&rule(), "firing", Some(87.5), None);
         assert!(b.contains("Alert: pod memory > 80%"));
         assert!(b.contains("State: firing"));
         assert!(b.contains("max(container.memory.usage) gt 80 over 300s"));
         assert!(b.contains("(service api)"));
         assert!(b.contains("Observed: 87.5"));
+        assert!(!b.contains("Series:")); // no attrs → no series line
+    }
+
+    #[test]
+    fn email_body_names_the_firing_series() {
+        let attrs = serde_json::json!({"k8s.node.name": "cluster-main", "host.arch": "arm64"});
+        let b = email_body(&rule(), "firing", Some(9.0), Some(&attrs));
+        // Sorted k=v, so host.arch precedes k8s.node.name.
+        assert!(b.contains("Series: host.arch=arm64, k8s.node.name=cluster-main"));
     }
 
     #[test]
     fn email_body_handles_no_data_and_no_service() {
         let mut r = rule();
         r.service = None;
-        let b = email_body(&r, "resolved", None);
+        let b = email_body(&r, "resolved", None, None);
         assert!(b.contains("Observed: no data"));
         assert!(!b.contains("(service"));
+    }
+
+    #[test]
+    fn render_attrs_sorts_truncates_and_skips_empty() {
+        use super::render_attrs;
+        assert_eq!(render_attrs(None), None);
+        assert_eq!(render_attrs(Some(&serde_json::json!({}))), None);
+        assert_eq!(render_attrs(Some(&serde_json::json!("x"))), None); // not an object
+        let a = serde_json::json!({"b": "2", "a": "1"});
+        assert_eq!(render_attrs(Some(&a)).unwrap(), "a=1, b=2");
+        // A huge value is bounded: <= MAX(400) + " …"(4 bytes), and ends with the ellipsis.
+        let big = serde_json::json!({"k": "v".repeat(1000)});
+        let r = render_attrs(Some(&big)).unwrap();
+        assert!(r.len() <= 404 && r.ends_with('…'));
+    }
+
+    #[test]
+    fn series_attrs_sql_groups_by_series_and_orders_by_breach_direction() {
+        // gt -> the largest per-series aggregate (DESC); lt -> the smallest (ASC); always one.
+        let gt = series_attrs_sql("max", false, "gt");
+        assert!(gt.contains("GROUP BY service, attributes"));
+        assert!(gt.contains("ORDER BY max(value) DESC"));
+        assert!(gt.trim_end().ends_with("LIMIT 1"));
+        assert!(gt.contains("attributes @> $4")); // same predicates as eval_sql
+        let lt = series_attrs_sql("min", false, "lt");
+        assert!(lt.contains("ORDER BY min(value) ASC"));
+        // rate + increase keep the per-series differencing, still grouped + limited to one.
+        let rate = series_attrs_sql("max", true, "gt");
+        assert!(rate.contains("PARTITION BY service, attributes ORDER BY time"));
+        assert!(rate.contains("GROUP BY service, attributes ORDER BY max(value) DESC"));
+        let inc = series_attrs_sql("increase", false, "gt");
+        assert!(inc.contains("ORDER BY sum(step) DESC"));
+        assert!(inc.trim_end().ends_with("LIMIT 1"));
+    }
+
+    #[test]
+    fn webhook_payload_includes_attributes_only_when_present() {
+        let attrs = serde_json::json!({"k8s.node.name": "cluster-main"});
+        let with = serde_json::to_string(&super::WebhookPayload {
+            rule: "r",
+            metric: "m",
+            service: None,
+            state: "firing",
+            value: Some(9.0),
+            threshold: 8.0,
+            comparator: "gt",
+            attributes: Some(&attrs),
+        })
+        .unwrap();
+        assert!(with.contains("\"attributes\":{\"k8s.node.name\":\"cluster-main\"}"));
+        let without = serde_json::to_string(&super::WebhookPayload {
+            rule: "r",
+            metric: "m",
+            service: None,
+            state: "resolved",
+            value: None,
+            threshold: 8.0,
+            comparator: "gt",
+            attributes: None,
+        })
+        .unwrap();
+        assert!(!without.contains("attributes")); // skip_serializing_if omits it
     }
 
     #[test]
@@ -968,6 +1179,7 @@ mod tests {
             &rule,
             "firing",
             Some(87.5),
+            None,
         )
         .await;
         let elapsed = start.elapsed();
@@ -1089,6 +1301,7 @@ mod tests {
             &rule,
             "firing",
             Some(87.5),
+            None,
         )
         .await;
         let elapsed = start.elapsed();
