@@ -22,7 +22,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router,
     transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -335,8 +335,8 @@ impl WatcherMcp {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for WatcherMcp {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "watcher: a Postgres-native OpenTelemetry traces/logs/metrics backend. \
              All tools are READ-ONLY queries over the same data the UI shows.",
         )
