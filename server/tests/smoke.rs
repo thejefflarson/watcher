@@ -1737,6 +1737,79 @@ async fn traces_filter_by_name_attr_errors_and_duration() {
     assert_eq!(ids(&post_slow), vec!["ts"]);
 }
 
+/// Seed one distributed trace `demo-a-gateway → demo-b-orders → demo-c-pay`
+/// (root in the alphabetically-*first* service, error in the last one). The
+/// `demo-c-pay` span is stamped *before* the root to simulate clock skew
+/// between hosts, so "earliest span" and "root span" disagree.
+async fn seed_three_service_trace(pool: &sqlx::PgPool) {
+    sqlx::query(
+        "INSERT INTO spans (trace_id, span_id, parent_span_id, service, name,
+                            start_time, end_time, duration_ms, status_code) VALUES
+          ('t3','root',NULL,  'demo-a-gateway','GET /checkout',
+             now() - interval '10 seconds', now() - interval '9.6 seconds', 400, 0),
+          ('t3','gw-c','root','demo-a-gateway','call orders',
+             now() - interval '9.9 seconds', now() - interval '9.7 seconds', 200, 0),
+          ('t3','ord', 'gw-c','demo-b-orders', 'POST /orders',
+             now() - interval '9.9 seconds', now() - interval '9.7 seconds', 200, 0),
+          ('t3','pay', 'ord', 'demo-c-pay',    'POST /charge',
+             now() - interval '10.5 seconds', now() - interval '10.45 seconds', 50, 2)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn trace_list_labels_trace_by_its_root_span() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    seed_three_service_trace(&pool).await;
+    // A partial trace whose root never arrived: fall back to the earliest span.
+    sqlx::query(
+        "INSERT INTO spans (trace_id, span_id, parent_span_id, service, name,
+                            start_time, end_time, duration_ms) VALUES
+          ('tp','late', 'gone','zz-svc','second', now() - interval '4 seconds', now(), 1),
+          ('tp','early','gone','aa-svc','first',  now() - interval '5 seconds', now(), 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let router = app(pool);
+
+    let (status, all) = get_json(&router, "/api/traces").await;
+    assert_eq!(status, StatusCode::OK);
+    let row = |id: &str| {
+        all.as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["trace_id"] == id)
+            .unwrap_or_else(|| panic!("trace {id} missing"))
+            .clone()
+    };
+
+    // Root span's service, not max(service) (= "demo-c-pay"); root's name even
+    // though the skewed pay span starts earlier.
+    let t3 = row("t3");
+    assert_eq!(t3["service"], "demo-a-gateway");
+    assert_eq!(t3["root_name"], "GET /checkout");
+
+    let tp = row("tp");
+    assert_eq!(tp["service"], "aa-svc");
+    assert_eq!(tp["root_name"], "first");
+
+    // The name filter matches the root's name, not the earliest span's.
+    let (_, byname) = get_json(&router, "/api/traces?name=checkout").await;
+    let ids: Vec<_> = byname
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["trace_id"].clone())
+        .collect();
+    assert_eq!(ids, vec!["t3"]);
+}
+
 #[tokio::test]
 #[serial]
 async fn get_trace_returns_spans_in_order() {

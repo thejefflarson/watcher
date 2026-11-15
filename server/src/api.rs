@@ -127,8 +127,11 @@ pub async fn query_traces(pool: &PgPool, q: TraceQuery) -> Result<Vec<TraceSumma
     // the per-trace aggregates stay computed over the whole trace.
     sqlx::query_as::<_, TraceSummary>(
         "SELECT trace_id,
-                max(service)                                                   AS service,
-                (array_agg(name ORDER BY start_time))[1]                       AS root_name,
+                -- the trace is labelled by its root span (parentless), falling
+                -- back to the earliest span when the root hasn't arrived yet
+                -- (partial trace). Not max(service): that's alphabetical.
+                (array_agg(service ORDER BY (parent_span_id IS NULL) DESC, start_time))[1] AS service,
+                (array_agg(name ORDER BY (parent_span_id IS NULL) DESC, start_time))[1]    AS root_name,
                 min(start_time)                                                AS start_time,
                 max(end_time)                                                  AS end_time,
                 -- ::float8 because Postgres 14+ extract() returns numeric, which sqlx won't decode into f64
@@ -151,7 +154,8 @@ pub async fn query_traces(pool: &PgPool, q: TraceQuery) -> Result<Vec<TraceSumma
                 OR trace_id IN (SELECT trace_id FROM spans WHERE attributes @> $6))
          GROUP BY trace_id
          HAVING ($5::text IS NULL
-                 OR (array_agg(name ORDER BY start_time))[1] ILIKE '%' || $5 || '%')
+                 OR (array_agg(name ORDER BY (parent_span_id IS NULL) DESC, start_time))[1]
+                    ILIKE '%' || $5 || '%')
             AND (NOT $7::bool OR count(*) FILTER (WHERE status_code = 2) > 0)
             AND ($8::float8 IS NULL
                  OR extract(epoch FROM (max(end_time) - min(start_time))) * 1000.0 >= $8)
