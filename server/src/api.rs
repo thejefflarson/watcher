@@ -228,6 +228,9 @@ pub struct LogQuery {
     pub to: Option<DateTime<Utc>>,
     /// Attribute equality filter, `key=value` (e.g. `k8s.pod.name=api-7f`).
     pub attr: Option<String>,
+    /// Minimum OTel `severity_number` (inclusive): 5 DEBUG, 9 INFO, 13 WARN,
+    /// 17 ERROR, 21 FATAL. Logs without a severity are excluded when set.
+    pub min_severity: Option<i32>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -243,7 +246,8 @@ pub struct LogRow {
     attributes: serde_json::Value,
 }
 
-/// GET /api/logs — recent logs with optional service / trace_id / full-text filters.
+/// GET /api/logs — recent logs with optional service / trace_id / full-text /
+/// minimum-severity filters.
 #[tracing::instrument(skip_all)]
 pub async fn list_logs(
     State(pool): State<PgPool>,
@@ -280,6 +284,7 @@ pub async fn query_logs(pool: &PgPool, q: LogQuery) -> Result<Vec<LogRow>, sqlx:
                )
            AND ($6::timestamptz IS NULL OR time <= $6)
            AND ($7::jsonb IS NULL OR attributes @> $7)
+           AND ($10::int IS NULL OR severity_number >= $10)
          ORDER BY time DESC
          LIMIT $8",
     )
@@ -292,6 +297,7 @@ pub async fn query_logs(pool: &PgPool, q: LogQuery) -> Result<Vec<LogRow>, sqlx:
     .bind(attr_json)
     .bind(limit)
     .bind(max_lookback_hours())
+    .bind(q.min_severity)
     .fetch_all(pool)
     .instrument(tracing::info_span!("db.query"))
     .await

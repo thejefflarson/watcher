@@ -3429,6 +3429,55 @@ async fn logs_attribute_filter() {
     assert_eq!(all.as_array().unwrap().len(), 2);
 }
 
+#[tokio::test]
+#[serial]
+async fn logs_min_severity_filter() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // DEBUG, INFO, WARN, ERROR, and one with no severity at all.
+    sqlx::query(
+        "INSERT INTO logs (time, service, body, severity_number, severity_text) VALUES
+            (now(),'svc','dbg',5,'DEBUG'),
+            (now(),'svc','inf',9,'INFO'),
+            (now(),'svc','wrn',13,'WARN'),
+            (now(),'svc','err',17,'ERROR'),
+            (now(),'svc','none',NULL,NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let router = app(pool);
+
+    let bodies = |v: &serde_json::Value| {
+        let mut b: Vec<String> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["body"].as_str().unwrap().to_string())
+            .collect();
+        b.sort();
+        b
+    };
+
+    // Inclusive lower bound: WARN (13) and above.
+    let (status, warn_up) = get_json(&router, "/api/logs?min_severity=13").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bodies(&warn_up), ["err", "wrn"]);
+
+    // ERROR and above.
+    let (_, err_up) = get_json(&router, "/api/logs?min_severity=17").await;
+    assert_eq!(bodies(&err_up), ["err"]);
+
+    // Composes with other filters.
+    let (_, none) = get_json(&router, "/api/logs?min_severity=13&q=inf").await;
+    assert!(none.as_array().unwrap().is_empty());
+
+    // No filter → everything, including the severity-less row.
+    let (_, all) = get_json(&router, "/api/logs").await;
+    assert_eq!(all.as_array().unwrap().len(), 5);
+}
+
 // --- Origin-side Cloudflare Access JWT verification (ADR 0013) ---------------
 //
 // The middleware guards the UI shell + /api when Access is configured, and never
