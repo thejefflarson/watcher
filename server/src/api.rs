@@ -109,17 +109,37 @@ fn parse_max_lookback_hours(raw: Option<&str>) -> i32 {
         .clamp(1, 8760)
 }
 
+/// Parse an `attr=key=value` filter into JSONB containment candidates:
+/// `(string_form, typed_form)`. The query string can't say whether `value` is
+/// a string, but OTel attributes are typed and stored as such in `attributes`
+/// (an int `code.line.number` is the JSON number `35`, not `"35"`), so a
+/// string-only `{"key":"35"}` never matches it. When `value` parses as a JSON
+/// number or bool the typed form carries that (`{"key":35}`); otherwise it
+/// repeats the string form, so callers can always bind both and OR them — each
+/// arm stays GIN-servable. Returns `(None, None)` for a missing/keyless filter.
+fn attr_filter(attr: Option<&str>) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+    let Some((k, v)) = attr
+        .and_then(|s| s.split_once('='))
+        .filter(|(k, _)| !k.is_empty())
+    else {
+        return (None, None);
+    };
+    let string_form = serde_json::json!({ k: v });
+    let typed_form = match serde_json::from_str::<serde_json::Value>(v) {
+        Ok(t @ (serde_json::Value::Number(_) | serde_json::Value::Bool(_))) => {
+            serde_json::json!({ k: t })
+        }
+        _ => string_form.clone(),
+    };
+    (Some(string_form), Some(typed_form))
+}
+
 /// Recent-traces query shared by the HTTP handler and the MCP `search_traces`
 /// tool. Applies the same limit clamp + default 24h window.
 pub async fn query_traces(pool: &PgPool, q: TraceQuery) -> Result<Vec<TraceSummary>, sqlx::Error> {
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
     // `key=value` → JSONB containment, matched against any span in the trace.
-    let attr_json = q
-        .attr
-        .as_deref()
-        .and_then(|s| s.split_once('='))
-        .filter(|(k, _)| !k.is_empty())
-        .map(|(k, v)| serde_json::json!({ k: v }));
+    let (attr_json, attr_typed) = attr_filter(q.attr.as_deref());
     // service + time bound the spans scanned (index-friendly). The attribute
     // filter selects whole traces that contain a matching span via a subquery the
     // spans_attrs_gin index can serve (a HAVING bool_or couldn't use the index).
@@ -148,7 +168,8 @@ pub async fn query_traces(pool: &PgPool, q: TraceQuery) -> Result<Vec<TraceSumma
                )
            AND ($3::timestamptz IS NULL OR start_time <= $3)
            AND ($6::jsonb IS NULL
-                OR trace_id IN (SELECT trace_id FROM spans WHERE attributes @> $6))
+                OR trace_id IN (SELECT trace_id FROM spans
+                                WHERE attributes @> $6 OR attributes @> $10))
          GROUP BY trace_id
          HAVING ($5::text IS NULL
                  OR (array_agg(name ORDER BY start_time))[1] ILIKE '%' || $5 || '%')
@@ -167,6 +188,7 @@ pub async fn query_traces(pool: &PgPool, q: TraceQuery) -> Result<Vec<TraceSumma
     .bind(q.errors_only)
     .bind(q.min_duration_ms)
     .bind(max_lookback_hours())
+    .bind(attr_typed)
     .fetch_all(pool)
     .instrument(tracing::info_span!("db.query"))
     .await
@@ -257,12 +279,7 @@ pub async fn query_logs(pool: &PgPool, q: LogQuery) -> Result<Vec<LogRow>, sqlx:
     let limit = q.limit.unwrap_or(200).clamp(1, 2000);
     // `key=value` → JSONB containment `attributes @> {"key":"value"}`, which the
     // logs_attrs_gin index serves.
-    let attr_json = q
-        .attr
-        .as_deref()
-        .and_then(|s| s.split_once('='))
-        .filter(|(k, _)| !k.is_empty())
-        .map(|(k, v)| serde_json::json!({ k: v }));
+    let (attr_json, attr_typed) = attr_filter(q.attr.as_deref());
     sqlx::query_as::<_, LogRow>(
         "SELECT id, time, trace_id, span_id, service, severity_number, severity_text, body, attributes
          FROM logs
@@ -279,7 +296,7 @@ pub async fn query_logs(pool: &PgPool, q: LogQuery) -> Result<Vec<LogRow>, sqlx:
                  now() - make_interval(hours => $9::int)
                )
            AND ($6::timestamptz IS NULL OR time <= $6)
-           AND ($7::jsonb IS NULL OR attributes @> $7)
+           AND ($7::jsonb IS NULL OR attributes @> $7 OR attributes @> $10)
          ORDER BY time DESC
          LIMIT $8",
     )
@@ -292,6 +309,7 @@ pub async fn query_logs(pool: &PgPool, q: LogQuery) -> Result<Vec<LogRow>, sqlx:
     .bind(attr_json)
     .bind(limit)
     .bind(max_lookback_hours())
+    .bind(attr_typed)
     .fetch_all(pool)
     .instrument(tracing::info_span!("db.query"))
     .await
@@ -1488,6 +1506,36 @@ mod tests {
     #[test]
     fn parse_max_lookback_hours_leaves_in_range_value_unchanged() {
         assert_eq!(parse_max_lookback_hours(Some("48")), 48);
+    }
+
+    #[test]
+    fn attr_filter_adds_typed_form_for_numbers_and_bools() {
+        use serde_json::json;
+        assert_eq!(
+            attr_filter(Some("code.line.number=35")),
+            (
+                Some(json!({"code.line.number": "35"})),
+                Some(json!({"code.line.number": 35}))
+            )
+        );
+        assert_eq!(
+            attr_filter(Some("ratio=0.5")),
+            (Some(json!({"ratio": "0.5"})), Some(json!({"ratio": 0.5})))
+        );
+        assert_eq!(
+            attr_filter(Some("retry=true")),
+            (Some(json!({"retry": "true"})), Some(json!({"retry": true})))
+        );
+        // Plain strings (and JSON-looking non-scalars) only match as strings.
+        for raw in ["k8s.pod.name=api-7f", "x=null", "x=[1]", "x=\"q\""] {
+            let (s, t) = attr_filter(Some(raw));
+            assert_eq!(s, t, "{raw}");
+        }
+        // Value may itself contain '=' (split on the first one only).
+        assert_eq!(attr_filter(Some("q=a=b")).0, Some(json!({"q": "a=b"})));
+        assert_eq!(attr_filter(Some("=35")), (None, None));
+        assert_eq!(attr_filter(Some("no-equals")), (None, None));
+        assert_eq!(attr_filter(None), (None, None));
     }
 
     // At the default 7-day retention, the series ceiling must match
