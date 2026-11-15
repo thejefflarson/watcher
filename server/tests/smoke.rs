@@ -3429,6 +3429,63 @@ async fn logs_attribute_filter() {
     assert_eq!(all.as_array().unwrap().len(), 2);
 }
 
+/// OTel attributes are typed: ints/doubles/bools land in `attributes` as JSON
+/// numbers/booleans, and `attr=key=value` must match them — not only string
+/// values. A string attribute that merely looks numeric must still match too.
+#[tokio::test]
+#[serial]
+async fn attribute_filter_matches_typed_values() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    sqlx::query(
+        r#"INSERT INTO logs (time, service, body, attributes) VALUES
+            (now(),'svc','int',   '{"code.line.number":35}'),
+            (now(),'svc','other', '{"code.line.number":36}'),
+            (now(),'svc','float', '{"ratio":0.5}'),
+            (now(),'svc','bool',  '{"retry":true}'),
+            (now(),'svc','strnum','{"build":"35"}')"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"INSERT INTO spans (trace_id, span_id, service, name, start_time, end_time,
+                              duration_ms, attributes) VALUES
+            ('t500','s1','api','GET /x', now(), now(), 1.0, '{"http.status_code":500}'),
+            ('t200','s2','api','GET /y', now(), now(), 1.0, '{"http.status_code":200}'),
+            ('tok', 's3','api','GET /z', now(), now(), 1.0, '{"cache.hit":false}')"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let router = app(pool);
+
+    let field = |v: &serde_json::Value, f: &str| {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r[f].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    for (q, want) in [
+        ("code.line.number%3D35", "int"),
+        ("ratio%3D0.5", "float"),
+        ("retry%3Dtrue", "bool"),
+        ("build%3D35", "strnum"),
+    ] {
+        let (status, logs) = get_json(&router, &format!("/api/logs?attr={q}")).await;
+        assert_eq!(status, StatusCode::OK, "{q}");
+        assert_eq!(field(&logs, "body"), vec![want], "{q}");
+    }
+
+    let (_, t500) = get_json(&router, "/api/traces?attr=http.status_code%3D500").await;
+    assert_eq!(field(&t500, "trace_id"), vec!["t500"]);
+    let (_, miss) = get_json(&router, "/api/traces?attr=cache.hit%3Dfalse").await;
+    assert_eq!(field(&miss, "trace_id"), vec!["tok"]);
+}
+
 // --- Origin-side Cloudflare Access JWT verification (ADR 0013) ---------------
 //
 // The middleware guards the UI shell + /api when Access is configured, and never
