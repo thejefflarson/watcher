@@ -120,11 +120,13 @@ pub async fn query_traces(pool: &PgPool, q: TraceQuery) -> Result<Vec<TraceSumma
         .and_then(|s| s.split_once('='))
         .filter(|(k, _)| !k.is_empty())
         .map(|(k, v)| serde_json::json!({ k: v }));
-    // service + time bound the spans scanned (index-friendly). The attribute
-    // filter selects whole traces that contain a matching span via a subquery the
-    // spans_attrs_gin index can serve (a HAVING bool_or couldn't use the index).
-    // The remaining trace-level filters (name / errors / duration) are HAVING, so
-    // the per-trace aggregates stay computed over the whole trace.
+    // Time bounds the spans scanned (index-friendly). The service and attribute
+    // filters select whole traces that *contain* a matching span via subqueries
+    // (served by spans_service_start_idx / spans_attrs_gin) rather than dropping
+    // the other spans — a plain `WHERE service = $1` would compute root, duration,
+    // span and error counts over that service's fragment only. The remaining
+    // trace-level filters (name / errors / duration) are HAVING, so the
+    // per-trace aggregates stay computed over the whole trace.
     sqlx::query_as::<_, TraceSummary>(
         "SELECT trace_id,
                 -- the trace is labelled by its root span (parentless), falling
@@ -139,7 +141,15 @@ pub async fn query_traces(pool: &PgPool, q: TraceQuery) -> Result<Vec<TraceSumma
                 count(*)                                                       AS span_count,
                 count(*) FILTER (WHERE status_code = 2)                        AS error_count
          FROM spans
-         WHERE ($1::text IS NULL OR service = $1)
+         WHERE ($1::text IS NULL
+                OR trace_id IN (
+                     SELECT trace_id FROM spans
+                     WHERE service = $1
+                       AND start_time >= GREATEST(
+                             COALESCE($2::timestamptz, now() - interval '24 hours'),
+                             now() - make_interval(hours => $9::int)
+                           )
+                       AND ($3::timestamptz IS NULL OR start_time <= $3)))
            -- default to a recent window when unbounded so this can't turn into a
            -- full-table GROUP BY (which times out); the UI always passes a range.
            -- GREATEST clamps an explicit `from` to the max-lookback ceiling too,

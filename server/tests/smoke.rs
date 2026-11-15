@@ -1812,6 +1812,67 @@ async fn trace_list_labels_trace_by_its_root_span() {
 
 #[tokio::test]
 #[serial]
+async fn trace_list_service_filter_keeps_whole_trace() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    seed_three_service_trace(&pool).await;
+    // An unrelated single-service trace that must not match `demo-c-pay`.
+    insert_span_at(&pool, "other", "tx", "x1", 1.0).await;
+    let router = app(pool);
+
+    let (_, unfiltered) = get_json(&router, "/api/traces").await;
+    let whole = unfiltered
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["trace_id"] == "t3")
+        .unwrap()
+        .clone();
+    assert_eq!(whole["span_count"], 4);
+    assert_eq!(whole["error_count"], 1);
+
+    // Focusing either end of the call chain returns the same, whole trace.
+    for svc in ["demo-a-gateway", "demo-c-pay"] {
+        let (status, got) = get_json(&router, &format!("/api/traces?service={svc}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let arr = got.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "{svc}");
+        for k in [
+            "trace_id",
+            "service",
+            "root_name",
+            "span_count",
+            "error_count",
+            "start_time",
+            "end_time",
+            "duration_ms",
+        ] {
+            assert_eq!(arr[0][k], whole[k], "{svc}: {k}");
+        }
+    }
+
+    // errors_only sees the downstream error when the gateway is focused.
+    let (_, errs) = get_json(
+        &router,
+        "/api/traces?service=demo-a-gateway&errors_only=true",
+    )
+    .await;
+    assert_eq!(errs.as_array().unwrap().len(), 1);
+
+    // A service not in the trace still excludes it.
+    let (_, none) = get_json(&router, "/api/traces?service=other").await;
+    let ids: Vec<_> = none
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["trace_id"].clone())
+        .collect();
+    assert_eq!(ids, vec!["tx"]);
+}
+
+#[tokio::test]
+#[serial]
 async fn get_trace_returns_spans_in_order() {
     let Some(pool) = pool_or_skip().await else {
         return;
