@@ -13,6 +13,15 @@ function sevClass(n: number | null): string {
   return "sev-debug";
 }
 
+// Minimum-severity choices, as OTel severity_number lower bounds (inclusive).
+const SEVERITY_FLOORS: [label: string, min: number][] = [
+  ["debug+", 5],
+  ["info+", 9],
+  ["warn+", 13],
+  ["error+", 17],
+  ["fatal", 21],
+];
+
 const fmtAttr = (v: unknown) => (typeof v === "string" ? v : JSON.stringify(v));
 
 export default function LogView() {
@@ -21,6 +30,7 @@ export default function LogView() {
   const [loaded, setLoaded] = useState(false);
   const [q, setQ] = useState("");
   const [attr, setAttr] = useState("");
+  const [minSev, setMinSev] = useState("");
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
   // Service focus is global (header select, mirrored to `?service=`).
   const { rangeKey, service, tick } = useControls();
@@ -45,6 +55,7 @@ export default function LogView() {
         trace_id: traceFilter ?? undefined,
         span_id: spanFilter ?? undefined,
         attr: attr.includes("=") ? attr : undefined,
+        min_severity: minSev ? Number(minSev) : undefined,
         limit: 200,
         ...rangeParams(rangeKey),
       })
@@ -61,7 +72,7 @@ export default function LogView() {
       active = false;
       clearTimeout(handle);
     };
-  }, [q, service, attr, traceFilter, spanFilter, rangeKey, tick]);
+  }, [q, service, attr, minSev, traceFilter, spanFilter, rangeKey, tick]);
 
   const toggle = (id: number) =>
     setExpanded((prev) => {
@@ -79,7 +90,7 @@ export default function LogView() {
     ? "No logs recorded for this span."
     : traceFilter
       ? "No logs for this trace."
-      : q || attr || service
+      : q || attr || minSev || service
         ? "No logs match these filters."
         : firstRunHint("logs");
 
@@ -99,6 +110,19 @@ export default function LogView() {
           onChange={(e) => setAttr(e.target.value)}
           title="Filter by an attribute, e.g. k8s.pod.name=api-7f"
         />
+        <select
+          aria-label="Minimum severity"
+          title="Minimum severity"
+          value={minSev}
+          onChange={(e) => setMinSev(e.target.value)}
+        >
+          <option value="">any severity</option>
+          {SEVERITY_FLOORS.map(([label, min]) => (
+            <option key={min} value={min}>
+              {label}
+            </option>
+          ))}
+        </select>
       </div>
       {(traceFilter || spanFilter) && (
         <p className="filter-banner">

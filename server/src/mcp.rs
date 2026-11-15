@@ -109,6 +109,9 @@ pub struct QueryLogsArgs {
     pub to: Option<String>,
     /// Attribute equality filter `key=value` (e.g. `k8s.pod.name=api-7f`).
     pub attr: Option<String>,
+    /// Minimum OTel severity number (inclusive): 5 DEBUG, 9 INFO, 13 WARN,
+    /// 17 ERROR, 21 FATAL.
+    pub min_severity: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Default)]
@@ -223,7 +226,7 @@ impl WatcherMcp {
 
     #[tool(
         description = "Query recent logs with optional service, trace id, span id, \
-        body substring, attribute and time-window filters."
+        body substring, attribute, minimum-severity and time-window filters."
     )]
     async fn query_logs(
         &self,
@@ -238,6 +241,7 @@ impl WatcherMcp {
             from: parse_time("from", a.from)?,
             to: parse_time("to", a.to)?,
             attr: a.attr,
+            min_severity: a.min_severity,
         };
         let rows = api::query_logs(&self.pool, q).await.map_err(db_error)?;
         json_result(&rows)
