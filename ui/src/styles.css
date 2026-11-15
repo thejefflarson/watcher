@@ -174,6 +174,28 @@ tr.clickable:hover td {
   text-decoration: underline;
 }
 
+/* Stretched link: the primary-cell <Link>'s ::after covers its whole row, so a
+   click anywhere on a tr.clickable (which already shows the pointer + hover
+   highlight) follows that real link — keeping native cmd/middle-click and a
+   single keyboard tab stop, no whole-row onClick or role="link" (JEF-431).
+   Other controls in the row (the metrics series expander) sit above it. */
+tr.clickable {
+  position: relative;
+}
+tr.clickable .rowlink::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+tr.clickable button,
+tr.clickable a:not(.rowlink) {
+  position: relative;
+  z-index: 1;
+}
+tr.clickable:hover .rowlink {
+  text-decoration: underline;
+}
+
 .mono {
   font-family: ui-monospace, Menlo, "SF Mono", monospace;
   font-size: 0.84rem;
