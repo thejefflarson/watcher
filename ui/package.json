@@ -25,7 +25,7 @@
     "eslint": "^10.14.0",
     "eslint-plugin-jsx-a11y-x": "^0.2.0",
     "eslint-plugin-react-hooks": "^7.1.1",
-    "jsdom": "^31.0.0",
+    "jsdom": "^31.0.1",
     "typescript": "^6.0.3",
     "vite": "^8.3.8",
     "vitest": "^5.1.0",
